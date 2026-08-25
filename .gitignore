@@ -1,0 +1,10 @@
+node_modules/
+native/node_modules/
+native/dist/
+native/src-tauri/target/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+__pycache__/
+*.pyc
+.DS_Store

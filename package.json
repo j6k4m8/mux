@@ -1,0 +1,23 @@
+{
+  "name": "mux",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mux local-first desktop mail client.",
+  "scripts": {
+    "start": "npm run dev",
+    "dev": "npm --prefix native run dev",
+    "verify": "npm run check && npm --prefix native run verify",
+    "check": "node scripts/check.mjs && node scripts/check-provider-fixtures.mjs",
+    "test": "npm --prefix native run test",
+    "e2e": "npm --prefix native run test:ui",
+    "build": "npm --prefix native run build",
+    "benchmark": "npm --prefix native run benchmark",
+    "test:provider-contract": "npm --prefix native run test:provider-contract",
+    "manifest:write": "node scripts/manifest.mjs --write",
+    "release:check": "npm run verify && node scripts/manifest.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

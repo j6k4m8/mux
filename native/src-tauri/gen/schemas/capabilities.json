@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Core permissions for the local Mux mailbox window; app commands remain explicitly allowlisted in Rust","local":true,"windows":["main"],"permissions":["core:default"]}}

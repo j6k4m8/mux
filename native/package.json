@@ -1,0 +1,38 @@
+{
+  "name": "mux",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build --bundles app && node ../scripts/check-bundle.mjs",
+    "frontend:dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "frontend:build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "npm run test:unit && npm run test:ui",
+    "test:unit": "node --test tests/*.test.mjs",
+    "test:ui": "vitest run --config vitest.config.ts",
+    "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast",
+    "test:provider-contract": "cargo test --manifest-path src-tauri/Cargo.toml provider_conformance -- --nocapture",
+    "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml && cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "verify": "npm run check && npm run test && npm run frontend:build && npm run rust:test && npm run rust:check",
+    "benchmark": "cargo run --release --manifest-path src-tauri/Cargo.toml --features benchmark --bin mux-benchmark",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "svelte": "^5.56.10"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "latest",
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/svelte": "^5.4.2",
+    "@testing-library/user-event": "^14.6.6",
+    "@types/node": "latest",
+    "jsdom": "^30.0.1",
+    "svelte-check": "^4.7.4",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "^4.1.11"
+  }
+}

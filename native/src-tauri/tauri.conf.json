@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mux",
+  "version": "0.1.0",
+  "identifier": "com.jordanmatelsky.mux",
+  "build": {
+    "beforeDevCommand": "npm run frontend:dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run frontend:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Mux",
+        "width": 1420,
+        "height": 900,
+        "minWidth": 360,
+        "minHeight": 480,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "category": "Productivity",
+    "shortDescription": "A fast, local-first email client",
+    "longDescription": "Mux brings multiple mail accounts into one focused, keyboard-friendly workspace.",
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}
