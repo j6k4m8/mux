@@ -76,7 +76,7 @@ describe('native rendering responsiveness', () => {
     expect(firstCollapsed?.textContent).not.toContain('sender@example.test');
     expect(firstCollapsed?.querySelector('.collapsed-heading strong')?.textContent).toBe('External Sender');
     expect(firstCollapsed?.querySelector('.collapsed-heading time')).toBeTruthy();
-    expect(firstCollapsed?.querySelector('.collapsed-preview')?.textContent).toBe('Bounded message 1');
+    expect(firstCollapsed?.querySelector('.collapsed-preview')?.textContent?.trim()).toBe('Bounded message 1');
   });
 
   test('renders at most 120 rows from 50,000 loaded threads without changing reader selection', async () => {

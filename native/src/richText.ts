@@ -10,6 +10,54 @@ const MAX_RENDER_TREE_NODES = 50_000;
 const MAX_REMOTE_IMAGE_RESOURCE_ID = 64;
 const MAX_REMOTE_IMAGE_DATA_URL_UNITS = 8 * 1024 * 1024 + 128;
 
+/// Where a reply's quoted tail begins. Anything from here down is the previous
+/// message, a signature, or client postmatter, none of which is new content.
+const QUOTE_BOUNDARIES: RegExp[] = [
+  /^--\s*$/u,
+  /^-{2,}\s*original message\s*-{2,}/iu,
+  /^_{5,}\s*$/u,
+  /^-{5,}\s*$/u,
+  /^on\b.{0,300}\bwrote:\s*$/iu,
+  /^on\b.{0,300}\b(?:at|,)\s.{0,120}$/iu,
+  /^\s*(?:>\s*)*from:\s/iu,
+  /^sent from my\b/iu,
+  /^get outlook for\b/iu,
+  /^this email .{0,80}confidential/iu
+];
+
+function isQuotedLine(line: string): boolean {
+  return /^\s*>/u.test(line);
+}
+
+function startsQuotedTail(line: string, next: string | undefined): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (QUOTE_BOUNDARIES.some((pattern) => pattern.test(trimmed))) return true;
+  // A reply header wrapped onto a second line: "On <date>" then "<name> wrote:".
+  return /^on\b/iu.test(trimmed) && /\bwrote:\s*$/iu.test(next?.trim() ?? '');
+}
+
+/// The part of a message a person actually wrote, with the quoted reply chain,
+/// signature, and client footer removed. Returns the surviving paragraphs plus
+/// whether anything was dropped, so the interface can say so rather than hide
+/// content silently.
+export function newContentParagraphs(value: string): { paragraphs: string[][]; trimmed: boolean } {
+  const lines = value.replace(/\r\n?/gu, '\n').split('\n');
+  let cut = lines.length;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (startsQuotedTail(lines[index], lines[index + 1])) {
+      cut = index;
+      break;
+    }
+  }
+  const kept = lines.slice(0, cut).filter((line) => !isQuotedLine(line));
+  const trimmed = cut < lines.length || kept.length !== cut;
+  const paragraphs = plainTextParagraphs(kept.join('\n'));
+  // A message that is nothing but a quote should still show something.
+  if (!paragraphs.length) return { paragraphs: plainTextParagraphs(value), trimmed: false };
+  return { paragraphs, trimmed };
+}
+
 /// Plain-text bodies carry their own structure in newlines. Any run of blank
 /// lines is one paragraph break, so "a\n\n\n\nb" reads the same as "a\n\nb";
 /// single newlines stay as line breaks inside the paragraph.
@@ -17,8 +65,14 @@ export function plainTextParagraphs(value: string): string[][] {
   return value
     .replace(/\r\n?/gu, '\n')
     .split(/\n[ \t]*\n+/u)
-    .map((paragraph) => paragraph.split('\n').map((line) => line.trimEnd()))
-    .filter((lines) => lines.some((line) => line.trim().length > 0));
+    .map((paragraph) => {
+      const lines = paragraph.split('\n').map((line) => line.trimEnd());
+      // A paragraph never opens or closes on a blank line.
+      while (lines.length && !lines[0].trim()) lines.shift();
+      while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+      return lines;
+    })
+    .filter((lines) => lines.length > 0);
 }
 
 export function safeRemoteImageDataUrl(value: string): string | null {

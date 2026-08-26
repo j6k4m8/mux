@@ -3,7 +3,7 @@
   import { tick } from 'svelte';
   import AttachmentList from './AttachmentList.svelte';
   import RichText from './RichText.svelte';
-  import { parseMessageRichText, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
+  import { newContentParagraphs, parseMessageRichText, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
   import type { AttachmentSummary, MessageSummary, RemoteImageContent, RemoteImageSummary } from './types';
 
   export let messages: MessageSummary[] = [];
@@ -253,10 +253,14 @@
           <span class="message-meta"><strong>{message.senderName}</strong><small>{message.senderEmail} → {message.recipients}{message.ccRecipients ? ` · Cc ${message.ccRecipients}` : ''}</small></span>
           <time>{fullTime(message.sentAt)}</time>
         {:else}
+          {@const collapsed = newContentParagraphs(message.bodyText)}
           <span class="collapsed-summary">
-            <span class="collapsed-bubble">
-              <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
-              <span class="collapsed-preview">{message.bodyText}</span>
+            <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
+            <span class="collapsed-preview">
+              {#each collapsed.paragraphs as lines}
+                <span class="collapsed-paragraph">{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</span>
+              {/each}
+              {#if collapsed.trimmed}<span class="collapsed-trimmed">quoted text and signature hidden</span>{/if}
             </span>
           </span>
         {/if}

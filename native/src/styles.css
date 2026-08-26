@@ -336,27 +336,23 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 /* Reader focus: which message j/k is sitting on. */
 .message-card.is-focused { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .message-card-toggle { width: 100%; min-height: var(--card-min-height); display: flex; align-items: center; gap: 11px; padding: var(--card-pad-block) 15px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
-.message-card.is-collapsed .message-card-toggle { min-height: 0; align-items: flex-end; padding: 2px 0; background: transparent; }
-.message-card.is-collapsed .message-card-toggle:hover { background: transparent; }
-.message-card.is-collapsed .message-card-toggle:hover .collapsed-bubble { border-color: var(--border-strong); }
+.message-card.is-collapsed .message-card-toggle { min-height: 0; align-items: flex-start; gap: 10px; padding: 7px 10px; border-radius: 9px; background: transparent; }
+.message-card.is-collapsed .message-card-toggle:hover { background: var(--surface-hover); }
 .message-card.is-collapsed .collapse-glyph { display: none; }
-/* My own messages sit on the right with no avatar, like any chat client. */
-.message-card.is-collapsed.is-mine .message-card-toggle { flex-direction: row-reverse; }
-.message-card.is-collapsed.is-mine .avatar { display: none; }
+.message-card.is-collapsed .avatar { margin-top: 1px; }
 .message-card-toggle:hover { background: var(--surface-hover); }
 .message-card-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 .message-meta { min-width: 120px; display: flex; flex: 0 1 auto; flex-direction: column; }
 .message-meta strong { color: var(--text); font-size: 12px; }
 .message-meta small { max-width: 320px; margin-top: 2px; overflow: hidden; color: var(--text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .message-card-toggle time { flex: 0 0 auto; align-self: flex-start; margin-left: auto; color: var(--text-faint); font-size: 9px; }
-.collapsed-summary { min-width: 0; flex: 1; display: flex; flex-direction: column; }
-.message-card.is-collapsed.is-mine .collapsed-summary { align-items: flex-end; }
-.collapsed-bubble { max-width: min(78%, 620px); display: flex; flex-direction: column; gap: 2px; padding: 9px 13px; border: 1px solid var(--border); border-radius: 15px 15px 15px 5px; background: var(--surface-raised); transition: border-color 120ms ease; }
-.message-card.is-collapsed.is-mine .collapsed-bubble { border-radius: 15px 15px 5px 15px; border-color: color-mix(in srgb, var(--accent) 26%, var(--border)); background: var(--accent-soft); }
-.collapsed-heading { min-width: 0; display: flex; align-items: baseline; gap: 10px; }
-.collapsed-heading strong { min-width: 0; overflow: hidden; color: var(--text-soft); font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.collapsed-summary { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.collapsed-heading { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.collapsed-heading strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 12px; font-weight: 760; text-overflow: ellipsis; white-space: nowrap; }
 .message-card-toggle .collapsed-heading time { align-self: auto; margin-left: auto; }
-.collapsed-preview { min-width: 0; color: var(--text); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+.collapsed-preview { min-width: 0; display: flex; flex-direction: column; gap: .55em; color: var(--text-soft); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.collapsed-paragraph { display: block; }
+.collapsed-trimmed { color: var(--text-faint); font-size: 10px; font-style: italic; }
 .collapse-glyph { flex: 0 0 auto; align-self: flex-start; color: var(--text-faint); font-size: 12px; }
 .message-body { margin: 1px 24px 22px 64px; color: var(--text-soft); font-size: 13px; line-height: 1.72; overflow-wrap: anywhere; }
 .message-body p, .message-body div { margin: 0 0 .8em; }

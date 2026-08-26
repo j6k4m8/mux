@@ -9,7 +9,7 @@ export default defineConfig({
     environmentOptions: {
       jsdom: { url: 'http://localhost/' }
     },
-    include: ['src/**/*.interaction.test.ts'],
+    include: ['src/**/*.interaction.test.ts', 'src/**/*.unit.test.ts'],
     setupFiles: ['./src/test/setup.ts']
   }
 });
