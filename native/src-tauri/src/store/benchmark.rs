@@ -158,6 +158,7 @@ fn run_at_path(
         view: Some("inbox".into()),
         cursor: None,
         limit: Some(50),
+        hidden_account_ids: Vec::new(),
     })?;
     let inbox_elapsed = inbox_started.elapsed();
     enforce_limit("inbox", inbox_elapsed, INBOX_LIMIT)?;
@@ -176,6 +177,7 @@ fn run_at_path(
         cursor: None,
         limit: Some(50),
         timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
     })?;
     let structured_elapsed = structured_started.elapsed();
     enforce_limit(
@@ -197,6 +199,7 @@ fn run_at_path(
         cursor: None,
         limit: Some(50),
         timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
     })?;
     let fts_elapsed = fts_started.elapsed();
     enforce_limit("FTS body search", fts_elapsed, FTS_SEARCH_LIMIT)?;

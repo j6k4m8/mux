@@ -65,7 +65,19 @@ expect(tauri.build?.devUrl === 'http://127.0.0.1:1420', 'The internal Vite devel
 expect(/host:\s*'127\.0\.0\.1'/u.test(viteConfig) && !viteConfig.includes('TAURI_DEV_HOST'), 'Vite must not accept a non-loopback development host.');
 expect(tauri.build?.frontendDist === '../dist', 'Tauri must bundle native/dist.');
 expect(tauri.bundle?.targets?.length === 1 && tauri.bundle.targets[0] === 'app', 'The only claimed bundle target is the macOS .app exercised by this project.');
-expect(tauri.bundle?.macOS?.signingIdentity === '-', 'The local macOS bundle must use Tauri ad-hoc signing without an Apple developer identity.');
+// Keychain items are bound to the code identity that created them, so a stable
+// signature is what stops macOS re-prompting after every rebuild. A development
+// certificate is enough for that; Developer ID would be a distribution claim
+// this project has not earned.
+expect(
+  tauri.bundle?.macOS?.signingIdentity === '-'
+    || /^Apple Development: /u.test(tauri.bundle?.macOS?.signingIdentity ?? ''),
+  'The macOS bundle must be ad-hoc signed or signed with an Apple Development certificate.'
+);
+expect(
+  !/Developer ID/u.test(tauri.bundle?.macOS?.signingIdentity ?? ''),
+  'This project does not claim Developer ID distribution or notarization.'
+);
 expect(/^default-run = "mux-native"$/mu.test(cargoManifest), 'Cargo must explicitly bundle mux-native rather than a utility binary.');
 expect(tauri.app?.security?.csp?.includes("default-src 'self'"), 'Tauri must retain an explicit self-only default CSP.');
 expect(JSON.stringify(capability.permissions) === JSON.stringify(['core:default']), 'The main window capability must not accumulate broad plugin permissions.');

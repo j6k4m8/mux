@@ -23,7 +23,14 @@ use crate::worker::{
 
 pub mod benchmark;
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
+/// A person cannot hide more accounts than they can configure.
+const MAX_HIDDEN_ACCOUNTS: usize = 64;
+/// Default provider refresh cadence: once a minute.
+pub(crate) const DEFAULT_REFRESH_SECONDS: i64 = 60;
+/// Bounds keep a mistyped cadence from hammering a provider or stalling mail.
+pub(crate) const MIN_REFRESH_SECONDS: i64 = 15;
+pub(crate) const MAX_REFRESH_SECONDS: i64 = 24 * 60 * 60;
 const MAX_ACTIVITY_ROWS: i64 = 100;
 const MAX_SNOOZE_DISTANCE_MS: i64 = 10 * 366 * 86_400_000;
 const MAX_RECIPIENT_HEADER_CHARS: usize = 10_000;
@@ -59,6 +66,8 @@ pub struct AccountSummary {
     signature: String,
     unread: i64,
     total: i64,
+    /// How often Mux asks the provider for new mail, in seconds.
+    refresh_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +119,12 @@ pub(crate) struct StoredRemoteImage {
     pub message_id: i64,
     pub resource_id: i64,
     pub url: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullResyncRequest {
+    pub accounts_reset: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,6 +351,9 @@ pub struct ThreadPageInput {
     view: Option<String>,
     cursor: Option<String>,
     limit: Option<i64>,
+    /// Accounts the person has hidden from the list. They keep syncing.
+    #[serde(default)]
+    hidden_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -385,6 +403,9 @@ pub struct SearchInput {
     limit: Option<i64>,
     #[serde(default)]
     timezone_offset_minutes: i32,
+    /// Accounts the person has hidden from the list. They keep syncing.
+    #[serde(default)]
+    hidden_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,14 +479,16 @@ impl MuxStore {
                             SELECT 1 FROM snoozes s
                             WHERE s.thread_id = e.id AND s.wake_at > ?1
                           ) THEN 1 ELSE 0 END), 0) AS unread,
-                        COUNT(e.id) AS total
+                        COUNT(e.id) AS total,
+                        COALESCE(MAX(p.refresh_seconds), ?2) AS refresh_seconds
                  FROM accounts a
                  LEFT JOIN thread_effective e
                    ON e.account_id = a.id AND e.remote_deleted = 0 AND e.trashed = 0
+                 LEFT JOIN provider_accounts p ON p.account_id = a.id
                  GROUP BY a.id, a.name, a.email, a.color, a.signature
                  ORDER BY a.name",
             )?
-            .query_map([now], |row| {
+            .query_map(params![now, DEFAULT_REFRESH_SECONDS], |row| {
                 Ok(AccountSummary {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -474,6 +497,7 @@ impl MuxStore {
                     signature: row.get(4)?,
                     unread: row.get(5)?,
                     total: row.get(6)?,
+                    refresh_seconds: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -559,13 +583,59 @@ impl MuxStore {
         Ok(bootstrap)
     }
 
+    /// Validates hidden account identifiers and returns them sorted and deduplicated
+    /// so the same visibility always produces the same cursor scope.
+    fn hidden_accounts(ids: &[String]) -> Result<Vec<String>, StoreError> {
+        if ids.len() > MAX_HIDDEN_ACCOUNTS {
+            return Err(StoreError::Validation(
+                "Too many hidden accounts requested".into(),
+            ));
+        }
+        let mut hidden = ids
+            .iter()
+            .map(|id| bounded_text(id, "hiddenAccountId", 200))
+            .collect::<Result<Vec<_>, _>>()?;
+        hidden.sort();
+        hidden.dedup();
+        Ok(hidden)
+    }
+
+    /// Sets how often one account asks its provider for new mail.
+    pub(crate) fn set_account_refresh_seconds(
+        &mut self,
+        account_id: &str,
+        seconds: i64,
+    ) -> Result<(), StoreError> {
+        let account_id = bounded_text(account_id, "accountId", 200)?;
+        if !(MIN_REFRESH_SECONDS..=MAX_REFRESH_SECONDS).contains(&seconds) {
+            return Err(StoreError::Validation(format!(
+                "Refresh interval must be between {MIN_REFRESH_SECONDS} and {MAX_REFRESH_SECONDS} seconds"
+            )));
+        }
+        let changed = self.connection.execute(
+            "UPDATE provider_accounts SET refresh_seconds = ?2, updated_at = ?3
+             WHERE account_id = ?1",
+            params![account_id, seconds, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(
+                "Provider account was not found".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn list_threads(&self, input: ThreadPageInput) -> Result<ThreadPage, StoreError> {
         let limit = input.limit.unwrap_or(50).clamp(1, 100);
         let account_id = exact_account_id(input.account_id.as_deref())?;
         let view = input.view.as_deref().unwrap_or("inbox");
+        let hidden = Self::hidden_accounts(&input.hidden_account_ids)?;
+        // Visibility is part of the scope: a cursor cannot be replayed against a
+        // different set of hidden accounts.
+        let hidden_scope = hidden.join(",");
         let scope = match account_id.as_deref() {
-            Some(account_id) => canonical_scope(&["account:some", account_id, view]),
-            None => canonical_scope(&["account:none", view]),
+            Some(account_id) => canonical_scope(&["account:some", account_id, view, &hidden_scope]),
+            None => canonical_scope(&["account:none", view, &hidden_scope]),
         };
         let mut snapshot_at = now_ms();
         let cursor_position = input
@@ -583,6 +653,13 @@ impl MuxStore {
         if let Some(account_id) = account_id.as_deref() {
             conditions.push("e.account_id = ?".to_string());
             values.push(Value::Text(bounded_text(account_id, "accountId", 200)?));
+        }
+        if !hidden.is_empty() {
+            let placeholders = std::iter::repeat_n("?", hidden.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("e.account_id NOT IN ({placeholders})"));
+            values.extend(hidden.iter().map(|id| Value::Text(id.clone())));
         }
         append_mailbox_view(&mut conditions, &mut values, view, snapshot_at)?;
         if let Some(position) = cursor_position {
@@ -997,6 +1074,19 @@ impl MuxStore {
         Ok(())
     }
 
+    /// Rewind every provider sync cursor so the next cycle re-enumerates the whole
+    /// mailbox and re-ingests each message in place. Nothing is deleted: re-ingest
+    /// upserts onto the existing thread and message rows, so pending local intent,
+    /// Mux-owned metadata, drafts, and thread identity all survive untouched.
+    pub(crate) fn request_full_resync(&mut self) -> Result<FullResyncRequest, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let accounts_reset = transaction.execute("DELETE FROM provider_sync_cursors", [])? as i64;
+        transaction.commit()?;
+        Ok(FullResyncRequest { accounts_reset })
+    }
+
     fn attachment_metadata_for_messages(
         &self,
         messages: &[MessageSummary],
@@ -1123,11 +1213,20 @@ impl MuxStore {
         let account_id = exact_account_id(input.account_id.as_deref())?;
         let view = input.view.as_deref().unwrap_or("all");
         let timezone = input.timezone_offset_minutes.to_string();
+        let hidden = Self::hidden_accounts(&input.hidden_account_ids)?;
+        let hidden_scope = hidden.join(",");
         let scope = match account_id.as_deref() {
-            Some(account_id) => {
-                canonical_scope(&["account:some", account_id, &input.query, view, &timezone])
+            Some(account_id) => canonical_scope(&[
+                "account:some",
+                account_id,
+                &input.query,
+                view,
+                &timezone,
+                &hidden_scope,
+            ]),
+            None => {
+                canonical_scope(&["account:none", &input.query, view, &timezone, &hidden_scope])
             }
-            None => canonical_scope(&["account:none", &input.query, view, &timezone]),
         };
         let mut snapshot_at = now_ms();
         let cursor_position = input
@@ -1146,6 +1245,13 @@ impl MuxStore {
         let mut conditions = vec![compiled.clause, "e.remote_deleted = 0".into()];
         let mut values = compiled.parameters;
 
+        if !hidden.is_empty() {
+            let placeholders = std::iter::repeat_n("?", hidden.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("e.account_id NOT IN ({placeholders})"));
+            values.extend(hidden.iter().map(|id| Value::Text(id.clone())));
+        }
         if let Some(account_id) = account_id {
             conditions.push("e.account_id = ?".into());
             values.push(Value::Text(account_id));
@@ -6088,7 +6194,7 @@ mod tests {
         let normalized = schema.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains(
             "auth_state TEXT NOT NULL DEFAULT 'signed_out' CHECK(auth_state IN ( \
-             'signed_out', 'credential_locked', 'ready', 'reauthorization_required', 'unavailable' ))"
+             'signed_out', 'ready', 'reauthorization_required', 'unavailable' ))"
         ));
         assert!(normalized.contains(
             "sync_state TEXT NOT NULL DEFAULT 'never_synced' CHECK(sync_state IN ( \
@@ -6100,14 +6206,16 @@ mod tests {
              length(CAST(credential_ref AS BLOB)) BETWEEN 1 AND 256 )"
         ));
         assert!(normalized.contains(
-            "auth_block_reason TEXT CHECK( auth_block_reason IS NULL OR auth_block_reason IN ( \
-             'credential_locked', 'provider_reauthorization' ) )"
+            "auth_block_reason TEXT CHECK( auth_block_reason IS NULL OR auth_block_reason = \
+             'provider_reauthorization' )"
         ));
         assert!(normalized.contains(
-            "CHECK( auth_state NOT IN ('ready', 'credential_locked', \
+            "CHECK( auth_state NOT IN ('ready', \
              'reauthorization_required') OR credential_ref IS NOT NULL )"
         ));
         assert!(!normalized.contains("DEFAULT 'locked'"));
+        // The locked-credential state was removed in schema 22.
+        assert!(!normalized.contains("'credential_locked'"));
         assert!(!normalized.contains("'expired'"));
         assert!(!normalized.contains("'requires_action'"));
         assert_eq!(
@@ -6129,9 +6237,8 @@ mod tests {
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM provider_accounts
-                     WHERE auth_state IN (
-                       'ready', 'credential_locked', 'reauthorization_required'
-                     ) AND credential_ref IS NULL",
+                     WHERE auth_state IN ('ready', 'reauthorization_required')
+                       AND credential_ref IS NULL",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -6388,6 +6495,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("search succeeds")
             .rows
@@ -6498,7 +6606,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version");
-        assert_eq!(version, "21");
+        assert_eq!(version, "22");
         assert_eq!(
             store
                 .connection
@@ -6540,7 +6648,7 @@ mod tests {
         assert_eq!(foreign_key_violations, 0);
 
         let bootstrap = store.bootstrap().expect("bootstrap query");
-        assert_eq!(bootstrap.schema_version, 21);
+        assert_eq!(bootstrap.schema_version, 22);
         assert_eq!(bootstrap.accounts.len(), 3);
         assert_eq!(bootstrap.view_counts.len(), 4);
         assert!(bootstrap.drafts.is_empty());
@@ -6579,6 +6687,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(100),
+                hidden_account_ids: Vec::new(),
             })
             .expect("thread page");
         assert_eq!(threads.threads.len(), 12);
@@ -6738,7 +6847,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -6897,7 +7006,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -6948,8 +7057,8 @@ mod tests {
                  ) VALUES
                    ('acc_work', 'gmail', 'shared-account', 'ready', 'idle',
                     'provider/acc_work', NULL, 1, 1),
-                   ('acc_personal', 'jmap', 'shared-account', 'credential_locked', 'offline',
-                    'provider/acc_personal', 'credential_locked', 1, 1);
+                   ('acc_personal', 'jmap', 'shared-account', 'reauthorization_required',
+                    'offline', 'provider/acc_personal', 'provider_reauthorization', 1, 1);
                  INSERT INTO provider_capabilities(account_id, capability, enabled)
                    VALUES('acc_work', 'delta_sync', 1);
                  INSERT INTO provider_containers(
@@ -7283,7 +7392,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         for table in [
             "provider_accounts",
@@ -7373,7 +7482,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -7436,7 +7545,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -7489,7 +7598,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert_eq!(
             migrated
@@ -7584,13 +7693,13 @@ mod tests {
                  ) VALUES
                    ('locked-account', 'jmap', 'remote-locked-account', 'locked', 'offline', 1, 1),
                    ('reauth-account', 'jmap', 'remote-reauth-account', 'expired', 'error', 1, 1);
-                 UPDATE provider_work_items
-                   SET state = 'authentication_blocked',
-                       auth_block_reason = 'credential_locked',
-                       last_error_code = 'credential_locked'
-                   WHERE id = 'locked-work';
                  DROP TRIGGER provider_work_auth_block_insert;
                  DROP TRIGGER provider_work_auth_block_update;
+                 UPDATE provider_work_items
+                   SET state = 'authentication_blocked',
+                       auth_block_reason = 'provider_reauthorization',
+                       last_error_code = 'credential_locked'
+                   WHERE id = 'locked-work';
                  ALTER TABLE provider_work_items DROP COLUMN auth_block_reason;
                  UPDATE meta SET value = '10' WHERE key = 'schema_version';",
             )
@@ -7608,7 +7717,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let accounts = migrated
             .connection
@@ -7764,7 +7873,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let accounts = migrated
             .connection
@@ -7867,7 +7976,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v11_repairs_stale_provider_account_checks_and_preserves_vault_markers() {
+    fn schema_v11_repairs_stale_provider_account_checks_and_preserves_credential_markers() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("stale-v11-provider-accounts.db");
         let store = MuxStore::open(&path, false).expect("current schema created");
@@ -7910,7 +8019,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert_eq!(
             migrated
@@ -7938,9 +8047,10 @@ mod tests {
                 .unwrap(),
             (
                 "remote-v11".into(),
-                "credential_locked".into(),
+                // Schema 22 turns a stale locked account into one needing reauthorization.
+                "reauthorization_required".into(),
                 "provider/stale-v11".into(),
-                "credential_locked".into(),
+                "provider_reauthorization".into(),
                 "authentication_blocked".into(),
                 "credential_locked".into(),
                 222,
@@ -8705,7 +8815,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let expected = vec![(
             7001,
@@ -8799,7 +8909,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let receipts_after = migrated
             .connection
@@ -9024,7 +9134,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert_eq!(
             migrated
@@ -9691,6 +9801,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(50),
+                hidden_account_ids: Vec::new(),
             })
             .expect("visible projection")
             .threads
@@ -10059,6 +10170,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(100),
+                hidden_account_ids: Vec::new(),
             })
             .expect("thread page");
         let counts = threads
@@ -10099,6 +10211,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(1),
+                hidden_account_ids: Vec::new(),
             })
             .expect("first tied page");
         let tied_second = store
@@ -10107,6 +10220,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: tied_first.next_cursor.clone(),
                 limit: Some(1),
+                hidden_account_ids: Vec::new(),
             })
             .expect("second tied page");
         assert_eq!(tied_first.threads[0].id, 2);
@@ -10148,6 +10262,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(3),
+                hidden_account_ids: Vec::new(),
             })
             .expect("first thread page");
         assert_eq!(first.threads.len(), 3);
@@ -10158,6 +10273,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: first.next_cursor,
                 limit: Some(3),
+                hidden_account_ids: Vec::new(),
             })
             .expect("second thread page");
         assert!(first
@@ -10349,6 +10465,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(500),
+                hidden_account_ids: Vec::new(),
             })
             .expect("bounded thread page");
         assert_eq!(first_threads.threads.len(), 100);
@@ -10359,6 +10476,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: first_threads.next_cursor,
                 limit: Some(500),
+                hidden_account_ids: Vec::new(),
             })
             .expect("thread continuation");
         assert!(first_threads.threads.iter().all(|left| second_threads
@@ -10437,6 +10555,7 @@ mod tests {
                 view: Some("inbox".into()),
                 cursor: Some("bad".into()),
                 limit: Some(50),
+                hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(_))
         ));
@@ -10455,6 +10574,7 @@ mod tests {
                     view: Some("inbox".into()),
                     cursor: Some(cursor.into()),
                     limit: Some(50),
+                    hidden_account_ids: Vec::new(),
                 }),
                 Err(StoreError::Validation(_))
             ));
@@ -10482,6 +10602,7 @@ mod tests {
                 cursor: None,
                 limit: Some(10),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("fielded search");
         assert_eq!(result.rows.len(), 1);
@@ -10533,6 +10654,7 @@ mod tests {
                 cursor: None,
                 limit: Some(10),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("Cc search");
         assert_eq!(
@@ -10548,6 +10670,7 @@ mod tests {
                 cursor: None,
                 limit: Some(3),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("first page");
         assert!(first.has_more);
@@ -10559,6 +10682,7 @@ mod tests {
                 cursor: first.next_cursor,
                 limit: Some(3),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("second page");
         assert!(first
@@ -10585,10 +10709,108 @@ mod tests {
                     cursor,
                     limit: Some(10),
                     timezone_offset_minutes: 0,
+                    hidden_account_ids: Vec::new(),
                 })
                 .expect_err("invalid search must fail");
             assert!(matches!(error, StoreError::Validation(_)));
         }
+    }
+
+    #[test]
+    fn hidden_accounts_leave_the_listing_without_touching_their_mail() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("hidden-accounts.db");
+        let store = MuxStore::open(&path, true).expect("seeded store opens");
+
+        let all = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: Vec::new(),
+            })
+            .expect("unfiltered listing");
+        let hidden_account = all
+            .threads
+            .first()
+            .map(|thread| thread.account_id.clone())
+            .expect("seeded thread");
+        let expected = all
+            .threads
+            .iter()
+            .filter(|thread| thread.account_id != hidden_account)
+            .count();
+
+        let filtered = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: vec![hidden_account.clone()],
+            })
+            .expect("filtered listing");
+        assert_eq!(filtered.threads.len(), expected);
+        assert!(filtered
+            .threads
+            .iter()
+            .all(|thread| thread.account_id != hidden_account));
+        assert!(expected < all.threads.len(), "fixture must hide something");
+
+        // Search honours the same visibility.
+        let searched = store
+            .search_threads(SearchInput {
+                query: "is:unread".into(),
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                timezone_offset_minutes: 0,
+                hidden_account_ids: vec![hidden_account.clone()],
+            })
+            .expect("filtered search");
+        assert!(searched
+            .rows
+            .iter()
+            .all(|thread| thread.account_id != hidden_account));
+
+        // Hiding is a view filter only: the mail itself is untouched.
+        let threads: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE account_id = ?1",
+                [&hidden_account],
+                |row| row.get(0),
+            )
+            .expect("hidden account rows");
+        assert!(threads > 0, "hidden account keeps its threads");
+
+        // Duplicates and order must not change the accepted set.
+        let repeated = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: vec![hidden_account.clone(), hidden_account.clone()],
+            })
+            .expect("duplicate hidden ids");
+        assert_eq!(repeated.threads.len(), expected);
+
+        let too_many = (0..(MAX_HIDDEN_ACCOUNTS + 1))
+            .map(|index| format!("acc_{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: too_many,
+            }),
+            Err(StoreError::Validation(_))
+        ));
     }
 
     #[test]
@@ -10602,6 +10824,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
             })
             .expect("first page");
         let cursor = first.next_cursor.expect("continuation cursor");
@@ -10613,12 +10836,21 @@ mod tests {
                 view: Some("inbox".into()),
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
             },
             ThreadPageInput {
                 account_id: Some("acc_work".into()),
                 view: Some("all".into()),
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
+            },
+            ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: Some(cursor.clone()),
+                limit: Some(2),
+                hidden_account_ids: vec!["acc_personal".into()],
             },
         ] {
             assert!(matches!(
@@ -10634,6 +10866,7 @@ mod tests {
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Search cursor is invalid"
         ));
@@ -10647,6 +10880,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: Some(String::from_utf8(tampered).unwrap()),
                 limit: Some(2),
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
         ));
@@ -10664,6 +10898,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: Some(cursor),
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
             })
             .expect("persistently signed cursor continues");
         assert!(second
@@ -10679,6 +10914,7 @@ mod tests {
                 cursor: None,
                 limit: Some(2),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("search page");
         let search_cursor = search.next_cursor.expect("search continuation");
@@ -10691,6 +10927,7 @@ mod tests {
                 cursor: Some(search_cursor),
                 limit: Some(2),
                 timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Search cursor is invalid"
         ));
@@ -10744,6 +10981,7 @@ mod tests {
                     view: Some("all".into()),
                     cursor: None,
                     limit: Some(1),
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap()
         };
@@ -10763,14 +11001,15 @@ mod tests {
             (literal_star.next_cursor, Some(" acc_work ")),
         ] {
             assert!(matches!(
-                store.list_threads(ThreadPageInput {
-                    account_id: account_id.map(str::to_string),
-                    view: Some("all".into()),
-                    cursor,
-                    limit: Some(1),
-                }),
-                Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
-            ));
+                    store.list_threads(ThreadPageInput {
+                        account_id: account_id.map(str::to_string),
+                        view: Some("all".into()),
+                        cursor,
+                        limit: Some(1),
+            hidden_account_ids: Vec::new(),
+                    }),
+                    Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
+                ));
         }
 
         let star_search = store
@@ -10781,6 +11020,7 @@ mod tests {
                 cursor: None,
                 limit: Some(1),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .unwrap();
         assert_eq!(star_search.rows[0].account_id, "*");
@@ -10792,6 +11032,7 @@ mod tests {
                 cursor: star_search.next_cursor,
                 limit: Some(1),
                 timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Search cursor is invalid"
         ));
@@ -10822,6 +11063,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(1),
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message))
                 if message == "accountId must not be empty when present"
@@ -10894,6 +11136,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(100),
+                hidden_account_ids: Vec::new(),
             })
             .unwrap();
         let mut seen = first
@@ -10936,6 +11179,7 @@ mod tests {
                     view: Some("all".into()),
                     cursor: Some(next),
                     limit: Some(100),
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap();
             for thread in page.threads {
@@ -10970,6 +11214,7 @@ mod tests {
                     cursor: search_cursor,
                     limit: Some(100),
                     timezone_offset_minutes: 0,
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap();
             for thread in page.rows {
@@ -12193,6 +12438,7 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(10),
+                hidden_account_ids: Vec::new(),
             })
             .unwrap()
             .threads
@@ -12204,6 +12450,7 @@ mod tests {
                     view: Some("trash".into()),
                     cursor: None,
                     limit: Some(10),
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap()
                 .threads
@@ -12512,6 +12759,7 @@ mod tests {
                     view: Some(view.into()),
                     cursor: None,
                     limit: Some(100),
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap()
                 .threads
@@ -12549,6 +12797,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .unwrap();
         assert_eq!(
@@ -12568,6 +12817,7 @@ mod tests {
                     cursor: None,
                     limit: Some(100),
                     timezone_offset_minutes: 0,
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap();
             assert_eq!(
@@ -12813,6 +13063,158 @@ mod tests {
             store.resolve_outcome_unknown_send(&operation.id),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn full_resync_rewinds_cursors_without_removing_anything() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("full-resync.db");
+        let mut store = MuxStore::open(&path, false).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO accounts(id, name, email, color, provider)
+             VALUES('acct', 'acct', 'a@example.test', '#000', 'fake')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO threads(id, account_id, subject, participants, snippet, latest_at,
+               message_count, remote_in_inbox, remote_unread, remote_starred, has_attachment,
+               has_invite, has_link, has_from_me)
+             VALUES(7, 'acct', '', '', '', 1, 1, 1, 0, 0, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(id, thread_id, sender_name, sender_email, recipients,
+               sent_at, body_text, is_from_me) VALUES(7, 7, '', 's@example.test', '', 1, '', 0)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO snoozes(thread_id, wake_at, created_at) VALUES(7, 99, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO drafts(id, account_id, reply_to_thread_id, recipients, subject, body,
+               body_html, updated_at, revision)
+             VALUES('draft-1', 'acct', 7, '', '', '', '', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO operations(id, thread_id, field, kind, state, created_at, not_before)
+             VALUES('op-live', 7, 'unread', 'set', 'pending', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO provider_accounts(account_id, provider_kind, remote_account_id,
+               auth_state, created_at, updated_at)
+             VALUES('acct', 'gmail', 'remote-acct', 'signed_out', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO provider_sync_cursors(account_id, scope, cursor, updated_at)
+             VALUES('acct', 'a:v1', '{\"phase\":\"history\"}', 1)",
+                [],
+            )
+            .unwrap();
+
+        let requested = store.request_full_resync().unwrap();
+        assert_eq!(requested.accounts_reset, 1);
+
+        let count = |sql: &str| -> i64 {
+            store
+                .connection
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        };
+        // Only the sync bookmark is rewound, so the next cycle re-enumerates everything.
+        assert_eq!(count("SELECT COUNT(*) FROM provider_sync_cursors"), 0);
+        // Every layer of durable state is still exactly where it was.
+        assert_eq!(count("SELECT COUNT(*) FROM threads"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM messages"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM snoozes"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM drafts"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM accounts"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM operations WHERE state = 'pending' AND thread_id = 7"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM drafts WHERE reply_to_thread_id = 7"),
+            1
+        );
+    }
+
+    #[test]
+    fn no_product_statement_can_empty_a_table_of_mail_intent_or_metadata() {
+        // A resync must never be able to become a wipe. Bulk deletion of anything a
+        // person owns is not vocabulary this app has; single-row deletes stay legal.
+        let sources = [
+            ("store.rs", include_str!("store.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("provider_ingest.rs", include_str!("provider_ingest.rs")),
+            (
+                "provider_conformance.rs",
+                include_str!("provider_conformance.rs"),
+            ),
+            ("gmail.rs", include_str!("gmail.rs")),
+            ("worker.rs", include_str!("worker.rs")),
+        ];
+        let owned = [
+            "threads",
+            "messages",
+            "attachments",
+            "drafts",
+            "operations",
+            "snoozes",
+            "invitations",
+            "accounts",
+            "message_remote_images",
+            "remote_content_sender_allowlist",
+            "remote_content_domain_allowlist",
+        ];
+        for (name, source) in sources {
+            // Tests build and tear down their own fixtures; only shipping code is bound.
+            let product = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for statement in product.split("DELETE FROM ").skip(1) {
+                let table = statement
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .find(|value| !value.is_empty())
+                    .unwrap_or_default();
+                if !owned.contains(&table) {
+                    continue;
+                }
+                let clause = statement
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                assert!(
+                    clause.contains("WHERE"),
+                    "{name} can empty {table} without a WHERE clause"
+                );
+            }
+        }
     }
 
     #[test]

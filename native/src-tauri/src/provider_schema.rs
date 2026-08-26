@@ -11,27 +11,28 @@ const PROVIDER_ACCOUNTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS provider_acco
          length(CAST(remote_account_id AS BLOB)) BETWEEN 1 AND 2048
        ),
        auth_state TEXT NOT NULL DEFAULT 'signed_out' CHECK(auth_state IN (
-         'signed_out', 'credential_locked', 'ready', 'reauthorization_required', 'unavailable'
+         'signed_out', 'ready', 'reauthorization_required', 'unavailable'
        )),
        credential_ref TEXT CHECK(
          credential_ref IS NULL OR
          length(CAST(credential_ref AS BLOB)) BETWEEN 1 AND 256
        ),
        auth_block_reason TEXT CHECK(
-         auth_block_reason IS NULL OR auth_block_reason IN (
-           'credential_locked', 'provider_reauthorization'
-         )
+         auth_block_reason IS NULL OR auth_block_reason = 'provider_reauthorization'
        ),
        sync_state TEXT NOT NULL DEFAULT 'never_synced' CHECK(sync_state IN (
          'never_synced', 'idle', 'scheduled', 'syncing', 'backoff',
          'authentication_blocked', 'offline', 'failed'
        )),
+       refresh_seconds INTEGER NOT NULL DEFAULT 60 CHECK(
+         refresh_seconds BETWEEN 15 AND 86400
+       ),
        last_error_code TEXT CHECK(last_error_code IS NULL OR length(last_error_code) <= 200),
        last_sync_at INTEGER CHECK(last_sync_at IS NULL OR last_sync_at >= 0),
        created_at INTEGER NOT NULL CHECK(created_at >= 0),
        updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
        CHECK(
-         auth_state NOT IN ('ready', 'credential_locked', 'reauthorization_required') OR
+         auth_state NOT IN ('ready', 'reauthorization_required') OR
          credential_ref IS NOT NULL
        )
      );";
@@ -59,11 +60,12 @@ pub(crate) fn provider_accounts_need_rebuild(
     Ok(![
         "account_id TEXT PRIMARY KEY CHECK( length(CAST(account_id AS BLOB)) BETWEEN 1 AND 256 ) REFERENCES accounts(id) ON DELETE CASCADE",
         "provider_kind TEXT NOT NULL CHECK(provider_kind IN ('gmail', 'imap', 'jmap', 'pop'))",
-        "auth_state TEXT NOT NULL DEFAULT 'signed_out' CHECK(auth_state IN ( 'signed_out', 'credential_locked', 'ready', 'reauthorization_required', 'unavailable' ))",
+        "auth_state TEXT NOT NULL DEFAULT 'signed_out' CHECK(auth_state IN ( 'signed_out', 'ready', 'reauthorization_required', 'unavailable' ))",
         "credential_ref TEXT CHECK( credential_ref IS NULL OR length(CAST(credential_ref AS BLOB)) BETWEEN 1 AND 256 )",
-        "auth_block_reason TEXT CHECK( auth_block_reason IS NULL OR auth_block_reason IN ( 'credential_locked', 'provider_reauthorization' ) )",
+        "auth_block_reason TEXT CHECK( auth_block_reason IS NULL OR auth_block_reason = 'provider_reauthorization' )",
         "sync_state TEXT NOT NULL DEFAULT 'never_synced' CHECK(sync_state IN ( 'never_synced', 'idle', 'scheduled', 'syncing', 'backoff', 'authentication_blocked', 'offline', 'failed' ))",
-        "CHECK( auth_state NOT IN ('ready', 'credential_locked', 'reauthorization_required') OR credential_ref IS NOT NULL )",
+        "refresh_seconds INTEGER NOT NULL DEFAULT 60 CHECK( refresh_seconds BETWEEN 15 AND 86400 )",
+        "CHECK( auth_state NOT IN ('ready', 'reauthorization_required') OR credential_ref IS NOT NULL )",
     ]
     .iter()
     .all(|fragment| normalized.contains(fragment)))
@@ -251,9 +253,7 @@ pub(crate) fn migrate(
              last_error_code IS NULL OR length(CAST(last_error_code AS BLOB)) BETWEEN 1 AND 512
            ),
            auth_block_reason TEXT CHECK(
-             auth_block_reason IS NULL OR auth_block_reason IN (
-               'credential_locked', 'provider_reauthorization'
-             )
+             auth_block_reason IS NULL OR auth_block_reason = 'provider_reauthorization'
            ),
            retry_after_at INTEGER CHECK(retry_after_at IS NULL OR retry_after_at >= 0),
            completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= 0),
@@ -634,9 +634,7 @@ pub(crate) fn migrate(
         transaction.execute_batch(
             "ALTER TABLE provider_accounts
                ADD COLUMN auth_block_reason TEXT CHECK(
-                 auth_block_reason IS NULL OR auth_block_reason IN (
-                   'credential_locked', 'provider_reauthorization'
-                 )
+                 auth_block_reason IS NULL OR auth_block_reason = 'provider_reauthorization'
                );",
         )?;
     }
@@ -644,9 +642,7 @@ pub(crate) fn migrate(
         transaction.execute_batch(
             "ALTER TABLE provider_work_items
                ADD COLUMN auth_block_reason TEXT CHECK(
-                 auth_block_reason IS NULL OR auth_block_reason IN (
-                   'credential_locked', 'provider_reauthorization'
-                 )
+                 auth_block_reason IS NULL OR auth_block_reason = 'provider_reauthorization'
                );",
         )?;
     }
@@ -654,71 +650,92 @@ pub(crate) fn migrate(
         transaction.execute_batch(
             "UPDATE provider_accounts
                SET auth_block_reason = CASE auth_state
-                 WHEN 'credential_locked' THEN 'credential_locked'
+                 WHEN 'credential_locked' THEN 'provider_reauthorization'
                  WHEN 'reauthorization_required' THEN 'provider_reauthorization'
                  ELSE NULL
                END;
              UPDATE provider_work_items
                SET auth_block_reason = CASE
                  WHEN state <> 'authentication_blocked' THEN NULL
-                 WHEN EXISTS (
-                   SELECT 1 FROM provider_accounts account
-                   WHERE account.account_id = provider_work_items.account_id
-                     AND account.auth_block_reason = 'credential_locked'
-                 ) THEN 'credential_locked'
                  ELSE 'provider_reauthorization'
                END;",
         )?;
     }
+    if !column_exists(transaction, "provider_accounts", "refresh_seconds")? {
+        transaction.execute_batch(
+            "ALTER TABLE provider_accounts
+               ADD COLUMN refresh_seconds INTEGER NOT NULL DEFAULT 60 CHECK(
+                 refresh_seconds BETWEEN 15 AND 86400
+               );",
+        )?;
+    }
+    if stored_schema_version < 22 {
+        // The locked-credential state is gone. Anything still wearing it needs
+        // reauthorizing, which is the only way back now.
+        transaction.execute_batch(
+            "UPDATE provider_work_items
+               SET auth_block_reason = 'provider_reauthorization'
+             WHERE auth_block_reason = 'credential_locked';
+             UPDATE provider_accounts
+               SET auth_state = 'reauthorization_required',
+                   auth_block_reason = 'provider_reauthorization'
+             WHERE auth_state = 'credential_locked' AND credential_ref IS NOT NULL;
+             UPDATE provider_accounts
+               SET auth_state = 'signed_out', auth_block_reason = NULL
+             WHERE auth_state = 'credential_locked';
+             UPDATE provider_accounts
+               SET auth_block_reason = 'provider_reauthorization'
+             WHERE auth_block_reason = 'credential_locked';",
+        )?;
+    }
     transaction.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS provider_account_auth_block_insert
+        // Recreated rather than IF NOT EXISTS, so an existing database actually
+        // loses the old provenance rules instead of keeping them alongside.
+        "DROP TRIGGER IF EXISTS provider_account_auth_block_insert;
+         DROP TRIGGER IF EXISTS provider_account_auth_block_update;
+         DROP TRIGGER IF EXISTS provider_work_auth_block_insert;
+         DROP TRIGGER IF EXISTS provider_work_auth_block_update;
+
+         CREATE TRIGGER provider_account_auth_block_insert
          BEFORE INSERT ON provider_accounts
          WHEN NOT (
-           (NEW.auth_state = 'credential_locked' AND
-             NEW.auth_block_reason IS 'credential_locked') OR
            (NEW.auth_state = 'reauthorization_required' AND
              NEW.auth_block_reason IS 'provider_reauthorization') OR
-           (NEW.auth_state NOT IN ('credential_locked', 'reauthorization_required') AND
+           (NEW.auth_state <> 'reauthorization_required' AND
              NEW.auth_block_reason IS NULL)
          )
          BEGIN
            SELECT RAISE(ABORT, 'provider account auth block provenance mismatch');
          END;
 
-         CREATE TRIGGER IF NOT EXISTS provider_account_auth_block_update
+         CREATE TRIGGER provider_account_auth_block_update
          BEFORE UPDATE OF auth_state, auth_block_reason ON provider_accounts
          WHEN NOT (
-           (NEW.auth_state = 'credential_locked' AND
-             NEW.auth_block_reason IS 'credential_locked') OR
            (NEW.auth_state = 'reauthorization_required' AND
              NEW.auth_block_reason IS 'provider_reauthorization') OR
-           (NEW.auth_state NOT IN ('credential_locked', 'reauthorization_required') AND
+           (NEW.auth_state <> 'reauthorization_required' AND
              NEW.auth_block_reason IS NULL)
          )
          BEGIN
            SELECT RAISE(ABORT, 'provider account auth block provenance mismatch');
          END;
 
-         CREATE TRIGGER IF NOT EXISTS provider_work_auth_block_insert
+         CREATE TRIGGER provider_work_auth_block_insert
          BEFORE INSERT ON provider_work_items
          WHEN NOT (
-           (NEW.state = 'authentication_blocked' AND (
-             NEW.auth_block_reason IS 'credential_locked' OR
-             NEW.auth_block_reason IS 'provider_reauthorization'
-           )) OR
+           (NEW.state = 'authentication_blocked' AND
+             NEW.auth_block_reason IS 'provider_reauthorization') OR
            (NEW.state <> 'authentication_blocked' AND NEW.auth_block_reason IS NULL)
          )
          BEGIN
            SELECT RAISE(ABORT, 'provider work auth block provenance mismatch');
          END;
 
-         CREATE TRIGGER IF NOT EXISTS provider_work_auth_block_update
+         CREATE TRIGGER provider_work_auth_block_update
          BEFORE UPDATE OF state, auth_block_reason ON provider_work_items
          WHEN NOT (
-           (NEW.state = 'authentication_blocked' AND (
-             NEW.auth_block_reason IS 'credential_locked' OR
-             NEW.auth_block_reason IS 'provider_reauthorization'
-           )) OR
+           (NEW.state = 'authentication_blocked' AND
+             NEW.auth_block_reason IS 'provider_reauthorization') OR
            (NEW.state <> 'authentication_blocked' AND NEW.auth_block_reason IS NULL)
          )
          BEGIN
@@ -786,6 +803,11 @@ fn rebuild_provider_accounts_table(transaction: &Transaction<'_>) -> Result<(), 
     } else {
         "NULL"
     };
+    let refresh_seconds = if column_exists(transaction, "provider_accounts", "refresh_seconds")? {
+        "refresh_seconds"
+    } else {
+        "60"
+    };
 
     transaction.execute_batch(
         "DROP TABLE IF EXISTS provider_accounts_v12;
@@ -798,27 +820,28 @@ fn rebuild_provider_accounts_table(transaction: &Transaction<'_>) -> Result<(), 
              length(CAST(remote_account_id AS BLOB)) BETWEEN 1 AND 2048
            ),
            auth_state TEXT NOT NULL DEFAULT 'signed_out' CHECK(auth_state IN (
-             'signed_out', 'credential_locked', 'ready', 'reauthorization_required', 'unavailable'
+             'signed_out', 'ready', 'reauthorization_required', 'unavailable'
            )),
            credential_ref TEXT CHECK(
              credential_ref IS NULL OR
              length(CAST(credential_ref AS BLOB)) BETWEEN 1 AND 256
            ),
            auth_block_reason TEXT CHECK(
-             auth_block_reason IS NULL OR auth_block_reason IN (
-               'credential_locked', 'provider_reauthorization'
-             )
+             auth_block_reason IS NULL OR auth_block_reason = 'provider_reauthorization'
            ),
            sync_state TEXT NOT NULL DEFAULT 'never_synced' CHECK(sync_state IN (
              'never_synced', 'idle', 'scheduled', 'syncing', 'backoff',
              'authentication_blocked', 'offline', 'failed'
            )),
+           refresh_seconds INTEGER NOT NULL DEFAULT 60 CHECK(
+             refresh_seconds BETWEEN 15 AND 86400
+           ),
            last_error_code TEXT CHECK(last_error_code IS NULL OR length(last_error_code) <= 200),
            last_sync_at INTEGER CHECK(last_sync_at IS NULL OR last_sync_at >= 0),
            created_at INTEGER NOT NULL CHECK(created_at >= 0),
            updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
            CHECK(
-             auth_state NOT IN ('ready', 'credential_locked', 'reauthorization_required') OR
+             auth_state NOT IN ('ready', 'reauthorization_required') OR
              credential_ref IS NOT NULL
            )
          );",
@@ -827,16 +850,16 @@ fn rebuild_provider_accounts_table(transaction: &Transaction<'_>) -> Result<(), 
     transaction.execute_batch(&format!(
         "INSERT INTO provider_accounts_v12(
            account_id, provider_kind, remote_account_id, auth_state,
-           credential_ref, auth_block_reason, sync_state, last_error_code,
-           last_sync_at, created_at, updated_at
+           credential_ref, auth_block_reason, sync_state, refresh_seconds,
+           last_error_code, last_sync_at, created_at, updated_at
          )
          SELECT account_id, provider_kind, remote_account_id,
            CASE auth_state
              WHEN 'locked' THEN CASE WHEN {credential_ref} IS NULL
-               THEN 'signed_out' ELSE 'credential_locked' END
+               THEN 'signed_out' ELSE 'reauthorization_required' END
              WHEN 'signed_out' THEN 'signed_out'
              WHEN 'credential_locked' THEN CASE WHEN {credential_ref} IS NULL
-               THEN 'signed_out' ELSE 'credential_locked' END
+               THEN 'signed_out' ELSE 'reauthorization_required' END
              WHEN 'ready' THEN CASE WHEN {credential_ref} IS NULL
                THEN 'signed_out' ELSE 'ready' END
              WHEN 'expired' THEN CASE WHEN {credential_ref} IS NULL
@@ -850,13 +873,10 @@ fn rebuild_provider_accounts_table(transaction: &Transaction<'_>) -> Result<(), 
            END,
            {credential_ref},
            CASE
-             WHEN {credential_ref} IS NOT NULL AND (
-               auth_state = 'credential_locked' OR
-               (auth_state = 'locked' AND {credential_ref} IS NOT NULL)
+             WHEN {credential_ref} IS NOT NULL AND auth_state IN (
+               'locked', 'credential_locked', 'expired', 'requires_action',
+               'reauthorization_required'
              )
-               THEN 'credential_locked'
-             WHEN {credential_ref} IS NOT NULL AND
-               auth_state IN ('expired', 'requires_action', 'reauthorization_required')
                THEN 'provider_reauthorization'
              ELSE NULL
            END,
@@ -879,6 +899,7 @@ fn rebuild_provider_accounts_table(transaction: &Transaction<'_>) -> Result<(), 
              ) THEN sync_state
              ELSE 'failed'
            END,
+           {refresh_seconds},
            last_error_code, last_sync_at, created_at, updated_at
          FROM provider_accounts;
          DROP TABLE provider_accounts;

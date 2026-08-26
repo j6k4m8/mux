@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::gmail_access::{encode_modify_authority, GmailAuthorizedTokens};
-use crate::vault::{CredentialVault, VaultError, VaultStatus};
+use crate::keychain::{CredentialStore, CredentialStoreStatus};
 
 const CLIENT_CONFIG_ENV: &str = "MUX_GOOGLE_OAUTH_CLIENT_CONFIG";
 const AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -64,10 +64,10 @@ impl GmailOAuthCommandError {
         Self { code, message }
     }
 
-    pub(crate) fn vault_locked() -> Self {
+    pub(crate) fn keychain_unavailable() -> Self {
         Self::new(
-            "vault_locked",
-            "Unlock credential protection before connecting Gmail.",
+            "keychain_unavailable",
+            "Mux could not reach the system keychain.",
         )
     }
 
@@ -703,12 +703,12 @@ fn decode_token_response(
 
 pub(crate) fn persist_authorized_mailbox(
     database_path: &Path,
-    vault: &CredentialVault,
+    credentials: &CredentialStore,
     mut authorized: AuthorizedMailbox,
     now_ms: i64,
 ) -> Result<GmailOAuthResult, GmailOAuthCommandError> {
-    if vault.status() != VaultStatus::Unlocked || now_ms < 0 {
-        return Err(GmailOAuthCommandError::vault_locked());
+    if credentials.status() != CredentialStoreStatus::Available || now_ms < 0 {
+        return Err(GmailOAuthCommandError::keychain_unavailable());
     }
     authorized.email = authorized.email.trim().to_ascii_lowercase();
     let account_id = account_id_for_email(&authorized.email);
@@ -723,10 +723,9 @@ pub(crate) fn persist_authorized_mailbox(
         authorized.tokens,
     )
     .map_err(|_| GmailOAuthCommandError::storage())?;
-    let expected = encoded.clone();
-    finish_vault_write(expected.as_slice(), vault.put(&record_ref, encoded), || {
-        vault.get(&record_ref)
-    })?;
+    credentials
+        .put(&record_ref, encoded)
+        .map_err(|_| GmailOAuthCommandError::storage())?;
 
     let database_result = persist_account_marker(
         database_path,
@@ -742,7 +741,7 @@ pub(crate) fn persist_authorized_mailbox(
             Ok(Some(account_id)) => account_id,
             Ok(None) => {
                 if configured_ref.is_none() {
-                    let _ = vault.remove(&record_ref);
+                    let _ = credentials.remove(&record_ref);
                 }
                 return Err(GmailOAuthCommandError::storage());
             }
@@ -920,34 +919,6 @@ fn persisted_account_id(
         )
         .optional()
         .map_err(|_| ())
-}
-
-fn finish_vault_write<F>(
-    expected: &[u8],
-    write_result: Result<(), VaultError>,
-    reread: F,
-) -> Result<(), GmailOAuthCommandError>
-where
-    F: FnOnce() -> Result<Option<Zeroizing<Vec<u8>>>, VaultError>,
-{
-    match write_result {
-        Ok(()) => Ok(()),
-        Err(VaultError::CommitUncertain { .. }) => {
-            let actual = reread().map_err(|_| GmailOAuthCommandError::storage())?;
-            if actual
-                .as_ref()
-                .is_some_and(|value| value.as_slice() == expected)
-            {
-                Ok(())
-            } else {
-                Err(GmailOAuthCommandError::storage())
-            }
-        }
-        Err(VaultError::Locked | VaultError::StaleUnlock) => {
-            Err(GmailOAuthCommandError::vault_locked())
-        }
-        Err(_) => Err(GmailOAuthCommandError::storage()),
-    }
 }
 
 #[cfg(test)]
@@ -1178,21 +1149,19 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("oauth.db");
         drop(MuxStore::open(&path, false).unwrap());
-        let mut vault = CredentialVault::for_database(&path);
-        vault
-            .create(Zeroizing::new(b"synthetic-test-passphrase".to_vec()))
-            .unwrap();
+        // A throwaway keychain so the test never touches the login keychain.
+        let credentials = CredentialStore::temporary(&directory.path().join("oauth.keychain"));
 
         let first = persist_authorized_mailbox(
             &path,
-            &vault,
+            &credentials,
             synthetic_authorized("reader@example.test"),
             1000,
         )
         .unwrap();
         let second = persist_authorized_mailbox(
             &path,
-            &vault,
+            &credentials,
             synthetic_authorized("READER@example.test"),
             2000,
         )
@@ -1225,7 +1194,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        let stored = vault.get(&record_ref).unwrap().unwrap();
+        let stored = credentials.get(&record_ref).unwrap().unwrap();
         let record: serde_json::Value = serde_json::from_slice(&stored).unwrap();
         assert_eq!(record["remoteSubject"], "reader@example.test");
         assert_eq!(record["scopes"], serde_json::json!([GMAIL_MODIFY_SCOPE]));

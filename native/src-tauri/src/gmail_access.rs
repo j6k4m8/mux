@@ -1,12 +1,11 @@
-//! Typed Gmail authority records behind the encrypted Rust vault.
+//! Typed Gmail authority records held in the system keychain.
 //!
 //! This is deliberately not an IPC surface. A configured SQLite row contains
-//! only an opaque vault lookup reference; every adapter execution revalidates
+//! only an opaque keychain lookup reference; every adapter execution revalidates
 //! the referenced record, account subject, scope, and expiry before I/O.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -16,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::gmail::{GmailAccessError, GmailAccessGrant, GmailAccessSource};
-use crate::vault::{CredentialVault, VaultError, VaultStatus};
+use crate::keychain::{CredentialError, CredentialStore, CredentialStoreStatus};
 use crate::worker::WorkerError;
 
 const RECORD_VERSION: u8 = 1;
@@ -55,38 +54,33 @@ pub(crate) trait GmailGrantRefresher {
     ) -> Result<RefreshedGrant, GmailAccessError>;
 }
 
-pub(crate) struct GmailVaultAccess<R> {
+pub(crate) struct GmailKeychainAccess<R> {
     database_path: PathBuf,
-    vault: Arc<Mutex<CredentialVault>>,
+    credentials: CredentialStore,
     refresher: R,
 }
 
-impl<R> GmailVaultAccess<R> {
-    pub(crate) fn new(
-        database_path: &Path,
-        vault: Arc<Mutex<CredentialVault>>,
-        refresher: R,
-    ) -> Self {
+impl<R> GmailKeychainAccess<R> {
+    pub(crate) fn new(database_path: &Path, credentials: CredentialStore, refresher: R) -> Self {
         Self {
             database_path: database_path.to_owned(),
-            vault,
+            credentials,
             refresher,
         }
     }
 }
 
-/// Validates every configured Gmail lookup marker against the unlocked vault
-/// before the generic worker is allowed to transition credential-locked rows
-/// back to ready. Missing, malformed, wrong-version, wrong-scope, and
-/// wrong-subject records remain provider-reauthorization blocked.
-pub(crate) fn reconcile_unlocked_records(
+/// Validates every configured Gmail lookup marker against the keychain at
+/// startup. Missing, malformed, wrong-version, wrong-scope, and wrong-subject
+/// records are left provider-reauthorization blocked.
+pub(crate) fn reconcile_credential_records(
     database_path: &Path,
-    vault: &CredentialVault,
+    credentials: &CredentialStore,
     now_ms: i64,
 ) -> Result<usize, WorkerError> {
-    if now_ms < 0 || vault.status() != VaultStatus::Unlocked {
+    if now_ms < 0 || credentials.status() != CredentialStoreStatus::Available {
         return Err(WorkerError::Conflict(
-            "Gmail authority cannot be reconciled while the vault is locked".into(),
+            "Gmail authority cannot be reconciled while the keychain is unavailable".into(),
         ));
     }
     let mut connection = Connection::open(database_path)?;
@@ -96,7 +90,7 @@ pub(crate) fn reconcile_unlocked_records(
             "SELECT account_id, remote_account_id, credential_ref
              FROM provider_accounts
              WHERE provider_kind = 'gmail' AND credential_ref IS NOT NULL
-               AND auth_state IN ('credential_locked', 'ready')
+               AND auth_state = 'ready'
              ORDER BY account_id",
         )?;
         let values = statement
@@ -112,19 +106,14 @@ pub(crate) fn reconcile_unlocked_records(
     };
     let mut invalid = 0;
     for (account_id, remote_subject, reference) in accounts {
-        let valid = match vault.get(&reference) {
+        let valid = match credentials.get(&reference) {
             Ok(Some(bytes)) => GmailAuthorityRecord::decode(&bytes)
                 .and_then(|record| record.validate_for_subject(&remote_subject))
                 .is_ok(),
             Ok(None) => false,
-            Err(VaultError::Locked | VaultError::StaleUnlock) => {
+            Err(CredentialError::Unavailable) => {
                 return Err(WorkerError::Conflict(
-                    "Gmail authority reconciliation lost the vault unlock".into(),
-                ))
-            }
-            Err(VaultError::Io(_)) => {
-                return Err(WorkerError::Conflict(
-                    "Gmail authority reconciliation could not read the vault".into(),
+                    "Gmail authority reconciliation could not read the keychain".into(),
                 ))
             }
             Err(_) => false,
@@ -160,7 +149,7 @@ pub(crate) fn reconcile_unlocked_records(
     Ok(invalid)
 }
 
-impl<R> GmailVaultAccess<R>
+impl<R> GmailKeychainAccess<R>
 where
     R: GmailGrantRefresher + Sync,
 {
@@ -172,7 +161,7 @@ where
     ) -> Result<GmailAccessGrant, GmailAccessError> {
         let configured = read_configured_account(&self.database_path, account_id)?;
         match configured.auth_state.as_str() {
-            "credential_locked" => return Err(GmailAccessError::Locked),
+            "credential_locked" => return Err(GmailAccessError::CredentialUnavailable),
             "reauthorization_required" | "signed_out" => {
                 return Err(GmailAccessError::ReauthorizationRequired)
             }
@@ -182,16 +171,11 @@ where
         let reference = configured
             .record_ref
             .ok_or(GmailAccessError::ReauthorizationRequired)?;
-        let bytes = {
-            let vault = self.vault.lock().map_err(|_| GmailAccessError::Permanent)?;
-            if vault.status() != VaultStatus::Unlocked {
-                return Err(GmailAccessError::Locked);
-            }
-            vault
-                .get(&reference)
-                .map_err(map_vault_error)?
-                .ok_or(GmailAccessError::ReauthorizationRequired)?
-        };
+        let bytes = self
+            .credentials
+            .get(&reference)
+            .map_err(map_credential_error)?
+            .ok_or(GmailAccessError::ReauthorizationRequired)?;
         let mut record = GmailAuthorityRecord::decode(bytes.as_slice())?;
         record.validate_for_subject(&configured.remote_subject)?;
         if requires_modify && !record.can_mutate() {
@@ -233,16 +217,9 @@ where
         {
             return Err(GmailAccessError::ReauthorizationRequired);
         }
-        {
-            let vault = self.vault.lock().map_err(|_| GmailAccessError::Permanent)?;
-            if vault.status() != VaultStatus::Unlocked {
-                return Err(GmailAccessError::Locked);
-            }
-            let expected = record.encode()?;
-            finish_refresh_write(expected.as_slice(), vault.put(&reference, encoded), || {
-                vault.get(&reference)
-            })?;
-        }
+        self.credentials
+            .put(&reference, encoded)
+            .map_err(map_credential_error)?;
         Ok(GmailAccessGrant {
             access_value: record
                 .access_value
@@ -253,7 +230,7 @@ where
     }
 }
 
-impl<R> GmailAccessSource for GmailVaultAccess<R>
+impl<R> GmailAccessSource for GmailKeychainAccess<R>
 where
     R: GmailGrantRefresher + Sync,
 {
@@ -450,48 +427,13 @@ fn validate_field(value: &str) -> Result<(), GmailAccessError> {
     Ok(())
 }
 
-fn map_vault_error(error: VaultError) -> GmailAccessError {
+fn map_credential_error(error: CredentialError) -> GmailAccessError {
     match error {
-        VaultError::Locked | VaultError::StaleUnlock => GmailAccessError::Locked,
-        VaultError::Absent => GmailAccessError::ReauthorizationRequired,
-        VaultError::Io(_) => GmailAccessError::Retryable,
-        _ => GmailAccessError::Permanent,
-    }
-}
-
-fn map_vault_refresh_write_error(error: VaultError) -> GmailAccessError {
-    match error {
-        VaultError::Locked | VaultError::StaleUnlock => GmailAccessError::Locked,
-        VaultError::Io(_) => GmailAccessError::Retryable,
-        // Commit uncertainty must not be blindly retried because the refreshed
-        // record may already be durable after rename.
-        VaultError::CommitUncertain { .. } => GmailAccessError::Permanent,
-        _ => GmailAccessError::Permanent,
-    }
-}
-
-fn finish_refresh_write<F>(
-    expected: &[u8],
-    write_result: Result<(), VaultError>,
-    reread: F,
-) -> Result<(), GmailAccessError>
-where
-    F: FnOnce() -> Result<Option<Zeroizing<Vec<u8>>>, VaultError>,
-{
-    match write_result {
-        Ok(()) => Ok(()),
-        Err(VaultError::CommitUncertain { .. }) => {
-            let actual = reread().map_err(map_vault_error)?;
-            if actual
-                .as_ref()
-                .is_some_and(|value| value.as_slice() == expected)
-            {
-                Ok(())
-            } else {
-                Err(GmailAccessError::Permanent)
-            }
+        // A keychain that cannot answer is a transient condition, not a decision.
+        CredentialError::Unavailable => GmailAccessError::Retryable,
+        CredentialError::InvalidIdentifier | CredentialError::LimitExceeded(_) => {
+            GmailAccessError::Permanent
         }
-        Err(error) => Err(map_vault_refresh_write_error(error)),
     }
 }
 
@@ -647,13 +589,6 @@ mod tests {
     use super::*;
     use crate::store::MuxStore;
 
-    fn uncertain_write() -> Result<(), VaultError> {
-        Err(VaultError::CommitUncertain {
-            operation: "update",
-            source: std::io::Error::other("synthetic post-rename uncertainty"),
-        })
-    }
-
     struct FixtureRefresher {
         calls: AtomicUsize,
     }
@@ -692,7 +627,23 @@ mod tests {
         .unwrap()
     }
 
-    fn configured_fixture() -> (tempfile::TempDir, PathBuf, Arc<Mutex<CredentialVault>>) {
+    /// Each fixture gets its own keychain service, and removes what it wrote.
+    struct FixtureCredentials {
+        store: CredentialStore,
+        identifiers: Vec<&'static str>,
+    }
+
+    impl Drop for FixtureCredentials {
+        fn drop(&mut self) {
+            for identifier in &self.identifiers {
+                let _ = self.store.remove(identifier);
+            }
+        }
+    }
+
+    static FIXTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    fn configured_fixture() -> (tempfile::TempDir, PathBuf, FixtureCredentials) {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("gmail-access.db");
         drop(MuxStore::open(&path, false).expect("native store"));
@@ -714,36 +665,27 @@ mod tests {
             )
             .expect("provider account fixture");
         drop(connection);
-        let mut vault = CredentialVault::for_database(&path);
-        vault
-            .create(Zeroizing::new(b"fixture-passphrase".to_vec()))
-            .expect("create vault");
-        vault
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        // A throwaway keychain per fixture: no login-keychain access, no prompts.
+        let store = CredentialStore::temporary(
+            &directory
+                .path()
+                .join(format!("gmail-access-{sequence}.keychain")),
+        );
+        store
             .put(
                 "gmail/fixture/a",
                 Zeroizing::new(authority_record("subject-1", 4_000_000)),
             )
             .expect("put authority record");
-        (directory, path, Arc::new(Mutex::new(vault)))
-    }
-
-    #[test]
-    fn gmail_provider_conformance_commit_uncertainty_accepts_only_the_exact_record() {
-        let expected = b"exact refreshed authority record";
-        assert!(finish_refresh_write(expected, uncertain_write(), || {
-            Ok(Some(Zeroizing::new(expected.to_vec())))
-        })
-        .is_ok());
-        assert!(matches!(
-            finish_refresh_write(expected, uncertain_write(), || Ok(None)),
-            Err(GmailAccessError::Permanent)
-        ));
-        assert!(matches!(
-            finish_refresh_write(expected, uncertain_write(), || {
-                Ok(Some(Zeroizing::new(b"different authority record".to_vec())))
-            }),
-            Err(GmailAccessError::Permanent)
-        ));
+        (
+            directory,
+            path,
+            FixtureCredentials {
+                store,
+                identifiers: vec!["gmail/fixture/a"],
+            },
+        )
     }
 
     #[test]
@@ -851,10 +793,10 @@ mod tests {
 
     #[test]
     fn gmail_provider_conformance_mutations_require_modify_authority() {
-        let (_directory, path, vault) = configured_fixture();
-        let source = GmailVaultAccess::new(
+        let (_directory, path, credentials) = configured_fixture();
+        let source = GmailKeychainAccess::new(
             &path,
-            Arc::clone(&vault),
+            credentials.store.clone(),
             FixtureRefresher {
                 calls: AtomicUsize::new(0),
             },
@@ -864,9 +806,8 @@ mod tests {
             source.access_for_mutation("gmail-account", 1_000),
             Err(GmailAccessError::ReauthorizationRequired)
         ));
-        vault
-            .lock()
-            .unwrap()
+        credentials
+            .store
             .put(
                 "gmail/fixture/a",
                 Zeroizing::new(authority_record_with_scope(
@@ -902,11 +843,11 @@ mod tests {
     }
 
     #[test]
-    fn gmail_provider_conformance_vault_record_is_verified_before_access_or_refresh() {
-        let (_directory, path, vault) = configured_fixture();
-        let source = GmailVaultAccess::new(
+    fn gmail_provider_conformance_keychain_record_is_verified_before_access_or_refresh() {
+        let (_directory, path, credentials) = configured_fixture();
+        let source = GmailKeychainAccess::new(
             &path,
-            Arc::clone(&vault),
+            credentials.store.clone(),
             FixtureRefresher {
                 calls: AtomicUsize::new(0),
             },
@@ -921,21 +862,24 @@ mod tests {
         );
         assert_eq!(source.refresher.calls.load(Ordering::SeqCst), 0);
 
-        vault.lock().expect("vault lock").lock();
+        // A record that disappears must stop access rather than reuse a cached grant.
+        credentials
+            .store
+            .remove("gmail/fixture/a")
+            .expect("remove authority record");
         assert!(matches!(
             source.access_for_account("gmail-account", 1_000),
-            Err(GmailAccessError::Locked)
+            Err(GmailAccessError::ReauthorizationRequired)
         ));
         assert_eq!(source.refresher.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn gmail_provider_conformance_near_expiry_access_refreshes_before_a_whole_page() {
-        let (_directory, path, vault) = configured_fixture();
+        let (_directory, path, credentials) = configured_fixture();
         let now_ms = 1_000;
-        vault
-            .lock()
-            .expect("vault lock")
+        credentials
+            .store
             .put(
                 "gmail/fixture/a",
                 Zeroizing::new(authority_record(
@@ -944,9 +888,9 @@ mod tests {
                 )),
             )
             .expect("replace near-expiry authority record");
-        let source = GmailVaultAccess::new(
+        let source = GmailKeychainAccess::new(
             &path,
-            vault,
+            credentials.store.clone(),
             FixtureRefresher {
                 calls: AtomicUsize::new(0),
             },
@@ -964,18 +908,17 @@ mod tests {
 
     #[test]
     fn gmail_provider_conformance_expired_access_refreshes_and_rewrites_only_the_vault() {
-        let (_directory, path, vault) = configured_fixture();
-        vault
-            .lock()
-            .expect("vault lock")
+        let (_directory, path, credentials) = configured_fixture();
+        credentials
+            .store
             .put(
                 "gmail/fixture/a",
                 Zeroizing::new(authority_record("subject-1", 100)),
             )
             .expect("replace expired authority record");
-        let source = GmailVaultAccess::new(
+        let source = GmailKeychainAccess::new(
             &path,
-            Arc::clone(&vault),
+            credentials.store.clone(),
             FixtureRefresher {
                 calls: AtomicUsize::new(0),
             },
@@ -989,9 +932,8 @@ mod tests {
             "synthetic-refreshed-value"
         );
         assert_eq!(source.refresher.calls.load(Ordering::SeqCst), 1);
-        let stored = vault
-            .lock()
-            .expect("vault lock")
+        let stored = credentials
+            .store
             .get("gmail/fixture/a")
             .expect("read refreshed record")
             .expect("refreshed record exists");
@@ -1014,18 +956,17 @@ mod tests {
 
     #[test]
     fn gmail_provider_conformance_subject_mismatch_never_refreshes() {
-        let (_directory, path, vault) = configured_fixture();
-        vault
-            .lock()
-            .expect("vault lock")
+        let (_directory, path, credentials) = configured_fixture();
+        credentials
+            .store
             .put(
                 "gmail/fixture/a",
                 Zeroizing::new(authority_record("different-subject", 100)),
             )
             .expect("replace mismatched record");
-        let source = GmailVaultAccess::new(
+        let source = GmailKeychainAccess::new(
             &path,
-            vault,
+            credentials.store.clone(),
             FixtureRefresher {
                 calls: AtomicUsize::new(0),
             },
@@ -1038,28 +979,24 @@ mod tests {
     }
 
     #[test]
-    fn gmail_provider_conformance_unlock_reconciliation_blocks_missing_records_before_resume() {
-        let (_directory, path, vault) = configured_fixture();
-        vault
-            .lock()
-            .expect("vault lock")
+    fn gmail_provider_conformance_reconciliation_blocks_missing_records_at_startup() {
+        let (_directory, path, credentials) = configured_fixture();
+        credentials
+            .store
             .remove("gmail/fixture/a")
             .expect("remove authority record");
         let connection = Connection::open(&path).expect("fixture connection");
         connection
             .execute(
-                "UPDATE provider_accounts
-                 SET auth_state = 'credential_locked',
-                     auth_block_reason = 'credential_locked',
-                     sync_state = 'authentication_blocked'
+                "UPDATE provider_accounts SET auth_state = 'ready', sync_state = 'idle'
                  WHERE account_id = 'gmail-account'",
                 [],
             )
-            .expect("simulate startup lock");
+            .expect("account believed usable");
         drop(connection);
 
         assert_eq!(
-            reconcile_unlocked_records(&path, &vault.lock().expect("vault lock"), 5_000,)
+            reconcile_credential_records(&path, &credentials.store, 5_000,)
                 .expect("reconcile missing record"),
             1
         );

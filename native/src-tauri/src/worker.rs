@@ -335,9 +335,10 @@ pub(crate) enum WorkerOutcome {
         code: String,
         retry_after_at: i64,
     },
-    /// The configured vault could not yield credentials before provider I/O began.
-    /// This is therefore safe for non-idempotent sends and does not consume retry budget.
-    CredentialLocked,
+    /// No usable credential was available before provider I/O began, so the
+    /// account needs reauthorizing. Safe for non-idempotent sends because
+    /// nothing was submitted, and it does not consume retry budget.
+    CredentialUnavailable,
     AuthenticationExpired {
         code: String,
     },
@@ -964,7 +965,7 @@ impl DurableWorker {
                 set_terminal(&transaction, &claim.id, WorkState::Failed, Some(&code), now)?;
                 WorkState::Failed
             }
-            WorkerOutcome::CredentialLocked => {
+            WorkerOutcome::CredentialUnavailable => {
                 refund_pre_submission_attempt(&transaction, &claim.id)?;
                 let account = transaction
                     .query_row(
@@ -981,17 +982,13 @@ impl DurableWorker {
                     )
                     .optional()?;
                 match account {
-                    Some((auth_state, Some(_), reason))
-                        if auth_state == "ready"
-                            || (auth_state == "credential_locked"
-                                && reason.as_deref() == Some("credential_locked")) =>
-                    {
+                    Some((auth_state, Some(_), _)) if auth_state == "ready" => {
                         transaction.execute(
                             "UPDATE provider_accounts
-                             SET auth_state = 'credential_locked',
-                                 auth_block_reason = 'credential_locked',
+                             SET auth_state = 'reauthorization_required',
+                                 auth_block_reason = 'provider_reauthorization',
                                  sync_state = 'authentication_blocked',
-                                 last_error_code = 'credential_locked', updated_at = ?2
+                                 last_error_code = 'credential_unavailable', updated_at = ?2
                              WHERE account_id = ?1",
                             params![claim.account_id, now],
                         )?;
@@ -999,8 +996,8 @@ impl DurableWorker {
                             &transaction,
                             &claim.id,
                             now,
-                            "credential_locked",
-                            "credential_locked",
+                            "provider_reauthorization",
+                            "credential_unavailable",
                         )?;
                         WorkState::AuthenticationBlocked
                     }
@@ -1302,186 +1299,6 @@ impl DurableWorker {
         )?;
         transaction.commit()?;
         Ok(changed)
-    }
-
-    /// Unlocks only work blocked because the local credential vault was locked. Provider-side
-    /// revocation remains blocked until `resume_after_auth` is called after reauthorization.
-    pub fn resume_after_credential_unlock(
-        &self,
-        account_id: &str,
-        now: i64,
-    ) -> Result<usize, WorkerError> {
-        bounded_nonempty(account_id, "Account ID", MAX_ACCOUNT_ID_BYTES)?;
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let account_changed = transaction.execute(
-            "UPDATE provider_accounts
-             SET auth_state = 'ready', sync_state = 'scheduled', last_error_code = NULL,
-                 auth_block_reason = NULL, updated_at = ?2
-             WHERE account_id = ?1 AND credential_ref IS NOT NULL
-               AND auth_state = 'credential_locked'
-               AND auth_block_reason = 'credential_locked'",
-            params![account_id, now],
-        )?;
-        if account_changed != 1 {
-            return Err(WorkerError::Conflict(
-                "Configured provider account is not credential-locked".into(),
-            ));
-        }
-        clear_resumed_linked_operation_errors(&transaction, account_id, "credential_locked", now)?;
-        let changed = transaction.execute(
-            "UPDATE provider_work_items
-             SET state = 'queued', available_at = ?2, last_error_code = NULL,
-                 auth_block_reason = NULL
-             WHERE account_id = ?1 AND state = 'authentication_blocked'
-               AND auth_block_reason = 'credential_locked'",
-            params![account_id, now],
-        )?;
-        transaction.commit()?;
-        Ok(changed)
-    }
-
-    /// Resumes every account blocked only by the process-local vault lock. This is the lifecycle
-    /// unlock path: provider reauthorization rows are excluded in each statement, so they cannot
-    /// be revived even if account and work rows are concurrently present in the same database.
-    /// The returned count is the number of durable work items moved back to `queued`.
-    pub fn resume_all_after_credential_unlock(&self, now: i64) -> Result<usize, WorkerError> {
-        if now < 0 {
-            return Err(WorkerError::Validation(
-                "Worker clock cannot be negative".into(),
-            ));
-        }
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "UPDATE operations
-             SET state = 'retrying', not_before = ?1, error = NULL
-             WHERE id IN (
-               SELECT work.operation_id
-               FROM provider_work_items work
-               JOIN provider_accounts account ON account.account_id = work.account_id
-               WHERE work.state = 'authentication_blocked'
-                 AND work.auth_block_reason = 'credential_locked'
-                 AND work.operation_id IS NOT NULL
-                 AND account.auth_state = 'credential_locked'
-                 AND account.auth_block_reason = 'credential_locked'
-                 AND account.credential_ref IS NOT NULL
-             ) AND state = 'retrying'",
-            [now],
-        )?;
-        let changed = transaction.execute(
-            "UPDATE provider_work_items
-             SET state = 'queued', available_at = ?1, last_error_code = NULL,
-                 auth_block_reason = NULL
-             WHERE state = 'authentication_blocked'
-               AND auth_block_reason = 'credential_locked'
-               AND EXISTS (
-                 SELECT 1 FROM provider_accounts account
-                 WHERE account.account_id = provider_work_items.account_id
-                   AND account.auth_state = 'credential_locked'
-                   AND account.auth_block_reason = 'credential_locked'
-                   AND account.credential_ref IS NOT NULL
-               )",
-            [now],
-        )?;
-        transaction.execute(
-            "UPDATE provider_accounts
-             SET auth_state = 'ready', sync_state = 'scheduled', last_error_code = NULL,
-                 auth_block_reason = NULL, updated_at = ?1
-             WHERE credential_ref IS NOT NULL AND auth_state = 'credential_locked'
-               AND auth_block_reason = 'credential_locked'",
-            [now],
-        )?;
-        transaction.commit()?;
-        Ok(changed)
-    }
-
-    /// Every process starts with the vault locked. Only real provider accounts carrying a
-    /// non-secret credential lookup reference are transitioned; fake/demo accounts are untouched.
-    pub fn mark_configured_credentials_locked_for_startup(
-        &self,
-        now: i64,
-    ) -> Result<usize, WorkerError> {
-        if now < 0 {
-            return Err(WorkerError::Validation(
-                "Worker clock cannot be negative".into(),
-            ));
-        }
-        let connection = self.connect()?;
-        let changed = connection.execute(
-            "UPDATE provider_accounts
-             SET auth_state = 'credential_locked',
-                 auth_block_reason = 'credential_locked',
-                 sync_state = 'authentication_blocked',
-                 last_error_code = 'credential_locked', updated_at = ?1
-             WHERE auth_state = 'ready' AND credential_ref IS NOT NULL",
-            [now],
-        )?;
-        Ok(changed)
-    }
-
-    /// Reconciles SQLite after the user explicitly deletes the vault. Waiting work is cancelled
-    /// before execution, retry-safe in-flight work receives cooperative cancellation, and an
-    /// executing non-idempotent send is left to its normal acknowledgement/uncertainty path.
-    /// Credentials already copied into in-flight provider I/O cannot be revoked by this helper.
-    pub fn reset_credentials_after_vault_deletion(&self, now: i64) -> Result<usize, WorkerError> {
-        if now < 0 {
-            return Err(WorkerError::Validation(
-                "Worker clock cannot be negative".into(),
-            ));
-        }
-        let mut connection = self.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let account_count = transaction.query_row(
-            "SELECT COUNT(*) FROM provider_accounts WHERE credential_ref IS NOT NULL",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
-        transaction.execute(
-            "UPDATE operations
-             SET state = 'cancelled', error = 'credentials_reset'
-             WHERE id IN (
-               SELECT work.operation_id FROM provider_work_items work
-               JOIN provider_accounts account ON account.account_id = work.account_id
-               WHERE account.credential_ref IS NOT NULL
-                 AND work.operation_id IS NOT NULL
-                 AND work.state NOT IN (
-                   'executing', 'succeeded', 'failed', 'cancelled', 'outcome_unknown'
-                 )
-             ) AND state IN ('pending', 'executing', 'retrying', 'cancelled')",
-            [],
-        )?;
-        transaction.execute(
-            "UPDATE provider_work_items
-             SET state = 'cancelled', completed_at = ?1,
-                 last_error_code = 'credentials_reset', auth_block_reason = NULL,
-                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                 retry_after_at = NULL
-             WHERE account_id IN (
-               SELECT account_id FROM provider_accounts WHERE credential_ref IS NOT NULL
-             ) AND state NOT IN (
-               'executing', 'succeeded', 'failed', 'cancelled', 'outcome_unknown'
-             )",
-            [now],
-        )?;
-        transaction.execute(
-            "UPDATE provider_work_items
-             SET cancel_requested = 1, last_error_code = 'credentials_reset'
-             WHERE account_id IN (
-               SELECT account_id FROM provider_accounts WHERE credential_ref IS NOT NULL
-             ) AND state = 'executing' AND kind <> 'send'",
-            [],
-        )?;
-        transaction.execute(
-            "UPDATE provider_accounts
-             SET auth_state = 'signed_out', credential_ref = NULL,
-                 auth_block_reason = NULL, sync_state = 'offline',
-                 last_error_code = NULL, updated_at = ?1
-             WHERE credential_ref IS NOT NULL",
-            [now],
-        )?;
-        transaction.commit()?;
-        Ok(account_count)
     }
 
     pub fn recover_expired(&self, now: i64) -> Result<RecoveryResult, WorkerError> {
@@ -2816,10 +2633,6 @@ mod tests {
                 .as_deref(),
             Some("provider_reauthorization")
         );
-        assert!(matches!(
-            worker.resume_after_credential_unlock("account-a", 29),
-            Err(WorkerError::Conflict(_))
-        ));
         assert!(
             worker
                 .claim_available(10_000, "worker", 3)
@@ -2854,7 +2667,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_locked_send_is_pre_submission_safe_and_preserves_retry_budget() {
+    fn credential_unavailable_send_is_pre_submission_safe_and_preserves_retry_budget() {
         let (_directory, path, worker) = configured_worker(&["account-a"]);
         let connection = Connection::open(&path).unwrap();
         connection
@@ -2888,7 +2701,7 @@ mod tests {
         assert_eq!(claim.kind, WorkKind::Send);
         assert_eq!(
             worker
-                .acknowledge(&claim, WorkerOutcome::CredentialLocked, 2)
+                .acknowledge(&claim, WorkerOutcome::CredentialUnavailable, 2)
                 .unwrap(),
             WorkState::AuthenticationBlocked
         );
@@ -2896,11 +2709,11 @@ mod tests {
         assert_eq!(blocked.attempt_count, 0);
         assert_eq!(
             blocked.last_error_code.as_deref(),
-            Some("credential_locked")
+            Some("credential_unavailable")
         );
         assert_eq!(
             blocked.auth_block_reason.as_deref(),
-            Some("credential_locked")
+            Some("provider_reauthorization")
         );
         let connection = Connection::open(&path).unwrap();
         assert_eq!(
@@ -2918,7 +2731,7 @@ mod tests {
                     },
                 )
                 .unwrap(),
-            ("retrying".into(), 0, Some("credential_locked".into()))
+            ("retrying".into(), 0, Some("credential_unavailable".into()))
         );
         assert_eq!(
             connection
@@ -2929,449 +2742,26 @@ mod tests {
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .unwrap(),
-            ("credential_locked".into(), "credential_locked".into())
+            (
+                "reauthorization_required".into(),
+                "provider_reauthorization".into()
+            )
         );
         drop(connection);
 
-        assert!(matches!(
-            worker.resume_after_auth("account-a", 3),
-            Err(WorkerError::Conflict(_))
-        ));
-        assert_eq!(
-            worker
-                .resume_after_credential_unlock("account-a", 4)
-                .unwrap(),
-            1
-        );
+        // Reauthorizing the account is the only way back, and it costs no attempt.
+        assert_eq!(worker.resume_after_auth("account-a", 4).unwrap(), 1);
         let resumed = worker.snapshot("locked-send").unwrap().unwrap();
         assert_eq!(resumed.state, WorkState::Queued);
         assert_eq!(resumed.attempt_count, 0);
         assert_eq!(resumed.auth_block_reason, None);
         let second_claim = worker.claim_available(4, "worker", 1).unwrap();
-        assert_eq!(second_claim.len(), 1, "vault locking consumed no attempt");
+        assert_eq!(
+            second_claim.len(),
+            1,
+            "an unavailable credential consumed no attempt"
+        );
         assert_eq!(second_claim[0].attempt, 1);
-    }
-
-    #[test]
-    fn concurrent_provider_reauthorization_wins_over_credential_unlock_provenance() {
-        let (_directory, path, worker) = configured_worker(&["account-a"]);
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE provider_accounts SET credential_ref = 'vault_entry_account_a'
-                 WHERE account_id = 'account-a'",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-        let mut send = item("auth-race-send", "account-a", WorkKind::Send);
-        send.max_attempts = 1;
-        worker.enqueue(send, 0).unwrap();
-        let claim = worker.claim_available(1, "worker", 1).unwrap().remove(0);
-
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "UPDATE provider_accounts
-                 SET auth_state = 'reauthorization_required',
-                     auth_block_reason = 'provider_reauthorization',
-                     sync_state = 'authentication_blocked'
-                 WHERE account_id = 'account-a'",
-                [],
-            )
-            .unwrap();
-        assert_eq!(
-            worker
-                .acknowledge(&claim, WorkerOutcome::CredentialLocked, 2)
-                .unwrap(),
-            WorkState::AuthenticationBlocked
-        );
-        let blocked = worker.snapshot("auth-race-send").unwrap().unwrap();
-        assert_eq!(blocked.attempt_count, 0);
-        assert_eq!(
-            blocked.auth_block_reason.as_deref(),
-            Some("provider_reauthorization")
-        );
-        assert_eq!(worker.resume_all_after_credential_unlock(3).unwrap(), 0);
-        assert_eq!(
-            worker.snapshot("auth-race-send").unwrap().unwrap().state,
-            WorkState::AuthenticationBlocked
-        );
-        assert_eq!(worker.resume_after_auth("account-a", 4).unwrap(), 1);
-        assert_eq!(
-            worker.snapshot("auth-race-send").unwrap().unwrap().state,
-            WorkState::Queued
-        );
-    }
-
-    #[test]
-    fn startup_locks_only_configured_accounts_and_claims_require_provider_readiness() {
-        let (_directory, path, worker) = configured_worker(&["configured", "fixture", "reauth"]);
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "-- Model a legacy/tampered row to verify the worker also enforces the invariant
-                 -- defensively; current schema constraints reject this state on normal writes.
-                 PRAGMA ignore_check_constraints = ON;
-                 UPDATE provider_accounts SET credential_ref = NULL
-                   WHERE account_id = 'fixture';
-                 PRAGMA ignore_check_constraints = OFF;
-                 UPDATE provider_accounts
-                   SET credential_ref = 'vault:v1:reauth',
-                       auth_state = 'reauthorization_required',
-                       auth_block_reason = 'provider_reauthorization',
-                       sync_state = 'authentication_blocked'
-                   WHERE account_id = 'reauth';",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO accounts(id, name, email, color, provider)
-                 VALUES('unconfigured-real', 'Real', 'real@example.com', '#000000', 'jmap')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-        worker
-            .enqueue(item("configured-work", "configured", WorkKind::Sync), 0)
-            .unwrap();
-        worker
-            .enqueue(item("fixture-work", "fixture", WorkKind::Sync), 0)
-            .unwrap();
-        worker
-            .enqueue(item("reauth-work", "reauth", WorkKind::Sync), 0)
-            .unwrap();
-        worker
-            .enqueue(item("orphan-work", "unconfigured-real", WorkKind::Sync), 0)
-            .unwrap();
-
-        assert_eq!(
-            worker
-                .mark_configured_credentials_locked_for_startup(5)
-                .unwrap(),
-            1
-        );
-        assert!(worker.claim_available(5, "worker", 3).unwrap().is_empty());
-        assert_eq!(
-            worker.next_wake_delay(5).unwrap(),
-            Duration::from_millis(test_config().idle_poll_ms),
-            "a ready real-provider row without a credential reference must not wake the worker"
-        );
-        let connection = Connection::open(&path).unwrap();
-        let states = connection
-            .prepare(
-                "SELECT account_id, auth_state, auth_block_reason
-                 FROM provider_accounts ORDER BY account_id",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            states,
-            vec![
-                (
-                    "configured".into(),
-                    "credential_locked".into(),
-                    Some("credential_locked".into())
-                ),
-                ("fixture".into(), "ready".into(), None),
-                (
-                    "reauth".into(),
-                    "reauthorization_required".into(),
-                    Some("provider_reauthorization".into())
-                )
-            ]
-        );
-        drop(connection);
-        assert_eq!(worker.resume_all_after_credential_unlock(6).unwrap(), 0);
-        assert_eq!(
-            worker
-                .claim_available(6, "worker", 3)
-                .unwrap()
-                .iter()
-                .map(|work| work.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["configured-work"]
-        );
-        assert_eq!(
-            worker.snapshot("orphan-work").unwrap().unwrap().state,
-            WorkState::Queued
-        );
-        assert_eq!(
-            worker.snapshot("fixture-work").unwrap().unwrap().state,
-            WorkState::Queued
-        );
-        assert_eq!(
-            worker.snapshot("reauth-work").unwrap().unwrap().state,
-            WorkState::Queued
-        );
-        assert!(matches!(
-            worker.resume_after_credential_unlock("reauth", 7),
-            Err(WorkerError::Conflict(_))
-        ));
-    }
-
-    #[test]
-    fn vault_reset_signs_out_accounts_without_resuming_or_ambiguously_cancelling_sends() {
-        let (_directory, path, worker) = configured_worker(&["account-a"]);
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "UPDATE provider_accounts SET credential_ref = 'vault_entry_account_a'
-                 WHERE account_id = 'account-a'",
-                [],
-            )
-            .unwrap();
-        worker
-            .enqueue(item("executing-safe", "account-a", WorkKind::Mutation), 0)
-            .unwrap();
-        worker
-            .enqueue(item("executing-send", "account-a", WorkKind::Send), 1)
-            .unwrap();
-        worker
-            .enqueue(item("waiting", "account-a", WorkKind::Sync), 2)
-            .unwrap();
-        let claims = worker.claim_available(3, "worker", 3).unwrap();
-        assert_eq!(claims.len(), 2);
-        let send_claim = claims
-            .iter()
-            .find(|claim| claim.id == "executing-send")
-            .unwrap()
-            .clone();
-
-        assert_eq!(worker.reset_credentials_after_vault_deletion(4).unwrap(), 1);
-        let safe = worker.snapshot("executing-safe").unwrap().unwrap();
-        let send = worker.snapshot("executing-send").unwrap().unwrap();
-        let waiting = worker.snapshot("waiting").unwrap().unwrap();
-        assert_eq!(safe.state, WorkState::Executing);
-        assert!(safe.cancel_requested);
-        assert_eq!(send.state, WorkState::Executing);
-        assert!(!send.cancel_requested);
-        assert_eq!(waiting.state, WorkState::Cancelled);
-        assert_eq!(
-            waiting.last_error_code.as_deref(),
-            Some("credentials_reset")
-        );
-        let connection = Connection::open(path).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT auth_state, credential_ref, auth_block_reason
-                     FROM provider_accounts WHERE account_id = 'account-a'",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-                .unwrap(),
-            ("signed_out".into(), None, None)
-        );
-        assert!(worker.claim_available(10, "other", 3).unwrap().is_empty());
-        assert!(matches!(
-            worker.resume_after_credential_unlock("account-a", 10),
-            Err(WorkerError::Conflict(_))
-        ));
-        assert!(matches!(
-            worker.resume_after_auth("account-a", 10),
-            Err(WorkerError::Conflict(_))
-        ));
-        assert_eq!(
-            worker
-                .acknowledge(&send_claim, WorkerOutcome::CredentialLocked, 5)
-                .unwrap(),
-            WorkState::Cancelled,
-            "a reset racing a pre-submission send must not become outcome_unknown"
-        );
-        let send = worker.snapshot("executing-send").unwrap().unwrap();
-        assert_eq!(send.attempt_count, 0);
-        assert_eq!(
-            send.last_error_code.as_deref(),
-            Some("provider_account_signed_out")
-        );
-    }
-
-    #[test]
-    fn vault_reset_cancellation_wins_over_every_non_success_safe_acknowledgement() {
-        let outcomes = vec![
-            (
-                "retryable",
-                WorkerOutcome::RetryableFailure {
-                    code: "temporary".into(),
-                },
-            ),
-            (
-                "rate_limited",
-                WorkerOutcome::RateLimited {
-                    code: "quota".into(),
-                    retry_after_at: 100,
-                },
-            ),
-            (
-                "permanent",
-                WorkerOutcome::PermanentFailure {
-                    code: "invalid".into(),
-                },
-            ),
-            (
-                "authentication",
-                WorkerOutcome::AuthenticationExpired {
-                    code: "expired".into(),
-                },
-            ),
-            (
-                "pre_submission_rejection",
-                WorkerOutcome::RejectedBeforeSubmission {
-                    code: "temporarily_unavailable".into(),
-                },
-            ),
-            ("credential_locked", WorkerOutcome::CredentialLocked),
-            (
-                "outcome_unknown",
-                WorkerOutcome::OutcomeUnknown {
-                    code: "connection_lost".into(),
-                },
-            ),
-            ("adapter_cancelled", WorkerOutcome::Cancelled),
-        ];
-
-        for (case, outcome) in outcomes {
-            let (_directory, path, worker) = configured_worker(&["account-a"]);
-            let connection = Connection::open(&path).unwrap();
-            connection
-                .execute_batch(
-                    "INSERT INTO threads(
-                       id, account_id, subject, participants, snippet, latest_at, message_count,
-                       remote_in_inbox, remote_unread, remote_starred, has_attachment, has_invite,
-                       has_link, has_from_me, category, attachment_names
-                     ) VALUES(
-                       1, 'account-a', 'Reset race', 'A', '', 0, 0,
-                       1, 1, 0, 0, 0, 0, 0, '', ''
-                     );
-                     INSERT INTO operations(
-                       id, thread_id, field, kind, old_value, new_value,
-                       state, created_at, not_before
-                     ) VALUES(
-                       'reset-operation', 1, 'starred', 'star', '0', '1',
-                       'pending', 0, 0
-                     );",
-                )
-                .unwrap();
-            drop(connection);
-            let mut work = item("reset-work", "account-a", WorkKind::Mutation);
-            work.operation_id = Some("reset-operation".into());
-            worker.enqueue(work, 0).unwrap();
-            let claim = worker.claim_available(1, "worker", 1).unwrap().remove(0);
-
-            assert_eq!(worker.reset_credentials_after_vault_deletion(2).unwrap(), 1);
-            assert_eq!(
-                worker.acknowledge(&claim, outcome, 3).unwrap(),
-                WorkState::Cancelled,
-                "reset cancellation lost the {case} acknowledgement race"
-            );
-            let snapshot = worker.snapshot("reset-work").unwrap().unwrap();
-            assert_eq!(snapshot.state, WorkState::Cancelled, "case: {case}");
-            assert_eq!(
-                snapshot.last_error_code.as_deref(),
-                Some("credentials_reset"),
-                "case: {case}"
-            );
-            let operation = Connection::open(path)
-                .unwrap()
-                .query_row(
-                    "SELECT state, error FROM operations WHERE id = 'reset-operation'",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                )
-                .unwrap();
-            assert_eq!(
-                operation,
-                ("cancelled".into(), Some("credentials_reset".into())),
-                "linked operation was stranded for case: {case}"
-            );
-        }
-    }
-
-    #[test]
-    fn vault_reset_race_preserves_success_and_send_uncertainty_semantics() {
-        let (_directory, path, worker) = configured_worker(&["account-a"]);
-        worker
-            .enqueue(item("successful-safe", "account-a", WorkKind::Mutation), 0)
-            .unwrap();
-        worker
-            .enqueue(item("uncertain-send", "account-a", WorkKind::Send), 1)
-            .unwrap();
-        let claims = worker.claim_available(2, "worker", 2).unwrap();
-        let safe = claims
-            .iter()
-            .find(|claim| claim.id == "successful-safe")
-            .unwrap();
-        let send = claims
-            .iter()
-            .find(|claim| claim.id == "uncertain-send")
-            .unwrap();
-
-        assert_eq!(worker.reset_credentials_after_vault_deletion(3).unwrap(), 1);
-        assert!(
-            worker
-                .snapshot("successful-safe")
-                .unwrap()
-                .unwrap()
-                .cancel_requested
-        );
-        assert!(
-            !worker
-                .snapshot("uncertain-send")
-                .unwrap()
-                .unwrap()
-                .cancel_requested
-        );
-        assert_eq!(
-            worker
-                .acknowledge_success_with_projection(safe, 4, |transaction| {
-                    transaction.execute(
-                        "INSERT INTO meta(key, value) VALUES('reset_race_projection', 'applied')",
-                        [],
-                    )?;
-                    Ok(())
-                })
-                .unwrap(),
-            WorkState::Succeeded
-        );
-        assert_eq!(
-            worker
-                .acknowledge(
-                    send,
-                    WorkerOutcome::RetryableFailure {
-                        code: "connection_lost_after_submit".into(),
-                    },
-                    4,
-                )
-                .unwrap(),
-            WorkState::OutcomeUnknown
-        );
-        assert_eq!(
-            Connection::open(path)
-                .unwrap()
-                .query_row(
-                    "SELECT value FROM meta WHERE key = 'reset_race_projection'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "applied"
-        );
     }
 
     #[test]
@@ -4238,7 +3628,7 @@ mod tests {
             .unwrap();
         assert!(connection
             .execute(
-                "UPDATE provider_accounts SET auth_state = 'credential_locked'
+                "UPDATE provider_accounts SET auth_state = 'reauthorization_required'
                  WHERE account_id = 'account-a'",
                 [],
             )

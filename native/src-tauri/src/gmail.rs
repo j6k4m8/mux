@@ -195,6 +195,20 @@ pub(crate) fn schedule_resumable_syncs(
     database_path: &Path,
     now_ms: i64,
 ) -> Result<usize, WorkerError> {
+    schedule_cursor_syncs(database_path, now_ms, false)
+}
+
+/// Schedules a delta cycle only for accounts whose own refresh cadence has
+/// elapsed since their last successful sync. Driven by the refresh timer.
+pub(crate) fn schedule_due_syncs(database_path: &Path, now_ms: i64) -> Result<usize, WorkerError> {
+    schedule_cursor_syncs(database_path, now_ms, true)
+}
+
+fn schedule_cursor_syncs(
+    database_path: &Path,
+    now_ms: i64,
+    only_due: bool,
+) -> Result<usize, WorkerError> {
     if now_ms < 0 {
         return Err(WorkerError::Validation(
             "Gmail sync timestamp is invalid".into(),
@@ -221,10 +235,12 @@ pub(crate) fn schedule_resumable_syncs(
                      'authentication_blocked'
                    )
                )
+               AND (?3 = 0 OR account.last_sync_at IS NULL
+                 OR ?2 - account.last_sync_at >= account.refresh_seconds * 1000)
              ORDER BY account.account_id",
         )?;
         let values = statement
-            .query_map([SYNC_SCOPE], |row| {
+            .query_map(params![SYNC_SCOPE, now_ms, i64::from(only_due)], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -238,7 +254,7 @@ pub(crate) fn schedule_resumable_syncs(
             params![account_id, SYNC_SCOPE],
             |row| row.get::<_, i64>(0),
         )?;
-        let identity = format!("unlock-{now_ms}-{index}-{terminal_count}");
+        let identity = format!("refresh-{now_ms}-{index}-{terminal_count}");
         let phase = match serde_json::from_str::<GmailCursor>(cursor)
             .ok()
             .and_then(|envelope| envelope.resume_phase().ok())
@@ -280,7 +296,7 @@ pub(crate) fn schedule_resumable_syncs(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GmailAccessError {
-    Locked,
+    CredentialUnavailable,
     ReauthorizationRequired,
     Retryable,
     RateLimited { retry_after_at: i64 },
@@ -288,8 +304,8 @@ pub(crate) enum GmailAccessError {
 }
 
 /// Yields a zeroizing, short-lived access token only after validating the
-/// configured account's current typed vault record. Implementations must not
-/// cache authority across a vault lock.
+/// configured account's current typed keychain record. Implementations must not
+/// cache authority beyond the validated record.
 pub(crate) struct GmailAccessGrant {
     pub access_value: Zeroizing<String>,
     pub remote_account_id: String,
@@ -3106,7 +3122,7 @@ fn work_item(
 
 fn access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
     match error {
-        GmailAccessError::Locked => WorkerOutcome::CredentialLocked,
+        GmailAccessError::CredentialUnavailable => WorkerOutcome::CredentialUnavailable,
         GmailAccessError::ReauthorizationRequired => WorkerOutcome::AuthenticationExpired {
             code: "gmail_reauthorization_required".into(),
         },
@@ -3125,7 +3141,7 @@ fn access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
 
 fn send_access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
     match error {
-        GmailAccessError::Locked => WorkerOutcome::CredentialLocked,
+        GmailAccessError::CredentialUnavailable => WorkerOutcome::CredentialUnavailable,
         GmailAccessError::ReauthorizationRequired => WorkerOutcome::AuthenticationExpired {
             code: "gmail_reauthorization_required".into(),
         },
@@ -3434,15 +3450,15 @@ mod tests {
         }
     }
 
-    struct LockedAccess;
+    struct UnavailableCredentialAccess;
 
-    impl GmailAccessSource for LockedAccess {
+    impl GmailAccessSource for UnavailableCredentialAccess {
         fn access_for_account(
             &self,
             _account_id: &str,
             _now_ms: i64,
         ) -> Result<GmailAccessGrant, GmailAccessError> {
-            Err(GmailAccessError::Locked)
+            Err(GmailAccessError::CredentialUnavailable)
         }
 
         fn access_for_mutation(
@@ -3450,7 +3466,7 @@ mod tests {
             _account_id: &str,
             _now_ms: i64,
         ) -> Result<GmailAccessGrant, GmailAccessError> {
-            Err(GmailAccessError::Locked)
+            Err(GmailAccessError::CredentialUnavailable)
         }
     }
 
@@ -3814,6 +3830,94 @@ mod tests {
     }
 
     #[test]
+    fn refresh_cadence_schedules_a_sync_only_once_the_interval_has_elapsed() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("gmail-refresh.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute(
+                "INSERT INTO accounts(id, name, email, color, provider)
+                 VALUES('gmail-account', 'Gmail', 'reader@example.test', '#000000', 'gmail')",
+                [],
+            )
+            .expect("account fixture");
+        connection
+            .execute(
+                "INSERT INTO provider_accounts(
+                   account_id, provider_kind, remote_account_id, auth_state,
+                   credential_ref, sync_state, refresh_seconds, last_sync_at,
+                   created_at, updated_at
+                 ) VALUES(
+                   'gmail-account', 'gmail', 'subject-1', 'ready',
+                   'gmail/account/a', 'idle', 60, 1_000_000, 1, 1
+                 )",
+                [],
+            )
+            .expect("provider account fixture");
+        let cursor = cursor_json(&GmailSyncPhase::History {
+            committed_history_id: "120".into(),
+            committed_label_digest: None,
+            page_token: None,
+            offset: 0,
+            page_digest: None,
+            reconciliation_generation: None,
+        })
+        .expect("history cursor");
+        connection
+            .execute(
+                "INSERT INTO provider_sync_cursors(account_id, scope, cursor, updated_at)
+                 VALUES('gmail-account', 'a:v1', ?1, 1_000_000)",
+                [&cursor],
+            )
+            .expect("durable cursor");
+        drop(connection);
+
+        // One second short of the cadence: nothing is due.
+        assert_eq!(
+            schedule_due_syncs(&path, 1_059_000).expect("early refresh"),
+            0
+        );
+        // Exactly at the cadence: the account is scheduled.
+        assert_eq!(
+            schedule_due_syncs(&path, 1_060_000).expect("due refresh"),
+            1
+        );
+        // Work is already queued, so a second tick must not pile on.
+        assert_eq!(
+            schedule_due_syncs(&path, 1_120_000).expect("no duplicate refresh"),
+            0
+        );
+
+        // A longer cadence pushes the next refresh out.
+        let connection = Connection::open(&path).expect("verify connection");
+        connection
+            .execute(
+                "UPDATE provider_work_items SET state = 'succeeded', completed_at = 1_060_500
+                 WHERE account_id = 'gmail-account'",
+                [],
+            )
+            .expect("complete the scheduled work");
+        connection
+            .execute(
+                "UPDATE provider_accounts
+                 SET refresh_seconds = 900, sync_state = 'idle', last_sync_at = 1_060_500
+                 WHERE account_id = 'gmail-account'",
+                [],
+            )
+            .expect("slower cadence");
+        drop(connection);
+        assert_eq!(
+            schedule_due_syncs(&path, 1_120_000).expect("still inside the longer cadence"),
+            0
+        );
+        assert_eq!(
+            schedule_due_syncs(&path, 1_960_500).expect("longer cadence elapsed"),
+            1
+        );
+    }
+
+    #[test]
     fn gmail_provider_conformance_initial_schedule_is_atomic_and_idempotent() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("gmail-schedule.db");
@@ -3896,18 +4000,6 @@ mod tests {
 
         let worker = DurableWorker::new(&path, WorkerConfig::default()).expect("durable worker");
         assert_eq!(
-            worker
-                .mark_configured_credentials_locked_for_startup(5_500)
-                .expect("startup credential lock"),
-            1
-        );
-        assert_eq!(
-            worker
-                .resume_all_after_credential_unlock(5_900)
-                .expect("unlock resume"),
-            0
-        );
-        assert_eq!(
             schedule_resumable_syncs(&path, 6_000).expect("resume durable cursor"),
             1
         );
@@ -3982,15 +4074,6 @@ mod tests {
             .expect("corrupt cursor fixture");
         drop(connection);
         let worker = DurableWorker::new(&path, WorkerConfig::default()).expect("durable worker");
-        assert_eq!(
-            worker
-                .mark_configured_credentials_locked_for_startup(2)
-                .expect("startup lock"),
-            2
-        );
-        worker
-            .resume_all_after_credential_unlock(3)
-            .expect("unlock resume");
 
         assert_eq!(
             schedule_resumable_syncs(&path, 4).expect("isolated scheduling"),
@@ -4601,11 +4684,11 @@ mod tests {
     #[test]
     fn gmail_provider_conformance_locked_vault_prevents_all_api_calls() {
         let api = FixtureApi::standard();
-        let adapter = GmailAdapter::new(LockedAccess, api, || 5_000);
+        let adapter = GmailAdapter::new(UnavailableCredentialAccess, api, || 5_000);
         let work = initial_sync_work("gmail-account", "locked", 0).expect("initial work");
         assert!(matches!(
             adapter.execute(&claim_for(work), &WorkerExecutionContext::new()),
-            WorkerOutcome::CredentialLocked
+            WorkerOutcome::CredentialUnavailable
         ));
         assert_eq!(adapter.api.calls.load(Ordering::SeqCst), 0);
     }
@@ -4917,8 +5000,8 @@ mod tests {
     #[test]
     fn gmail_provider_conformance_worker_outcomes_keep_auth_retry_and_rate_limit_distinct() {
         assert!(matches!(
-            access_error_outcome(GmailAccessError::Locked),
-            WorkerOutcome::CredentialLocked
+            access_error_outcome(GmailAccessError::CredentialUnavailable),
+            WorkerOutcome::CredentialUnavailable
         ));
         assert!(matches!(
             api_error_outcome(GmailApiError::Unauthorized),
@@ -5078,13 +5161,15 @@ mod tests {
 
     #[test]
     fn gmail_provider_conformance_mutation_errors_preserve_typed_worker_outcomes() {
-        let locked = GmailAdapter::new(LockedAccess, FixtureApi::standard(), || 5_000);
+        let locked = GmailAdapter::new(UnavailableCredentialAccess, FixtureApi::standard(), || {
+            5_000
+        });
         assert!(matches!(
             locked.execute(
                 &mutation_claim("locked", "starred", "1", None),
                 &WorkerExecutionContext::new()
             ),
-            WorkerOutcome::CredentialLocked
+            WorkerOutcome::CredentialUnavailable
         ));
         assert_eq!(locked.api.calls.load(Ordering::SeqCst), 0);
 
