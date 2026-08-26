@@ -8,3 +8,4 @@ data/*.db-wal
 __pycache__/
 *.pyc
 .DS_Store
+.env

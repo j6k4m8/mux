@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "node ../scripts/with-env.mjs npx tauri dev",
     "build": "tauri build --bundles app && node ../scripts/check-bundle.mjs",
     "frontend:dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "frontend:build": "vite build",
