@@ -15,6 +15,7 @@
   let bottomAnchor: HTMLDivElement;
   let loadedImageData = new Map<string, string>();
   let loadingMessageIds = new Set<number>();
+  let focusedId: number | null = null;
   let remoteImageErrors = new Map<number, string>();
   let allowedDomains = new Map<number, Set<string>>();
   let remoteImageViews: Record<number, Record<number, { dataUrl: string | null; altText: string }>> = {};
@@ -157,6 +158,38 @@
     expandedIds = next;
   }
 
+  /// Message-level focus, driven by j/k once the reader is entered from the list.
+  export function focusedMessageId(): number | null {
+    return focusedId;
+  }
+
+  export async function focusFirstMessage() {
+    const target = unreadMessageId ?? messages.at(-1)?.id ?? null;
+    await revealMessage(target);
+  }
+
+  export async function moveMessageFocus(delta: number) {
+    if (!messages.length) return;
+    const current = messages.findIndex((message) => message.id === focusedId);
+    const start = current === -1 ? (delta > 0 ? -1 : messages.length) : current;
+    const next = Math.min(messages.length - 1, Math.max(0, start + delta));
+    await revealMessage(messages[next]?.id ?? null);
+  }
+
+  export function clearMessageFocus() {
+    focusedId = null;
+  }
+
+  async function revealMessage(messageId: number | null) {
+    focusedId = messageId;
+    if (messageId === null) return;
+    expandedIds = new Set(expandedIds).add(messageId);
+    await tick();
+    document
+      .getElementById(`native-message-${messageId}`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
   export async function jumpToNewest() {
     await tick();
     bottomAnchor?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -172,12 +205,32 @@
 
 <svelte:window on:keydown={handleWindowKeydown} />
 
+{#if messages.length > 1}
+  <nav class="message-rail" aria-label="Jump to a message" data-testid="message-rail">
+    {#each messages as message, index (message.id)}
+      <button
+        class:is-focused={focusedId === message.id}
+        class:is-unread={message.id === unreadMessageId}
+        type="button"
+        data-message-id={message.id}
+        aria-label={`Message ${index + 1} of ${messages.length} from ${message.senderName}`}
+        title={`${message.senderName} · ${fullTime(message.sentAt)}`}
+        on:click={() => revealMessage(message.id)}
+      ></button>
+    {/each}
+  </nav>
+{/if}
 <div class="message-stack">
   {#each messages as message (message.id)}
     {#if message.id === unreadMessageId}
       <div class="unread-boundary" id="native-unread-boundary"><span>Unread from here</span></div>
     {/if}
-    <section class="message-card" class:is-collapsed={!expandedIds.has(message.id)} id={`native-message-${message.id}`}>
+    <section
+      class="message-card"
+      class:is-collapsed={!expandedIds.has(message.id)}
+      class:is-focused={focusedId === message.id}
+      id={`native-message-${message.id}`}
+    >
       <button
         class="message-card-toggle"
         type="button"

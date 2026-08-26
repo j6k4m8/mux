@@ -27,7 +27,8 @@ test('native mailbox shortcuts ignore command, control, and option combinations'
 });
 
 test('native mailbox shortcuts map only the documented mailbox keys', () => {
-  assert.equal(mailboxShortcutFor(event('/')), 'focus-filter');
+  // Search moved to the platform chord, so a bare slash is just a character.
+  assert.equal(mailboxShortcutFor(event('/')), null);
   assert.equal(mailboxShortcutFor(event('j')), 'next-thread');
   assert.equal(mailboxShortcutFor(event('k')), 'previous-thread');
   assert.equal(mailboxShortcutFor(event('e')), 'archive');

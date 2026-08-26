@@ -19,7 +19,8 @@ const account: AccountSummary = {
   color: '#5168f4',
   signature: '',
   unread: 0,
-  total: 50_000
+  total: 50_000,
+  refreshSeconds: 60
 };
 
 function message(id: number, threadId = 1): MessageSummary {
@@ -90,7 +91,6 @@ describe('native rendering responsiveness', () => {
     };
     const listInputs: Array<{ cursor: string | null; limit: number }> = [];
     mockIPC((command, payload) => {
-      if (command === 'vault_status') return { state: 'absent' };
       if (command === 'mailbox_bootstrap') return mailbox;
       if (command === 'list_threads') {
         const input = (payload as { input: { cursor: string | null; limit: number } }).input;
@@ -153,7 +153,6 @@ describe('native rendering responsiveness', () => {
       drafts: []
     };
     mockIPC((command) => {
-      if (command === 'vault_status') return { state: 'absent' };
       if (command === 'mailbox_bootstrap') return mailbox;
       if (command === 'list_threads') {
         return { threads: [thread(1)], hasMore: false, nextCursor: null } satisfies ThreadPage;

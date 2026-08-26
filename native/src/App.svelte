@@ -8,7 +8,7 @@
   import InlineReply from './InlineReply.svelte';
   import ThreadConversation from './ThreadConversation.svelte';
   import { replyRecipients } from './replyRecipients.mjs';
-  import { mailboxShortcutFor } from './shortcuts.mjs';
+  import { isInteractiveShortcutTarget, mailboxShortcutFor } from './shortcuts.mjs';
   import {
     adjacentMailboxWindowStart,
     boundedRefreshRowTarget,
@@ -47,10 +47,22 @@
   type SmartView = '' | 'unread' | 'attachments' | 'invitations' | 'finance';
   type Theme = 'light' | 'dark';
   type Notice = { text: string; operationId?: string; until?: number };
-  type VaultState = 'absent' | 'locked' | 'unlocked' | 'unavailable';
-  type VaultStatus = { state: VaultState };
   type GmailOAuthResult = { state: 'connected'; accountId: string; email: string };
-  type PaletteCommandId = 'compose' | 'archive' | 'snooze' | 'star' | 'read' | 'inbox' | 'starred' | 'activity' | 'theme';
+  type SettingsSection = 'accounts' | 'appearance' | 'mail' | 'shortcuts';
+  type Density = 'roomy' | 'default' | 'sardine';
+  type SwipeAction = 'archive' | 'delete' | 'snooze' | 'star' | 'unread' | 'none';
+  type Appearance = {
+    scale: number;
+    font: string;
+    density: Density;
+    toolbarIcons: boolean;
+    toolbarText: boolean;
+    toolbarShortcuts: boolean;
+    toolbarCollapseNarrow: boolean;
+    swipeLeft: SwipeAction;
+    swipeRight: SwipeAction;
+  };
+  type PaletteCommandId = 'compose' | 'archive' | 'snooze' | 'star' | 'read' | 'inbox' | 'starred' | 'activity' | 'theme' | 'settings';
   type PaletteCommand = { id: PaletteCommandId; title: string; description: string; shortcut: string };
 
   let mailbox: MailboxBootstrap | null = null;
@@ -114,6 +126,8 @@
   let replyDraftRequest = 0;
   let notice: Notice | null = null;
   let snoozeDialogOpen = false;
+  let customSnoozeValue = '';
+  let customSnoozeError = '';
   let commandPaletteOpen = false;
   let commandFilter = '';
   let commandIndex = 0;
@@ -137,31 +151,39 @@
   let refreshQueued = false;
   let initialRefreshQueued = false;
   let refreshLoop: Promise<void> | null = null;
-  let vaultState: VaultState = 'unavailable';
-  let vaultDialogOpen = false;
-  let vaultBusy = false;
-  let vaultError = '';
-  let vaultMessage = '';
-  let vaultChangingPassphrase = false;
-  let vaultResetting = false;
-  let vaultPassphrase = '';
-  let vaultConfirmation = '';
-  let vaultCurrentPassphrase = '';
-  let vaultNewPassphrase = '';
-  let vaultNewConfirmation = '';
-  let vaultResetConfirmation = '';
+  const DEFAULT_FONT = 'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif';
+  const APPEARANCE_KEY = 'mux-appearance';
+  const HIDDEN_ACCOUNTS_KEY = 'mux-hidden-accounts';
+  const DEFAULT_APPEARANCE: Appearance = {
+    scale: 1,
+    font: DEFAULT_FONT,
+    density: 'default',
+    toolbarIcons: true,
+    toolbarText: true,
+    toolbarShortcuts: false,
+    toolbarCollapseNarrow: true,
+    swipeLeft: 'archive',
+    swipeRight: 'snooze'
+  };
+  let appearance: Appearance = { ...DEFAULT_APPEARANCE };
+  let customFont = '';
+  /// True once Enter has stepped into the conversation; j/k then move messages.
+  let readerFocused = false;
+  /// Accounts hidden from the list. They keep syncing in the background.
+  let hiddenAccounts: string[] = [];
+  let settingsOpen = false;
+  let settingsSection: SettingsSection = 'accounts';
+  let settingsBusy = false;
+  let settingsError = '';
+  let settingsMessage = '';
+  let resyncBusy = false;
   let gmailOAuthBusy = false;
-  let vaultDialog: HTMLElement;
-  let vaultCloseButton: HTMLButtonElement;
-  let vaultPassphraseInput: HTMLInputElement;
-  let vaultCurrentPassphraseInput: HTMLInputElement;
-  let vaultResetInput: HTMLInputElement;
-  let vaultLockButton: HTMLButtonElement;
   let blockingDialogOpen = false;
 
   $: visibleThreads = filter.trim() ? searchRows : threads;
   $: visibleDrafts = (mailbox?.drafts ?? []).filter((draft) => {
     if (selectedAccount !== null && draft.accountId !== selectedAccount) return false;
+    if (hiddenAccounts.includes(draft.accountId)) return false;
     const query = filter.trim().toLocaleLowerCase();
     return !query || `${draft.subject} ${draft.recipients} ${draft.ccRecipients} ${draft.bccRecipients}`.toLocaleLowerCase().includes(query);
   });
@@ -207,14 +229,8 @@
   };
   $: selectedThreadTotal = selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
   $: remainingSeconds = notice?.until ? Math.max(0, Math.ceil((notice.until - clock) / 1_000)) : 0;
-  $: blockingDialogOpen = commandPaletteOpen || snoozeDialogOpen || activityDialogOpen || vaultDialogOpen || composerOpen;
+  $: blockingDialogOpen = commandPaletteOpen || snoozeDialogOpen || activityDialogOpen || composerOpen;
   $: if (notice?.until && clock >= notice.until) notice = null;
-  $: vaultStateLabel = ({
-    absent: 'Not set up',
-    locked: 'Locked',
-    unlocked: 'Unlocked',
-    unavailable: 'Unavailable'
-  } as const)[vaultState];
   $: {
     commandFilter;
     selectedThread;
@@ -231,6 +247,12 @@
       // A denied storage read should not stop the local mailbox from opening.
     }
     setTheme(savedTheme === 'dark' ? 'dark' : 'light', false);
+    hiddenAccounts = readHiddenAccounts();
+    const savedAppearance = readSavedAppearance();
+    applyAppearance(savedAppearance, false);
+    customFont = fontChoices.some((choice) => choice.value === savedAppearance.font)
+      ? ''
+      : savedAppearance.font;
     navigationMediaQuery = window.matchMedia('(max-width: 980px)');
     readerMediaQuery = window.matchMedia('(max-width: 680px)');
     syncResponsiveLayout();
@@ -241,7 +263,6 @@
     readerMediaQuery.addEventListener('change', syncResponsiveLayout);
     document.addEventListener('visibilitychange', refreshWhenVisible);
     void subscribeToMailboxChanges();
-    void refreshVaultStatus();
   });
 
   onDestroy(() => {
@@ -258,7 +279,6 @@
     navigationMediaQuery = null;
     readerMediaQuery = null;
     document.removeEventListener('visibilitychange', refreshWhenVisible);
-    clearVaultSecrets();
   });
 
   function setTheme(nextTheme: Theme, persist = true) {
@@ -272,9 +292,165 @@
     }
   }
 
+  async function setAccountRefresh(accountId: string, refreshSeconds: number) {
+    settingsError = '';
+    settingsMessage = '';
+    try {
+      await invoke('set_account_refresh', { input: { accountId, refreshSeconds } });
+      await refreshMailbox();
+      const label = refreshChoices.find((choice) => choice.value === refreshSeconds)?.label
+        ?? `${refreshSeconds}s`;
+      settingsMessage = `Checking for new mail every ${label}.`;
+    } catch (cause) {
+      settingsError = settingsErrorText(cause);
+    }
+  }
+
+  function toggleAccountVisibility(accountId: string) {
+    hiddenAccounts = hiddenAccounts.includes(accountId)
+      ? hiddenAccounts.filter((id) => id !== accountId)
+      : [...hiddenAccounts, accountId];
+    try {
+      window.localStorage.setItem(HIDDEN_ACCOUNTS_KEY, JSON.stringify(hiddenAccounts));
+    } catch {
+      // Visibility persistence is optional; the choice still applies this session.
+    }
+    // A visibility change re-scopes the cursor, so restart the page.
+    clearThreadPage();
+    resetSearch();
+    if (selectedView !== 'drafts') void loadThreads(false, true);
+  }
+
+  function readHiddenAccounts(): string[] {
+    try {
+      const raw = window.localStorage.getItem(HIDDEN_ACCOUNTS_KEY);
+      if (!raw) return [];
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((id): id is string => typeof id === 'string' && id.length > 0).slice(0, 64);
+    } catch {
+      return [];
+    }
+  }
+
+  function applyAppearance(next: Appearance, persist = true) {
+    appearance = next;
+    const root = document.documentElement;
+    root.style.setProperty('--ui-scale', String(next.scale));
+    root.style.setProperty('--app-font', next.font);
+    if (!persist) return;
+    try {
+      window.localStorage.setItem(APPEARANCE_KEY, JSON.stringify(next));
+    } catch {
+      // Appearance persistence is optional; the choice still applies this session.
+    }
+  }
+
+  function readSavedAppearance(): Appearance {
+    let raw: string | null = null;
+    try {
+      raw = window.localStorage.getItem(APPEARANCE_KEY);
+    } catch {
+      return { ...DEFAULT_APPEARANCE };
+    }
+    if (!raw) return { ...DEFAULT_APPEARANCE };
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (typeof parsed !== 'object' || parsed === null) throw new Error('shape');
+      const value = parsed as Partial<Appearance>;
+      // Bound anything read back from storage; it is not trusted input.
+      const scale = typeof value.scale === 'number' && Number.isFinite(value.scale)
+        ? Math.min(2, Math.max(0.75, value.scale))
+        : 1;
+      const font = typeof value.font === 'string' && value.font.trim() && value.font.length <= 200
+        ? value.font
+        : DEFAULT_FONT;
+      const density: Density = value.density === 'roomy' || value.density === 'sardine'
+        ? value.density
+        : 'default';
+      const flag = (candidate: unknown, fallback: boolean) =>
+        typeof candidate === 'boolean' ? candidate : fallback;
+      const swipe = (candidate: unknown, fallback: SwipeAction): SwipeAction =>
+        swipeChoices.some((choice) => choice.value === candidate)
+          ? (candidate as SwipeAction)
+          : fallback;
+      return {
+        scale,
+        font,
+        density,
+        toolbarIcons: flag(value.toolbarIcons, true),
+        toolbarText: flag(value.toolbarText, true),
+        toolbarShortcuts: flag(value.toolbarShortcuts, false),
+        toolbarCollapseNarrow: flag(value.toolbarCollapseNarrow, true),
+        swipeLeft: swipe(value.swipeLeft, 'archive'),
+        swipeRight: swipe(value.swipeRight, 'snooze')
+      };
+    } catch {
+      return { ...DEFAULT_APPEARANCE };
+    }
+  }
+
   function toggleTheme() {
     setTheme(theme === 'light' ? 'dark' : 'light');
   }
+
+  const fontChoices: Array<{ label: string; value: string }> = [
+    { label: 'Inter', value: DEFAULT_FONT },
+    { label: 'System', value: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' },
+    { label: 'Serif', value: 'ui-serif, "New York", Georgia, "Times New Roman", serif' },
+    { label: 'Mono', value: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace' }
+  ];
+
+  const textSizes: Array<{ label: string; value: number }> = [
+    { label: 'Small', value: 0.9 },
+    { label: 'Default', value: 1 },
+    { label: 'Large', value: 1.15 },
+    { label: 'Larger', value: 1.3 }
+  ];
+
+  const refreshChoices: Array<{ label: string; value: number }> = [
+    { label: '30s', value: 30 },
+    { label: '1 min', value: 60 },
+    { label: '5 min', value: 300 },
+    { label: '15 min', value: 900 },
+    { label: '1 hour', value: 3600 }
+  ];
+
+  const swipeChoices: Array<{ label: string; value: SwipeAction }> = [
+    { label: 'Archive', value: 'archive' },
+    { label: 'Trash', value: 'delete' },
+    { label: 'Snooze', value: 'snooze' },
+    { label: 'Star', value: 'star' },
+    { label: 'Unread', value: 'unread' },
+    { label: 'Nothing', value: 'none' }
+  ];
+
+  const densityChoices: Array<{ label: string; value: Density }> = [
+    { label: 'Roomy', value: 'roomy' },
+    { label: 'Default', value: 'default' },
+    { label: 'Sardinemode', value: 'sardine' }
+  ];
+
+  const settingsSections: Array<{ id: SettingsSection; title: string }> = [
+    { id: 'accounts', title: 'Accounts' },
+    { id: 'appearance', title: 'Appearance' },
+    { id: 'mail', title: 'Mail' },
+    { id: 'shortcuts', title: 'Shortcuts' }
+  ];
+
+  const shortcutReference: Array<{ keys: string; action: string }> = [
+    { keys: '⌘P', action: 'Open the command palette' },
+    { keys: '⌘,', action: 'Open settings' },
+    { keys: 'C', action: 'Compose' },
+    { keys: 'R / A / F', action: 'Reply, reply all, forward' },
+    { keys: 'J / K', action: 'Next or previous conversation' },
+    { keys: 'E', action: 'Archive or restore' },
+    { keys: 'S', action: 'Star' },
+    { keys: 'U', action: 'Toggle unread' },
+    { keys: 'H', action: 'Snooze' },
+    { keys: '⌘F', action: 'Search' },
+    { keys: 'Esc', action: 'Close or step back' }
+  ];
 
   function availablePaletteCommands(): PaletteCommand[] {
     const items: PaletteCommand[] = [
@@ -288,7 +464,8 @@
       { id: 'inbox', title: 'Go to Inbox', description: 'Open the current unified inbox', shortcut: 'G I' },
       { id: 'starred', title: 'Go to Starred', description: 'Open starred conversations', shortcut: 'G S' },
       { id: 'activity', title: 'Open activity', description: 'Inspect the local operation journal', shortcut: '' },
-      { id: 'theme', title: 'Toggle appearance', description: `Switch to ${theme === 'light' ? 'dark' : 'light'} mode`, shortcut: '' }
+      { id: 'theme', title: 'Toggle appearance', description: `Switch to ${theme === 'light' ? 'dark' : 'light'} mode`, shortcut: '' },
+      { id: 'settings', title: 'Open settings', description: 'Accounts, appearance, and mail data', shortcut: '⌘,' }
     ];
     const query = commandFilter.trim().toLocaleLowerCase();
     return query
@@ -324,6 +501,7 @@
     else if (command.id === 'starred') selectView('starred');
     else if (command.id === 'activity') void openActivity();
     else if (command.id === 'theme') toggleTheme();
+    else if (command.id === 'settings') void openSettings();
   }
 
   function restoreDialogFocus(target: HTMLElement | null) {
@@ -386,17 +564,6 @@
     document.querySelector<HTMLButtonElement>(`[data-thread-id="${selectedThreadId}"]`)?.focus();
   }
 
-  function isVaultState(value: unknown): value is VaultState {
-    return value === 'absent' || value === 'locked' || value === 'unlocked' || value === 'unavailable';
-  }
-
-  function readVaultStatus(value: unknown): VaultStatus {
-    if (typeof value === 'object' && value !== null && 'state' in value && isVaultState(value.state)) {
-      return { state: value.state };
-    }
-    throw new Error('Mux returned an invalid credential status.');
-  }
-
   function readGmailOAuthResult(value: unknown): GmailOAuthResult {
     if (
       typeof value === 'object' && value !== null &&
@@ -409,245 +576,72 @@
     throw new Error('Mux returned an invalid Google authorization result.');
   }
 
-  function clearVaultSecrets() {
-    vaultPassphrase = '';
-    vaultConfirmation = '';
-    vaultCurrentPassphrase = '';
-    vaultNewPassphrase = '';
-    vaultNewConfirmation = '';
+  function clearSettingsFeedback() {
+    settingsError = '';
+    settingsMessage = '';
   }
 
-  function clearVaultPanel() {
-    clearVaultSecrets();
-    vaultResetConfirmation = '';
-    vaultChangingPassphrase = false;
-    vaultResetting = false;
-    vaultError = '';
-    vaultMessage = '';
-  }
-
-  function vaultErrorText(cause: unknown, sensitiveValues: string[] = []): string {
-    let text = cause instanceof Error
+  function settingsErrorText(cause: unknown): string {
+    const text = cause instanceof Error
       ? cause.message
       : typeof cause === 'object' && cause !== null && 'message' in cause && typeof cause.message === 'string'
         ? cause.message
         : String(cause);
-    for (const value of sensitiveValues) {
-      if (value) text = text.split(value).join('[redacted]');
-    }
-    return text || 'Credential settings could not be updated.';
+    return text || 'Mux could not update that setting.';
   }
 
-  async function focusVaultPrimaryControl() {
-    if (!vaultDialogOpen) return;
-    await tick();
-    if (vaultResetting) vaultResetInput?.focus();
-    else if (vaultChangingPassphrase) vaultCurrentPassphraseInput?.focus();
-    else if (vaultState === 'absent' || vaultState === 'locked') vaultPassphraseInput?.focus();
-    else if (vaultState === 'unlocked') vaultLockButton?.focus();
-    else vaultCloseButton?.focus();
-  }
-
-  async function refreshVaultStatus(focusAfter = false) {
-    try {
-      const status = readVaultStatus(await invoke<unknown>('vault_status'));
-      vaultState = status.state;
-      if (vaultDialogOpen) vaultError = '';
-    } catch (cause) {
-      vaultState = 'unavailable';
-      if (vaultDialogOpen) vaultError = vaultErrorText(cause);
-    } finally {
-      if (focusAfter) await focusVaultPrimaryControl();
-    }
-  }
-
-  async function openVaultSettings() {
+  async function openSettings(section: SettingsSection = 'accounts') {
     navigationOpen = false;
-    clearVaultPanel();
-    vaultDialogOpen = true;
-    if (vaultBusy) await focusVaultPrimaryControl();
-    else await refreshVaultStatus(true);
+    closeCommandPalette(false);
+    clearSettingsFeedback();
+    settingsSection = section;
+    settingsOpen = true;
   }
 
-  function closeVaultSettings() {
+  function closeSettings() {
     if (gmailOAuthBusy) void cancelGmailOAuth();
-    clearVaultPanel();
-    vaultDialogOpen = false;
-  }
-
-  function handleVaultDialogKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      closeVaultSettings();
-      return;
-    }
-    if (event.key !== 'Tab' || !vaultDialog) return;
-    const controls = [...vaultDialog.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])'
-    )].filter((control) => !control.hasAttribute('hidden'));
-    if (!controls.length) return;
-    const first = controls[0];
-    const last = controls.at(-1)!;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
-
-  async function createVault() {
-    const passphrase = vaultPassphrase;
-    const confirmation = vaultConfirmation;
-    vaultError = '';
-    vaultMessage = '';
-    vaultBusy = true;
-    try {
-      if (!passphrase) throw new Error('Enter a passphrase.');
-      if (passphrase !== confirmation) throw new Error('The passphrases do not match.');
-      const status = readVaultStatus(await invoke<unknown>('vault_create', { passphrase }));
-      vaultState = status.state;
-      vaultMessage = 'Credential protection is ready for this session.';
-    } catch (cause) {
-      vaultError = vaultErrorText(cause, [passphrase, confirmation]);
-    } finally {
-      clearVaultSecrets();
-      vaultBusy = false;
-      await focusVaultPrimaryControl();
-    }
-  }
-
-  async function unlockVault() {
-    const passphrase = vaultPassphrase;
-    vaultError = '';
-    vaultMessage = '';
-    vaultBusy = true;
-    try {
-      if (!passphrase) throw new Error('Enter your passphrase.');
-      const status = readVaultStatus(await invoke<unknown>('vault_unlock', { passphrase }));
-      vaultState = status.state;
-      vaultMessage = 'Account credentials are available for this session.';
-    } catch (cause) {
-      vaultError = vaultErrorText(cause, [passphrase]);
-    } finally {
-      clearVaultSecrets();
-      vaultBusy = false;
-      await focusVaultPrimaryControl();
-    }
-  }
-
-  async function lockVault() {
-    vaultError = '';
-    vaultMessage = '';
-    vaultBusy = true;
-    try {
-      const status = readVaultStatus(await invoke<unknown>('vault_lock'));
-      vaultState = status.state;
-      vaultMessage = 'Account credentials are locked. Your local mailbox remains available.';
-    } catch (cause) {
-      vaultError = vaultErrorText(cause);
-    } finally {
-      clearVaultSecrets();
-      vaultBusy = false;
-      await focusVaultPrimaryControl();
-    }
+    clearSettingsFeedback();
+    settingsOpen = false;
   }
 
   async function connectGmail() {
-    vaultError = '';
-    vaultMessage = '';
+    settingsError = '';
+    settingsMessage = '';
     gmailOAuthBusy = true;
     try {
       const result = readGmailOAuthResult(await invoke<unknown>('gmail_oauth_begin'));
-      vaultMessage = `Connected ${result.email}.`;
+      settingsMessage = `Connected ${result.email}.`;
     } catch (cause) {
-      vaultError = vaultErrorText(cause);
+      settingsError = settingsErrorText(cause);
     } finally {
       gmailOAuthBusy = false;
-      await focusVaultPrimaryControl();
     }
   }
 
   async function cancelGmailOAuth() {
     try {
       await invoke<unknown>('gmail_oauth_cancel');
-      vaultMessage = 'Cancelling Google authorization…';
+      settingsMessage = 'Cancelling…';
     } catch (cause) {
-      vaultError = vaultErrorText(cause);
+      settingsError = settingsErrorText(cause);
     }
   }
 
-  async function changeVaultPassphrase() {
-    const currentPassphrase = vaultCurrentPassphrase;
-    const newPassphrase = vaultNewPassphrase;
-    const confirmation = vaultNewConfirmation;
-    vaultError = '';
-    vaultMessage = '';
-    vaultBusy = true;
+  async function resyncAllMail() {
+    settingsError = '';
+    settingsMessage = '';
+    resyncBusy = true;
     try {
-      if (!currentPassphrase || !newPassphrase) throw new Error('Enter your current and new passphrases.');
-      if (newPassphrase !== confirmation) throw new Error('The new passphrases do not match.');
-      const status = readVaultStatus(await invoke<unknown>('vault_change_passphrase', {
-        currentPassphrase,
-        newPassphrase
-      }));
-      vaultState = status.state;
-      vaultChangingPassphrase = false;
-      vaultMessage = 'Your passphrase was changed.';
+      const requested = await invoke<{ accountsReset: number }>('resync_all_mail');
+      settingsMessage = requested.accountsReset > 0
+        ? 'Re-downloading every message from your provider. Nothing was removed.'
+        : 'No provider account is connected yet, so there is nothing to re-download.';
+      await refreshMailbox();
     } catch (cause) {
-      vaultError = vaultErrorText(cause, [currentPassphrase, newPassphrase, confirmation]);
+      settingsError = settingsErrorText(cause);
     } finally {
-      clearVaultSecrets();
-      vaultBusy = false;
-      await focusVaultPrimaryControl();
+      resyncBusy = false;
     }
-  }
-
-  async function resetVault() {
-    const confirmation = vaultResetConfirmation;
-    vaultError = '';
-    vaultMessage = '';
-    vaultBusy = true;
-    try {
-      if (confirmation !== 'RESET') throw new Error('Type RESET to confirm.');
-      const status = readVaultStatus(await invoke<unknown>('vault_reset', { confirmation }));
-      vaultState = status.state;
-      vaultResetting = false;
-      vaultMessage = 'Credential protection was reset. Add account credentials again before connecting.';
-    } catch (cause) {
-      vaultError = vaultErrorText(cause);
-    } finally {
-      clearVaultSecrets();
-      vaultResetConfirmation = '';
-      vaultBusy = false;
-      await focusVaultPrimaryControl();
-    }
-  }
-
-  async function showVaultPassphraseChange() {
-    clearVaultSecrets();
-    vaultError = '';
-    vaultMessage = '';
-    vaultChangingPassphrase = true;
-    vaultResetting = false;
-    await focusVaultPrimaryControl();
-  }
-
-  async function showVaultReset() {
-    clearVaultSecrets();
-    vaultResetConfirmation = '';
-    vaultError = '';
-    vaultMessage = '';
-    vaultChangingPassphrase = false;
-    vaultResetting = true;
-    await focusVaultPrimaryControl();
-  }
-
-  async function cancelVaultSubpanel() {
-    clearVaultPanel();
-    await focusVaultPrimaryControl();
   }
 
   async function subscribeToMailboxChanges() {
@@ -784,7 +778,8 @@
       accountId,
       view,
       cursor: append ? threadCursor : null,
-      limit: 50
+      limit: 50,
+      hiddenAccountIds: hiddenAccounts
     };
     threadLoading = true;
     threadError = '';
@@ -1000,7 +995,8 @@
       view,
       cursor: append ? searchCursor : null,
       limit: 50,
-      timezoneOffsetMinutes: -new Date().getTimezoneOffset()
+      timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+      hiddenAccountIds: hiddenAccounts
     };
     const requiredThreadId = selectedThreadId;
     const isCurrent = () => request === searchRequest
@@ -1065,6 +1061,8 @@
 
   function selectThread(thread: ThreadSummary, openReader = true) {
     navigationOpen = false;
+    // Choosing another conversation leaves message-level focus behind.
+    exitReaderFocus();
     if (openReader && compactReader) mobileReaderOpen = true;
     window.clearTimeout(focusedReadTimer);
     if (thread.unread) {
@@ -1108,6 +1106,8 @@
     if (!selectedThread) return;
     snoozeReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     navigationOpen = false;
+    customSnoozeValue = '';
+    customSnoozeError = '';
     snoozeDialogOpen = true;
     await tick();
     snoozeDialog?.querySelector<HTMLElement>('[data-autofocus]')?.focus();
@@ -1137,6 +1137,22 @@
         wakeAt: nextWeek.getTime()
       }
     ];
+  }
+
+  /// A local datetime-local value, floored to the minute, must be in the future.
+  function snoozeAtCustomTime() {
+    customSnoozeError = '';
+    const parsed = new Date(customSnoozeValue);
+    const wakeAt = parsed.getTime();
+    if (!customSnoozeValue || Number.isNaN(wakeAt)) {
+      customSnoozeError = 'Pick a date and time.';
+      return;
+    }
+    if (wakeAt <= Date.now()) {
+      customSnoozeError = 'Pick a time in the future.';
+      return;
+    }
+    void snoozeUntil(wakeAt);
   }
 
   async function snoozeUntil(wakeAt: number) {
@@ -1322,11 +1338,12 @@
     inlineReplyKey += 1;
   }
 
-  async function applyThreadAction(action: string, label: string) {
-    if (!selectedThread) return;
+  async function applyThreadAction(action: string, label: string, target?: ThreadSummary) {
+    const thread = target ?? selectedThread;
+    if (!thread) return;
     try {
       const operation = await invoke<OperationSummary>('apply_thread_action', {
-        threadId: selectedThread.id,
+        threadId: thread.id,
         action
       });
       await queueMailboxRefresh();
@@ -1366,7 +1383,18 @@
       }
       return;
     }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'k' && !composerOpen && !snoozeDialogOpen && !activityDialogOpen && !vaultDialogOpen) {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'f' && !composerOpen && !settingsOpen) {
+      event.preventDefault();
+      closeCommandPalette(false);
+      filterInput?.focus();
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key === ',' && !composerOpen) {
+      event.preventDefault();
+      void openSettings();
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && ['p', 'k'].includes(event.key.toLocaleLowerCase()) && !composerOpen && !snoozeDialogOpen && !activityDialogOpen && !settingsOpen) {
       event.preventDefault();
       void openCommandPalette();
       return;
@@ -1385,14 +1413,31 @@
       }
       return;
     }
-    if (vaultDialogOpen) {
+    if (settingsOpen) {
       if (event.key === 'Escape') {
         event.preventDefault();
-        closeVaultSettings();
+        closeSettings();
       }
       return;
     }
     if (composerOpen) return;
+    if (
+      event.key === 'Enter'
+      && !readerFocused
+      && selectedThread
+      && selectedView !== 'drafts'
+      && !isInteractiveShortcutTarget(event.target)
+    ) {
+      event.preventDefault();
+      readerFocused = true;
+      void threadConversation?.focusFirstMessage();
+      return;
+    }
+    if (readerFocused && event.key === 'Escape') {
+      event.preventDefault();
+      exitReaderFocus();
+      return;
+    }
     if (event.key === 'Escape') {
       if (navigationOpen) {
         event.preventDefault();
@@ -1419,10 +1464,6 @@
     const action = mailboxShortcutFor(event);
     if (!action) return;
     event.preventDefault();
-    if (action === 'focus-filter') {
-      filterInput?.focus();
-      return;
-    }
     if (action === 'compose') {
       openComposer();
       return;
@@ -1455,11 +1496,177 @@
       void applyThreadAction(selectedThread?.unread ? 'read' : 'unread', selectedThread?.unread ? 'Marked read' : 'Marked unread');
       return;
     }
+    if (readerFocused && (action === 'next-thread' || action === 'previous-thread')) {
+      void threadConversation?.moveMessageFocus(action === 'next-thread' ? 1 : -1);
+      return;
+    }
     if (!visibleThreads.length) return;
     const currentIndex = Math.max(0, visibleThreads.findIndex((thread) => thread.id === selectedThread?.id));
     const direction = action === 'next-thread' ? 1 : -1;
     const nextIndex = Math.min(visibleThreads.length - 1, Math.max(0, currentIndex + direction));
     selectThread(visibleThreads[nextIndex]);
+  }
+
+  function exitReaderFocus() {
+    readerFocused = false;
+    threadConversation?.clearMessageFocus();
+  }
+
+  type ReaderAction = {
+    id: string;
+    label: string;
+    icon: 'inbox' | 'archive' | 'trash' | 'clock' | 'mail' | 'reply' | 'replyAll' | 'forward' | 'unread';
+    shortcut: string;
+    run: () => void;
+  };
+
+  $: readerActions = ((): ReaderAction[] => {
+    const thread = selectedThread;
+    if (!thread) return [];
+    const actions: ReaderAction[] = [];
+    if (selectedView === 'trash') {
+      actions.push({
+        id: 'untrash',
+        label: 'Remove from Trash',
+        icon: 'inbox',
+        shortcut: '',
+        run: () => void applyThreadAction('untrash', 'Removed from Trash')
+      });
+    } else {
+      actions.push({
+        id: thread.inInbox ? 'archive' : 'restore',
+        label: thread.inInbox ? 'Archive' : 'Move to inbox',
+        icon: 'archive',
+        shortcut: 'E',
+        run: () => void applyThreadAction(
+          thread.inInbox ? 'archive' : 'restore',
+          thread.inInbox ? 'Archived' : 'Restored to inbox'
+        )
+      });
+      actions.push({
+        id: 'delete',
+        label: 'Trash',
+        icon: 'trash',
+        shortcut: '',
+        run: () => void applyThreadAction('delete', 'Moved to Trash')
+      });
+    }
+    actions.push({ id: 'snooze', label: 'Snooze', icon: 'clock', shortcut: 'H', run: openSnoozeDialog });
+    actions.push({
+      id: thread.unread ? 'read' : 'unread',
+      label: thread.unread ? 'Mark read' : 'Mark unread',
+      icon: 'mail',
+      shortcut: 'U',
+      run: () => void applyThreadAction(
+        thread.unread ? 'read' : 'unread',
+        thread.unread ? 'Marked read' : 'Marked unread'
+      )
+    });
+    actions.push({ id: 'reply', label: 'Reply', icon: 'reply', shortcut: 'R', run: () => openReply('reply') });
+    actions.push({ id: 'reply-all', label: 'Reply all', icon: 'replyAll', shortcut: 'A', run: () => openReply('replyAll') });
+    actions.push({ id: 'forward', label: 'Forward', icon: 'forward', shortcut: 'F', run: openForward });
+    if (thread.unread) {
+      actions.push({
+        id: 'jump-unread',
+        label: 'Unread',
+        icon: 'unread',
+        shortcut: '',
+        run: () => void threadConversation?.jumpToUnread()
+      });
+    }
+    return actions;
+  })();
+
+  /// Horizontal drag on a thread row. Vertical movement wins so the list still
+  /// scrolls, and the gesture only fires past a deliberate distance.
+  const SWIPE_TRIGGER_PX = 72;
+  let swipeThreadId: number | null = null;
+  let swipeStartX = 0;
+  let swipeStartY = 0;
+  let swipeOffset = 0;
+  let swipeLocked = false;
+
+  /// Icon, wording, and tone shown behind a row for the action that will fire.
+  function swipeIntent(
+    thread: ThreadSummary,
+    action: SwipeAction
+  ): { label: string; icon: 'archive' | 'inbox' | 'trash' | 'clock' | 'star' | 'mail'; tone: string } | null {
+    if (action === 'none') return null;
+    if (action === 'archive') {
+      return thread.inInbox
+        ? { label: 'Archive', icon: 'archive', tone: 'archive' }
+        : { label: 'Move to inbox', icon: 'inbox', tone: 'archive' };
+    }
+    if (action === 'delete') return { label: 'Trash', icon: 'trash', tone: 'delete' };
+    if (action === 'snooze') return { label: 'Snooze', icon: 'clock', tone: 'snooze' };
+    if (action === 'star') {
+      return thread.starred
+        ? { label: 'Remove star', icon: 'star', tone: 'star' }
+        : { label: 'Star', icon: 'star', tone: 'star' };
+    }
+    return thread.unread
+      ? { label: 'Mark read', icon: 'mail', tone: 'unread' }
+      : { label: 'Mark unread', icon: 'mail', tone: 'unread' };
+  }
+
+  function swipeLabel(action: SwipeAction): string {
+    return swipeChoices.find((choice) => choice.value === action)?.label ?? 'Nothing';
+  }
+
+  function runSwipeAction(thread: ThreadSummary, action: SwipeAction) {
+    if (action === 'none') return;
+    if (action === 'snooze') {
+      selectThread(thread, false);
+      void openSnoozeDialog();
+      return;
+    }
+    if (action === 'star') {
+      void applyThreadAction(thread.starred ? 'unstar' : 'star', thread.starred ? 'Star removed' : 'Starred', thread);
+      return;
+    }
+    if (action === 'unread') {
+      void applyThreadAction(thread.unread ? 'read' : 'unread', thread.unread ? 'Marked read' : 'Marked unread', thread);
+      return;
+    }
+    if (action === 'archive') {
+      void applyThreadAction(thread.inInbox ? 'archive' : 'restore', thread.inInbox ? 'Archived' : 'Restored to inbox', thread);
+      return;
+    }
+    void applyThreadAction('delete', 'Moved to Trash', thread);
+  }
+
+  function swipeStart(event: PointerEvent, thread: ThreadSummary) {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    swipeThreadId = thread.id;
+    swipeStartX = event.clientX;
+    swipeStartY = event.clientY;
+    swipeOffset = 0;
+    swipeLocked = false;
+  }
+
+  function swipeMove(event: PointerEvent, thread: ThreadSummary) {
+    if (swipeThreadId !== thread.id) return;
+    const dx = event.clientX - swipeStartX;
+    const dy = event.clientY - swipeStartY;
+    if (!swipeLocked) {
+      if (Math.abs(dy) > Math.abs(dx)) {
+        swipeThreadId = null;
+        return;
+      }
+      if (Math.abs(dx) < 12) return;
+      swipeLocked = true;
+    }
+    swipeOffset = dx;
+  }
+
+  function swipeEnd(thread: ThreadSummary) {
+    if (swipeThreadId !== thread.id) return;
+    const offset = swipeOffset;
+    swipeThreadId = null;
+    swipeOffset = 0;
+    swipeLocked = false;
+    if (offset <= -SWIPE_TRIGGER_PX) runSwipeAction(thread, appearance.swipeLeft);
+    else if (offset >= SWIPE_TRIGGER_PX) runSwipeAction(thread, appearance.swipeRight);
   }
 
   function accountFor(accountId: string): AccountSummary | undefined {
@@ -1488,6 +1695,8 @@
   class:nav-open={navigationOpen}
   class:reader-mobile-open={mobileReaderOpen}
   data-theme={theme}
+  data-density={appearance.density}
+  data-collapse-toolbar={appearance.toolbarCollapseNarrow ? 'true' : 'false'}
   data-testid="mux-shell"
 >
   <header class="topbar" inert={blockingDialogOpen}>
@@ -1498,7 +1707,7 @@
       aria-label={navigationOpen ? 'Close mailbox navigation' : 'Open mailbox navigation'}
       aria-controls="native-navigation"
       aria-expanded={navigationOpen}
-      data-action="toggle-navigation"
+      data-action="toggle-navigation" title="Show or hide the mailbox list"
       data-testid="mobile-menu-button"
       disabled={!mailbox}
       on:click={toggleNavigation}
@@ -1554,303 +1763,529 @@
       <p>{error}</p>
     </section>
   {:else if mailbox}
-    <div class="workspace-grid" data-testid="mailbox-workspace" inert={blockingDialogOpen}>
-      <nav
-        id="native-navigation"
-        class="sidebar"
-        aria-label="Mailbox navigation"
-        aria-hidden={compactNavigation && !navigationOpen}
-        inert={compactNavigation && !navigationOpen}
-        data-testid="mailbox-navigation"
-      >
-        <button class="compose" data-action="compose" data-testid="compose-button" on:click={() => openComposer()}>
-          <Icon name="compose" size={18} /> Compose
-        </button>
-
-        <section class="nav-section">
-          <button class:is-active={selectedView === 'inbox'} data-action="view-inbox" on:click={() => selectView('inbox')}>
-            <span class="nav-icon"><Icon name="inbox" size={17} /></span><strong>Inbox</strong>
-            <em>{selectedCounts.inbox}</em>
+    {#if settingsOpen}
+      <section class="settings-screen" data-testid="settings-screen" data-section={settingsSection}>
+        <nav class="settings-nav" aria-label="Settings sections">
+          <button class="settings-back" type="button" title="Back to mail (Esc)" data-testid="settings-close" on:click={closeSettings}>
+            <span aria-hidden="true"><Icon name="chevron" size={15} /></span>Back to mail
           </button>
-          <button class:is-active={selectedView === 'starred'} data-action="view-starred" on:click={() => selectView('starred')}>
-            <span class="nav-icon"><Icon name="star" size={17} /></span><strong>Starred</strong>
-            <em>{selectedCounts.starred}</em>
-          </button>
-          <button class:is-active={selectedView === 'snoozed' && !selectedSmartView} data-action="view-snoozed" on:click={() => selectView('snoozed')}>
-            <span class="nav-icon"><Icon name="clock" size={17} /></span><strong>Snoozed</strong>
-            <em>{selectedCounts.snoozed}</em>
-          </button>
-          <button class:is-active={selectedView === 'sent'} data-action="view-sent" on:click={() => selectView('sent')}>
-            <span class="nav-icon"><Icon name="sent" size={17} /></span><strong>Sent</strong>
-            <em>{selectedCounts.sent}</em>
-          </button>
-          <button class:is-active={selectedView === 'drafts'} data-action="view-drafts" on:click={() => selectView('drafts')}>
-            <span class="nav-icon"><Icon name="drafts" size={17} /></span><strong>Drafts</strong>
-            <em>{mailbox.drafts.filter((draft) => selectedAccount === null || draft.accountId === selectedAccount).length}</em>
-          </button>
-          <button class:is-active={selectedView === 'archive'} data-action="view-archive" on:click={() => selectView('archive')}>
-            <span class="nav-icon"><Icon name="archive" size={17} /></span><strong>Archive</strong>
-            <em>{selectedCounts.archive}</em>
-          </button>
-          <button class:is-active={selectedView === 'trash'} data-action="view-trash" on:click={() => selectView('trash')}>
-            <span class="nav-icon"><Icon name="trash" size={17} /></span><strong>Trash</strong>
-            <em>{selectedCounts.trash}</em>
-          </button>
-          <button class:is-active={selectedView === 'all' && !selectedSmartView && !filter} data-action="view-all" on:click={() => selectView('all')}>
-            <span class="nav-icon"><Icon name="allMail" size={17} /></span><strong>All mail</strong>
-            <em>{selectedCounts.all}</em>
-          </button>
-        </section>
-
-        <p class="section-label">Smart views</p>
-        <section class="smart-views">
-          <button class:is-active={selectedSmartView === 'unread'} data-action="smart-unread" on:click={() => selectSmartView('unread', 'is:unread')}>
-            <span class="smart-dot blue"></span><span>Unread</span>
-          </button>
-          <button class:is-active={selectedSmartView === 'attachments'} data-action="smart-attachments" on:click={() => selectSmartView('attachments', 'has:attachment')}>
-            <span class="smart-dot violet"></span><span>Attachments</span>
-          </button>
-          <button class:is-active={selectedSmartView === 'invitations'} data-action="smart-invitations" on:click={() => selectSmartView('invitations', 'has:invite')}>
-            <span class="smart-dot green"></span><span>Invitations</span>
-          </button>
-          <button class:is-active={selectedSmartView === 'finance'} data-action="smart-finance" on:click={() => selectSmartView('finance', 'category:Finance')}>
-            <span class="smart-dot amber"></span><span>Finance</span>
-          </button>
-        </section>
-
-        <p class="section-label">Accounts</p>
-        <section class="accounts">
-          <button class:is-active={selectedAccount === null} data-action="account-all" on:click={() => selectAccount(null)}>
-            <span class="account-dot all"></span><span>All accounts</span>
-            <em>{mailbox.accounts.reduce((total, account) => total + account.unread, 0)}</em>
-          </button>
-          {#each mailbox.accounts as account}
-            <button class:is-active={selectedAccount === account.id} data-action="select-account" data-account-id={account.id} on:click={() => selectAccount(account.id)}>
-              <span class="account-dot" style:background={account.color}></span>
-              <span>{account.name}</span>
-              <em>{account.unread}</em>
-            </button>
+          <h1>Settings</h1>
+          {#each settingsSections as section}
+            <button
+              class:is-active={settingsSection === section.id}
+              type="button"
+              data-section={section.id}
+              aria-current={settingsSection === section.id ? 'page' : undefined}
+              on:click={() => { settingsSection = section.id; clearSettingsFeedback(); }}
+            >{section.title}</button>
           {/each}
-        </section>
+        </nav>
 
-        <button class="vault-status-button" type="button" data-action="open-vault" on:click={openVaultSettings} aria-haspopup="dialog">
-          <span class="vault-status-dot" class:is-absent={vaultState === 'absent'} class:is-locked={vaultState === 'locked'} class:is-unlocked={vaultState === 'unlocked'}></span>
-          <span><strong>Account security</strong><small>{vaultStateLabel}</small></span>
-          <span class="vault-status-arrow" aria-hidden="true"><Icon name="chevron" size={16} /></span>
-        </button>
+        <div class="settings-body">
+          {#if settingsSection === 'accounts'}
+            <header class="settings-heading">
+              <h2>Accounts</h2>
+              <p>Mux keeps each account's sign-in in your Mac's keychain, so it is ready whenever you are.</p>
+            </header>
 
-        <button class="projection-status" type="button" data-action="open-activity" on:click={openActivity} aria-haspopup="dialog">
-          <span class:has-error={Boolean(threadError) || !mailboxEventsAvailable}></span>
-          <div>
-            <strong>{threadError ? 'Mailbox needs attention' : mailboxEventsAvailable ? 'Up to date' : 'Refreshes on focus'}</strong>
-            <small>{threadError || (mailboxEventsAvailable ? 'Changes save on this Mac' : 'Live updates are unavailable')}</small>
-          </div>
-        </button>
-      </nav>
-
-      <section class="thread-pane" aria-label={viewTitle}>
-        <header class="pane-heading">
-          <div><small>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.email}</small><h1>{filter ? `Search ${viewTitle.toLocaleLowerCase()}` : viewTitle}</h1></div>
-          <span>{searching ? 'Searching…' : `${filter.trim() && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
-        </header>
-
-        <div class="thread-list" data-testid="thread-list">
-          {#if selectedView === 'drafts'}
-            {#if renderedDraftWindow.start > 0}
-              <button class="search-more" type="button" on:click={() => moveDraftRenderWindow(-1)}>Show previous loaded drafts</button>
-            {/if}
-            {#each renderedDraftWindow.rows as draft (draft.id)}
-              <button class="thread-row draft-row" data-testid="thread-row" data-draft-id={draft.id} on:click={() => openSavedDraft(draft)}>
-                <span class="thread-accent" style:background={draft.accountColor}></span>
-                <span class="avatar" style:--avatar-color={draft.accountColor}>D</span>
-                <span class="thread-copy">
-                  <span class="thread-line"><strong>{draft.recipients || 'No recipient'}</strong><time>{relativeTime(draft.updatedAt)}</time></span>
-                  <span class="subject">{draft.subject || 'No subject'}</span>
-                  <span class="snippet">{draft.locked ? 'Sending…' : 'Saved locally'}</span>
-                </span>
-              </button>
+            {#if mailbox.accounts.length}
+              <ul class="settings-account-list">
+                {#each mailbox.accounts as account (account.id)}
+                  <li>
+                    <div class="settings-account-head">
+                      <span class="settings-account-dot" style:--avatar-color={account.color}></span>
+                      <span><strong>{account.name}</strong><small>{account.email}</small></span>
+                      <em>{account.total} messages</em>
+                    </div>
+                    <div class="settings-account-refresh">
+                      <span>Check for new mail</span>
+                      <div class="settings-choice-row" role="group" aria-label={`Refresh interval for ${account.name}`} data-testid="refresh-interval" data-account-id={account.id}>
+                        {#each refreshChoices as choice}
+                          <button
+                            class:is-active={account.refreshSeconds === choice.value}
+                            type="button"
+                            on:click={() => setAccountRefresh(account.id, choice.value)}
+                          >{choice.label}</button>
+                        {/each}
+                      </div>
+                    </div>
+                  </li>
+                {/each}
+              </ul>
             {:else}
-              <div class="empty"><strong>No drafts</strong><span>Compose a message and it will autosave here.</span></div>
-            {/each}
-            {#if renderedDraftWindow.end < visibleDrafts.length}
-              <button class="search-more" type="button" on:click={() => moveDraftRenderWindow(1)}>Show next loaded drafts</button>
+              <p class="settings-empty">No accounts yet.</p>
             {/if}
-          {:else}
-            {#if renderedThreadWindow.start > 0}
-              <button class="search-more" type="button" on:click={() => moveThreadRenderWindow(-1)}>Show previous loaded threads</button>
-            {/if}
-            {#each renderedThreadWindow.rows as thread (thread.id)}
-              <button
-                class="thread-row"
-                class:is-selected={thread.id === selectedThread?.id}
-                class:is-unread={thread.unread}
-                data-testid="thread-row"
-                data-thread-id={thread.id}
-                on:click={() => selectThread(thread)}
-                aria-pressed={thread.id === selectedThread?.id}
-              >
-                <span class="thread-accent" style:background={accountFor(thread.accountId)?.color}></span>
-                <span class="avatar" style:--avatar-color={accountFor(thread.accountId)?.color}>{initials(thread.participants)}</span>
-                <span class="thread-copy">
-                  <span class="thread-line"><strong>{thread.participants}</strong><time>{relativeTime(thread.latestAt)}</time></span>
-                  <span class="subject">{thread.starred ? '★ ' : ''}{thread.subject}</span>
-                  <span class="snippet">{thread.snippet}</span>
-                </span>
-                {#if thread.unread}<span class="unread-dot" aria-label="Unread"></span>{/if}
-              </button>
-            {:else}
-              {#if threadLoading && !filter.trim()}
-                <div class="empty search-state"><strong>Loading mailbox</strong><span>Reading the next local page.</span></div>
-              {:else if searching}
-                <div class="empty search-state"><strong>Searching mail</strong><span>Press Esc to clear.</span></div>
-              {:else if searchError}
-                <div class="empty search-state has-error" role="alert"><strong>Search needs attention</strong><span>{searchError}</span></div>
-              {:else}
-                <div class="empty"><strong>No {viewTitle.toLocaleLowerCase()} mail</strong><span>{filter ? 'Try a broader search.' : 'Choose another mailbox or account.'}</span></div>
-              {/if}
-            {/each}
-            {#if threadError}
-              <div class="empty search-state has-error" role="alert"><strong>Mailbox page could not load</strong><span>{threadError}</span></div>
-            {/if}
-            {#if renderedThreadWindow.end < visibleThreads.length}
-              <button class="search-more" type="button" on:click={() => moveThreadRenderWindow(1)}>Show next loaded threads</button>
-            {:else if filter && searchHasMore && !searching}
-              <button class="search-more" type="button" on:click={() => runSearch(true)}>Load 50 more results</button>
-            {:else if !filter.trim() && threadHasMore && !threadLoading}
-              <button class="search-more" type="button" on:click={() => loadThreads(true)}>Load 50 more threads</button>
-            {/if}
-          {/if}
-        </div>
-        {#if selectedView !== 'drafts'}
-        <footer class="key-hint"><kbd>J</kbd><kbd>K</kbd><span>Navigate</span><kbd>R</kbd><span>Reply</span><kbd>A</kbd><span>All</span></footer>
-        {/if}
-      </section>
 
-      <article
-        class="reader"
-        aria-live="polite"
-        aria-hidden={compactReader && !mobileReaderOpen}
-        inert={compactReader && !mobileReaderOpen}
-        data-testid="reader"
-      >
-        {#if selectedThread}
-          <header class="reader-toolbar">
-            <button class="reader-back-button" type="button" data-action="reader-back" data-testid="reader-back-button" aria-label="Back to thread list" on:click={() => closeMobileReader(true)}>
-              <Icon name="chevron" size={18} />
-            </button>
-            {#if selectedView === 'trash'}
-              <button data-action="untrash" on:click={() => applyThreadAction('untrash', 'Removed from Trash')}>
-                <Icon name="inbox" size={16} /> <span>Remove from Trash</span>
-              </button>
-            {:else}
-              <button data-action={selectedThread.inInbox ? 'archive' : 'restore'} on:click={() => applyThreadAction(selectedThread.inInbox ? 'archive' : 'restore', selectedThread.inInbox ? 'Archived' : 'Restored to inbox')}>
-                <Icon name="archive" size={16} /> <span>{selectedThread.inInbox ? 'Archive' : 'Move to inbox'}</span>
-              </button>
-              <button data-action="delete" on:click={() => applyThreadAction('delete', 'Moved to Trash')}>
-                <Icon name="trash" size={16} /> <span>Trash</span>
-              </button>
-            {/if}
-            <button data-action="snooze" on:click={openSnoozeDialog}>
-              <Icon name="clock" size={16} /> <span>Snooze</span>
-            </button>
-            <button data-action={selectedThread.unread ? 'read' : 'unread'} on:click={() => applyThreadAction(selectedThread.unread ? 'read' : 'unread', selectedThread.unread ? 'Marked read' : 'Marked unread')}>
-              <Icon name="mail" size={16} /> <span>{selectedThread.unread ? 'Mark read' : 'Mark unread'}</span>
-            </button>
-            <button data-action="reply" on:click={() => openReply('reply')}><Icon name="reply" size={16} /> <span>Reply</span></button>
-            <button data-action="reply-all" on:click={() => openReply('replyAll')}><Icon name="replyAll" size={16} /> <span>Reply all</span></button>
-            <button data-action="forward" on:click={openForward}><Icon name="forward" size={16} /> <span>Forward</span></button>
-            {#if selectedThread.unread}
-              <button data-action="jump-unread" on:click={() => threadConversation?.jumpToUnread()}><Icon name="unread" size={16} /> <span>Unread</span></button>
-            {/if}
-            <button data-action="jump-newest" on:click={() => threadConversation?.jumpToNewest()}><Icon name="newest" size={16} /> <span>Newest</span></button>
-            <span class="toolbar-spacer"></span>
-            <button class:is-starred={selectedThread.starred} data-action={selectedThread.starred ? 'unstar' : 'star'} aria-label={selectedThread.starred ? 'Remove star' : 'Star'} title={selectedThread.starred ? 'Remove star (S)' : 'Star (S)'} on:click={() => applyThreadAction(selectedThread.starred ? 'unstar' : 'star', selectedThread.starred ? 'Star removed' : 'Starred')}>
-              <Icon name="star" size={18} filled={selectedThread.starred} />
-            </button>
-          </header>
-
-          <div class="reader-scroll">
-            <div class="subject-heading">
-              <div class="subject-line">
-                <h1 data-testid="reader-subject">{selectedThread.subject}</h1>
-                <span class="category-pill">{selectedThread.category}</span>
+            <section class="settings-card">
+              <h3>Connect an account</h3>
+              <div class="vault-provider-card" aria-labelledby="gmail-connect-title">
+                <div>
+                  <h3 id="gmail-connect-title">Gmail</h3>
+                  <p>Sign in through your browser. Mux never sees your Google password.</p>
+                </div>
+                {#if gmailOAuthBusy}
+                  <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
+                {:else}
+                  <button class="vault-primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Connect Gmail</button>
+                {/if}
               </div>
-              <p>{selectedThread.participants} · {selectedThread.messageCount} messages · {accountFor(selectedThread.accountId)?.name}</p>
+            </section>
+          {:else if settingsSection === 'appearance'}
+            <header class="settings-heading">
+              <h2>Appearance</h2>
+              <p>Mux follows this choice on every launch.</p>
+            </header>
+            <section class="settings-card">
+              <h3>Theme</h3>
+              <div class="settings-choice-row" role="group" aria-label="Theme">
+              <button class:is-active={theme === 'light'} type="button" data-action="theme-light" title="Use the light appearance" on:click={() => setTheme('light')}>
+                <span aria-hidden="true"><Icon name="sun" size={16} /></span>Light
+              </button>
+                <button class:is-active={theme === 'dark'} type="button" data-action="theme-dark" title="Use the dark appearance" on:click={() => setTheme('dark')}>
+                  <span aria-hidden="true"><Icon name="moon" size={16} /></span>Dark
+                </button>
+              </div>
+            </section>
+
+            <section class="settings-card">
+              <h3>Text and typeface</h3>
+              <p class="settings-hint">Scales the whole interface, not only message text.</p>
+              <div class="settings-choice-row" role="group" aria-label="Text size" data-testid="text-size">
+              {#each textSizes as size}
+                <button
+                  class:is-active={appearance.scale === size.value}
+                  type="button"
+                  on:click={() => applyAppearance({ ...appearance, scale: size.value })}
+                >{size.label}</button>
+              {/each}
             </div>
 
-            {#if messageLoading && loadedThreadId !== selectedThread.id}
-              <div class="empty search-state"><strong>Loading conversation</strong><span>Reading messages from the local store.</span></div>
-            {:else if messageError && loadedThreadId !== selectedThread.id}
-              <div class="empty search-state has-error" role="alert"><strong>Conversation needs attention</strong><span>{messageError}</span></div>
+              <div class="settings-choice-row settings-choice-spaced" role="group" aria-label="Typeface" data-testid="typeface">
+              {#each fontChoices as choice}
+                <button
+                  class:is-active={appearance.font === choice.value}
+                  type="button"
+                  style:font-family={choice.value}
+                  on:click={() => { customFont = ''; applyAppearance({ ...appearance, font: choice.value }); }}
+                >{choice.label}</button>
+              {/each}
+            </div>
+            <label class="settings-inline-field">
+              <span>Or name a font installed on this Mac</span>
+              <input
+                bind:value={customFont}
+                data-testid="custom-font"
+                placeholder="Iosevka"
+                spellcheck="false"
+                on:change={() => applyAppearance({ ...appearance, font: customFont.trim() || DEFAULT_FONT })}
+              />
+            </label>
+
+            </section>
+
+            <section class="settings-card">
+              <h3>Thread actions</h3>
+              <p class="settings-hint">What the buttons above a conversation show.</p>
+              <div class="settings-toggle-row" data-testid="toolbar-display">
+              <label><input type="checkbox" bind:checked={appearance.toolbarIcons} on:change={() => applyAppearance(appearance)} /><span>Icon</span></label>
+              <label><input type="checkbox" bind:checked={appearance.toolbarText} on:change={() => applyAppearance(appearance)} /><span>Text</span></label>
+              <label><input type="checkbox" bind:checked={appearance.toolbarShortcuts} on:change={() => applyAppearance(appearance)} /><span>Key shortcut</span></label>
+              <label><input type="checkbox" bind:checked={appearance.toolbarCollapseNarrow} on:change={() => applyAppearance(appearance)} /><span>Collapse to icons on narrow screens</span></label>
+            </div>
+
+            </section>
+
+            <section class="settings-card">
+              <h3>Swipe actions</h3>
+              <p class="settings-hint">Drag a conversation sideways in the list.</p>
+            <label class="settings-inline-field">
+              <span>Swipe left</span>
+              <select bind:value={appearance.swipeLeft} data-testid="swipe-left" on:change={() => applyAppearance(appearance)}>
+                {#each swipeChoices as choice}<option value={choice.value}>{choice.label}</option>{/each}
+              </select>
+            </label>
+            <label class="settings-inline-field">
+              <span>Swipe right</span>
+              <select bind:value={appearance.swipeRight} data-testid="swipe-right" on:change={() => applyAppearance(appearance)}>
+                {#each swipeChoices as choice}<option value={choice.value}>{choice.label}</option>{/each}
+              </select>
+            </label>
+
+            </section>
+
+            <section class="settings-card">
+              <h3>Density</h3>
+              <div class="settings-choice-row" role="group" aria-label="Density" data-testid="density">
+              {#each densityChoices as choice}
+                <button
+                  class:is-active={appearance.density === choice.value}
+                  type="button"
+                  data-density-option={choice.value}
+                  on:click={() => applyAppearance({ ...appearance, density: choice.value })}
+                >{choice.label}</button>
+              {/each}
+              </div>
+            </section>
+          {:else if settingsSection === 'mail'}
+            <header class="settings-heading">
+              <h2>Mail</h2>
+              <p>Mux keeps a copy of your mail on this Mac so it opens instantly.</p>
+            </header>
+            <section class="settings-card">
+              <h3>Re-download all mail</h3>
+              <p>Fetches every message from your provider again and refreshes the local copy in place. Nothing is removed, here or on the server. Useful if a message looks wrong or incomplete.</p>
+              <div class="vault-actions">
+                <button class="vault-primary-button" type="button" data-action="resync-all" title="Re-download every message from your provider" data-testid="resync-all" disabled={settingsBusy || resyncBusy || gmailOAuthBusy} on:click={resyncAllMail}>{resyncBusy ? 'Re-downloading…' : 'Re-download all mail'}</button>
+              </div>
+            </section>
+          {:else}
+            <header class="settings-heading">
+              <h2>Shortcuts</h2>
+              <p>These work whenever the message list has focus.</p>
+            </header>
+            <section class="settings-card">
+              <ul class="settings-shortcut-list">
+              {#each shortcutReference as row}
+                <li><kbd>{row.keys}</kbd><span>{row.action}</span></li>
+                {/each}
+              </ul>
+            </section>
+          {/if}
+
+          {#if settingsError}<p class="vault-feedback has-error" role="alert">{settingsError}</p>{/if}
+          {#if settingsMessage}<p class="vault-feedback" role="status">{settingsMessage}</p>{/if}
+        </div>
+      </section>
+    {:else}
+      <div class="workspace-grid" data-testid="mailbox-workspace" inert={blockingDialogOpen}>
+        <nav
+          id="native-navigation"
+          class="sidebar"
+          aria-label="Mailbox navigation"
+          aria-hidden={compactNavigation && !navigationOpen}
+          inert={compactNavigation && !navigationOpen}
+          data-testid="mailbox-navigation"
+        >
+          <button class="compose" data-action="compose" title="Compose a message (C)" data-testid="compose-button" on:click={() => openComposer()}>
+            <Icon name="compose" size={18} /> Compose
+          </button>
+
+          <section class="nav-section">
+            <button class:is-active={selectedView === 'inbox'} data-action="view-inbox" title="Inbox" on:click={() => selectView('inbox')}>
+              <span class="nav-icon"><Icon name="inbox" size={17} /></span><strong>Inbox</strong>
+              <em>{selectedCounts.inbox}</em>
+            </button>
+            <button class:is-active={selectedView === 'starred'} data-action="view-starred" title="Starred conversations" on:click={() => selectView('starred')}>
+              <span class="nav-icon"><Icon name="star" size={17} /></span><strong>Starred</strong>
+              <em>{selectedCounts.starred}</em>
+            </button>
+            <button class:is-active={selectedView === 'snoozed' && !selectedSmartView} data-action="view-snoozed" title="Snoozed conversations" on:click={() => selectView('snoozed')}>
+              <span class="nav-icon"><Icon name="clock" size={17} /></span><strong>Snoozed</strong>
+              <em>{selectedCounts.snoozed}</em>
+            </button>
+            <button class:is-active={selectedView === 'sent'} data-action="view-sent" title="Sent mail" on:click={() => selectView('sent')}>
+              <span class="nav-icon"><Icon name="sent" size={17} /></span><strong>Sent</strong>
+              <em>{selectedCounts.sent}</em>
+            </button>
+            <button class:is-active={selectedView === 'drafts'} data-action="view-drafts" title="Local drafts" on:click={() => selectView('drafts')}>
+              <span class="nav-icon"><Icon name="drafts" size={17} /></span><strong>Drafts</strong>
+              <em>{mailbox.drafts.filter((draft) => selectedAccount === null || draft.accountId === selectedAccount).length}</em>
+            </button>
+            <button class:is-active={selectedView === 'archive'} data-action="view-archive" title="Archived conversations" on:click={() => selectView('archive')}>
+              <span class="nav-icon"><Icon name="archive" size={17} /></span><strong>Archive</strong>
+              <em>{selectedCounts.archive}</em>
+            </button>
+            <button class:is-active={selectedView === 'trash'} data-action="view-trash" title="Trash" on:click={() => selectView('trash')}>
+              <span class="nav-icon"><Icon name="trash" size={17} /></span><strong>Trash</strong>
+              <em>{selectedCounts.trash}</em>
+            </button>
+            <button class:is-active={selectedView === 'all' && !selectedSmartView && !filter} data-action="view-all" title="All mail" on:click={() => selectView('all')}>
+              <span class="nav-icon"><Icon name="allMail" size={17} /></span><strong>All mail</strong>
+              <em>{selectedCounts.all}</em>
+            </button>
+          </section>
+
+          <p class="section-label">Smart views</p>
+          <section class="smart-views">
+            <button class:is-active={selectedSmartView === 'unread'} data-action="smart-unread" title="Unread conversations" on:click={() => selectSmartView('unread', 'is:unread')}>
+              <span class="smart-dot blue"></span><span>Unread</span>
+            </button>
+            <button class:is-active={selectedSmartView === 'attachments'} data-action="smart-attachments" title="Conversations with attachments" on:click={() => selectSmartView('attachments', 'has:attachment')}>
+              <span class="smart-dot violet"></span><span>Attachments</span>
+            </button>
+            <button class:is-active={selectedSmartView === 'invitations'} data-action="smart-invitations" title="Conversations with invitations" on:click={() => selectSmartView('invitations', 'has:invite')}>
+              <span class="smart-dot green"></span><span>Invitations</span>
+            </button>
+            <button class:is-active={selectedSmartView === 'finance'} data-action="smart-finance" title="Finance conversations" on:click={() => selectSmartView('finance', 'category:Finance')}>
+              <span class="smart-dot amber"></span><span>Finance</span>
+            </button>
+          </section>
+
+          <p class="section-label">Accounts</p>
+          <section class="accounts">
+            <button class:is-active={selectedAccount === null} data-action="account-all" title="Show every account together" on:click={() => selectAccount(null)}>
+              <span class="account-dot all"></span><span>All accounts</span>
+              <em>{mailbox.accounts.reduce((total, account) => total + account.unread, 0)}</em>
+            </button>
+            {#each mailbox.accounts as account}
+              {@const hidden = hiddenAccounts.includes(account.id)}
+              <div class="account-row" class:is-hidden={hidden}>
+                <button
+                  class="account-visibility"
+                  type="button"
+                  data-action="toggle-account-visibility"
+                  data-account-id={account.id}
+                  aria-pressed={!hidden}
+                  title={hidden ? `Show ${account.name}` : `Hide ${account.name}`}
+                  aria-label={hidden ? `Show ${account.name}` : `Hide ${account.name}`}
+                  on:click={() => toggleAccountVisibility(account.id)}
+                >
+                  <span class="account-dot" style:background={account.color}></span>
+                </button>
+                <button
+                  class="account-select"
+                  class:is-active={selectedAccount === account.id}
+                  type="button"
+                  data-action="select-account" title={`Show only ${account.name}`}
+                  data-account-id={account.id}
+                  on:click={() => selectAccount(account.id)}
+                >
+                  <span>{account.name}</span>
+                  <em>{account.unread}</em>
+                </button>
+              </div>
+            {/each}
+          </section>
+
+          <button class="settings-button" type="button" data-action="open-settings" title="Settings (⌘,)" on:click={() => openSettings()}>
+            <span class="nav-icon"><Icon name="settings" size={16} /></span><strong>Settings</strong>
+            <kbd>⌘,</kbd>
+          </button>
+
+          <button class="projection-status" type="button" data-action="open-activity" title="Open the local operation journal" on:click={openActivity} aria-haspopup="dialog">
+            <span class:has-error={Boolean(threadError) || !mailboxEventsAvailable}></span>
+            <div>
+              <strong>{threadError ? 'Mailbox needs attention' : mailboxEventsAvailable ? 'Up to date' : 'Refreshes on focus'}</strong>
+              <small>{threadError || (mailboxEventsAvailable ? 'Changes save on this Mac' : 'Live updates are unavailable')}</small>
+            </div>
+          </button>
+        </nav>
+
+        <section class="thread-pane" aria-label={viewTitle}>
+          <header class="pane-heading">
+            <div><small>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.email}</small><h1>{filter ? `Search ${viewTitle.toLocaleLowerCase()}` : viewTitle}</h1></div>
+            <span>{searching ? 'Searching…' : `${filter.trim() && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
+          </header>
+
+          <div class="thread-list" data-testid="thread-list">
+            {#if selectedView === 'drafts'}
+              {#if renderedDraftWindow.start > 0}
+                <button class="search-more" type="button" title="Load more" on:click={() => moveDraftRenderWindow(-1)}>Show previous loaded drafts</button>
+              {/if}
+              {#each renderedDraftWindow.rows as draft (draft.id)}
+                <button class="thread-row draft-row" data-testid="thread-row" data-draft-id={draft.id} on:click={() => openSavedDraft(draft)}>
+                  <span class="thread-accent" style:background={draft.accountColor}></span>
+                  <span class="avatar" style:--avatar-color={draft.accountColor}>D</span>
+                  <span class="thread-copy">
+                    <span class="thread-line"><strong>{draft.recipients || 'No recipient'}</strong><time>{relativeTime(draft.updatedAt)}</time></span>
+                    <span class="subject">{draft.subject || 'No subject'}</span>
+                    <span class="snippet">{draft.locked ? 'Sending…' : 'Saved locally'}</span>
+                  </span>
+                </button>
+              {:else}
+                <div class="empty"><strong>No drafts</strong><span>Compose a message and it will autosave here.</span></div>
+              {/each}
+              {#if renderedDraftWindow.end < visibleDrafts.length}
+                <button class="search-more" type="button" title="Load more" on:click={() => moveDraftRenderWindow(1)}>Show next loaded drafts</button>
+              {/if}
             {:else}
-              {#if messageHasMore && !messageLoading}
-                <button class="search-more" type="button" on:click={() => loadThreadMessages(selectedThread, true)}>Show older</button>
+              {#if renderedThreadWindow.start > 0}
+                <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(-1)}>Show previous loaded threads</button>
               {/if}
-              {#if messageError}
-                <div class="empty search-state has-error" role="alert"><strong>Older messages could not load</strong><span>{messageError}</span></div>
-              {/if}
-
-              {#if selectedInvitation}
-                <section class="invitation-card" data-testid="invitation-card" aria-label={`Invitation: ${selectedInvitation.title}`}>
-                  <div class="invitation-icon" aria-hidden="true"><Icon name="calendar" size={22} /></div>
-                  <div class="invitation-copy">
-                    <h2>{selectedInvitation.title}</h2>
-                    <p><strong>{formatInvitationTime(selectedInvitation)}</strong></p>
-                    <p>{selectedInvitation.location} · Organized by {selectedInvitation.organizer}</p>
-                    {#if selectedInvitation.conflictText}
-                      <p class="invitation-conflict">{selectedInvitation.conflictText}</p>
-                    {/if}
-                    <div class="invitation-actions" aria-label="Respond to invitation">
-                      <button class:is-selected={selectedInvitation.response === 'accepted'} type="button" on:click={() => respondToInvitation('accepted')}>Accept</button>
-                      <button class:is-selected={selectedInvitation.response === 'tentative'} type="button" on:click={() => respondToInvitation('tentative')}>Maybe</button>
-                      <button class:is-selected={selectedInvitation.response === 'declined'} type="button" on:click={() => respondToInvitation('declined')}>Decline</button>
+              {#each renderedThreadWindow.rows as thread (thread.id)}
+                {@const swiping = swipeThreadId === thread.id && swipeLocked}
+                {@const side = swipeOffset < 0 ? 'left' : 'right'}
+                {@const pending = swipeIntent(thread, swipeOffset < 0 ? appearance.swipeLeft : appearance.swipeRight)}
+                <div class="thread-swipe" class:is-swiping={swiping}>
+                  {#if swiping && pending}
+                    <div
+                      class="thread-swipe-hint"
+                      class:is-armed={Math.abs(swipeOffset) >= SWIPE_TRIGGER_PX}
+                      data-side={side}
+                      data-tone={pending.tone}
+                      aria-hidden="true"
+                    >
+                      <Icon name={pending.icon} size={17} />
+                      <span>{pending.label}</span>
                     </div>
-                  </div>
-                </section>
-              {/if}
-
-              {#key `${selectedThread.id}:${selectedMessages[0]?.id ?? 0}:${selectedMessages.length}`}
-                <ThreadConversation
-                  bind:this={threadConversation}
-                  messages={selectedMessages}
-                  attachments={selectedAttachments}
-                  accountColor={accountFor(selectedThread.accountId)?.color}
-                  threadUnread={selectedThread.unread}
-                />
-              {/key}
-            {/if}
-          </div>
-          {#if loadedThreadId === selectedThread.id && !replyDraftLoading}
-            <footer class="quick-reply-host" data-testid="inline-reply">
-              {#if replyDraftError && selectedReplyDraftHeader}
-                <div class="reply-draft-error" role="alert">
-                  <span>Saved reply could not load: {replyDraftError}</span>
-                  <button type="button" on:click={() => loadReplyDraft(selectedThread.id)}>Try again</button>
+                  {/if}
+                <button
+                  class="thread-row"
+                  class:is-selected={thread.id === selectedThread?.id}
+                  class:is-unread={thread.unread}
+                  class:is-swiping={swiping}
+                  style:--swipe-offset={swipeThreadId === thread.id ? `${swipeOffset}px` : '0px'}
+                  data-testid="thread-row"
+                  data-thread-id={thread.id}
+                  title={`${thread.subject} — swipe left to ${swipeLabel(appearance.swipeLeft).toLocaleLowerCase()}, right to ${swipeLabel(appearance.swipeRight).toLocaleLowerCase()}`}
+                  on:click={() => selectThread(thread)}
+                  on:pointerdown={(event) => swipeStart(event, thread)}
+                  on:pointermove={(event) => swipeMove(event, thread)}
+                  on:pointerup={() => swipeEnd(thread)}
+                  on:pointercancel={() => swipeEnd(thread)}
+                  aria-pressed={thread.id === selectedThread?.id}
+                >
+                  <span class="thread-accent" style:background={accountFor(thread.accountId)?.color}></span>
+                  <span class="avatar" style:--avatar-color={accountFor(thread.accountId)?.color}>{initials(thread.participants)}</span>
+                  <span class="thread-copy">
+                    <span class="thread-line"><strong>{thread.participants}</strong><time>{relativeTime(thread.latestAt)}</time></span>
+                    <span class="subject">{thread.starred ? '★ ' : ''}{thread.subject}</span>
+                    <span class="snippet">{thread.snippet}</span>
+                  </span>
+                  {#if thread.unread}<span class="unread-dot" aria-label="Unread"></span>{/if}
+                </button>
                 </div>
               {:else}
-                {#key `${selectedThread.id}:${inlineReplyKey}`}
-                  <InlineReply
-                    bind:this={inlineReply}
-                    accounts={mailbox.accounts}
-                    thread={selectedThread}
-                    draft={replyDraft}
-                    replyRecipient={singleReplyRecipients}
-                    replyAllRecipients={allReplyRecipients}
-                    on:saved={(event) => updateDraftLocally(event.detail)}
-                    on:queued={inlineQueued}
-                    on:popout={(event) => openReplyModal(event.detail.draft, event.detail.mode)}
+                {#if threadLoading && !filter.trim()}
+                  <div class="empty search-state"><strong>Loading mailbox</strong><span>Reading the next local page.</span></div>
+                {:else if searching}
+                  <div class="empty search-state"><strong>Searching mail</strong><span>Press Esc to clear.</span></div>
+                {:else if searchError}
+                  <div class="empty search-state has-error" role="alert"><strong>Search needs attention</strong><span>{searchError}</span></div>
+                {:else}
+                  <div class="empty"><strong>No {viewTitle.toLocaleLowerCase()} mail</strong><span>{filter ? 'Try a broader search.' : 'Choose another mailbox or account.'}</span></div>
+                {/if}
+              {/each}
+              {#if threadError}
+                <div class="empty search-state has-error" role="alert"><strong>Mailbox page could not load</strong><span>{threadError}</span></div>
+              {/if}
+              {#if renderedThreadWindow.end < visibleThreads.length}
+                <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(1)}>Show next loaded threads</button>
+              {:else if filter && searchHasMore && !searching}
+                <button class="search-more" type="button" title="Load more" on:click={() => runSearch(true)}>Load 50 more results</button>
+              {:else if !filter.trim() && threadHasMore && !threadLoading}
+                <button class="search-more" type="button" title="Load more" on:click={() => loadThreads(true)}>Load 50 more threads</button>
+              {/if}
+            {/if}
+          </div>
+          {#if selectedView !== 'drafts'}
+          <footer class="key-hint"><kbd>J</kbd><kbd>K</kbd><span>Navigate</span><kbd>R</kbd><span>Reply</span><kbd>A</kbd><span>All</span></footer>
+          {/if}
+        </section>
+
+        <article
+          class="reader"
+          aria-live="polite"
+          aria-hidden={compactReader && !mobileReaderOpen}
+          inert={compactReader && !mobileReaderOpen}
+          data-testid="reader"
+        >
+          {#if selectedThread}
+            <header class="reader-toolbar">
+              <button class="reader-back-button" type="button" data-action="reader-back" data-testid="reader-back-button" aria-label="Back to thread list" on:click={() => closeMobileReader(true)}>
+                <Icon name="chevron" size={18} />
+              </button>
+              {#each readerActions as action (action.id)}
+                <button
+                  data-action={action.id}
+                  title={action.shortcut ? `${action.label} (${action.shortcut})` : action.label}
+                  aria-label={action.label}
+                  on:click={action.run}
+                >
+                  {#if appearance.toolbarIcons}<Icon name={action.icon} size={16} />{/if}
+                  {#if appearance.toolbarText}<span>{action.label}</span>{/if}
+                  {#if appearance.toolbarShortcuts && action.shortcut}<kbd>{action.shortcut}</kbd>{/if}
+                </button>
+              {/each}
+              <span class="toolbar-spacer"></span>
+              <button class:is-starred={selectedThread.starred} data-action={selectedThread.starred ? 'unstar' : 'star'} aria-label={selectedThread.starred ? 'Remove star' : 'Star'} title={selectedThread.starred ? 'Remove star (S)' : 'Star (S)'} on:click={() => applyThreadAction(selectedThread.starred ? 'unstar' : 'star', selectedThread.starred ? 'Star removed' : 'Starred')}>
+                <Icon name="star" size={18} filled={selectedThread.starred} />
+              </button>
+            </header>
+
+            <div class="reader-scroll">
+              <div class="subject-heading">
+                <div class="subject-line">
+                  <h1 data-testid="reader-subject">{selectedThread.subject}</h1>
+                  <span class="category-pill">{selectedThread.category}</span>
+                </div>
+                <p>{selectedThread.participants} · {selectedThread.messageCount} messages · {accountFor(selectedThread.accountId)?.name}</p>
+              </div>
+
+              {#if messageLoading && loadedThreadId !== selectedThread.id}
+                <div class="empty search-state"><strong>Loading conversation</strong><span>Reading messages from the local store.</span></div>
+              {:else if messageError && loadedThreadId !== selectedThread.id}
+                <div class="empty search-state has-error" role="alert"><strong>Conversation needs attention</strong><span>{messageError}</span></div>
+              {:else}
+                {#if messageHasMore && !messageLoading}
+                  <button class="search-more" type="button" title="Load more" on:click={() => loadThreadMessages(selectedThread, true)}>Show older</button>
+                {/if}
+                {#if messageError}
+                  <div class="empty search-state has-error" role="alert"><strong>Older messages could not load</strong><span>{messageError}</span></div>
+                {/if}
+
+                {#if selectedInvitation}
+                  <section class="invitation-card" data-testid="invitation-card" aria-label={`Invitation: ${selectedInvitation.title}`}>
+                    <div class="invitation-icon" aria-hidden="true"><Icon name="calendar" size={22} /></div>
+                    <div class="invitation-copy">
+                      <h2>{selectedInvitation.title}</h2>
+                      <p><strong>{formatInvitationTime(selectedInvitation)}</strong></p>
+                      <p>{selectedInvitation.location} · Organized by {selectedInvitation.organizer}</p>
+                      {#if selectedInvitation.conflictText}
+                        <p class="invitation-conflict">{selectedInvitation.conflictText}</p>
+                      {/if}
+                      <div class="invitation-actions" aria-label="Respond to invitation">
+                        <button class:is-selected={selectedInvitation.response === 'accepted'} type="button" on:click={() => respondToInvitation('accepted')}>Accept</button>
+                        <button class:is-selected={selectedInvitation.response === 'tentative'} type="button" on:click={() => respondToInvitation('tentative')}>Maybe</button>
+                        <button class:is-selected={selectedInvitation.response === 'declined'} type="button" on:click={() => respondToInvitation('declined')}>Decline</button>
+                      </div>
+                    </div>
+                  </section>
+                {/if}
+
+                {#key `${selectedThread.id}:${selectedMessages[0]?.id ?? 0}:${selectedMessages.length}`}
+                  <ThreadConversation
+                    bind:this={threadConversation}
+                    messages={selectedMessages}
+                    attachments={selectedAttachments}
+                    accountColor={accountFor(selectedThread.accountId)?.color}
+                    threadUnread={selectedThread.unread}
                   />
                 {/key}
               {/if}
-            </footer>
+            </div>
+            {#if loadedThreadId === selectedThread.id && !replyDraftLoading}
+              <footer class="quick-reply-host" data-testid="inline-reply">
+                {#if replyDraftError && selectedReplyDraftHeader}
+                  <div class="reply-draft-error" role="alert">
+                    <span>Saved reply could not load: {replyDraftError}</span>
+                    <button type="button" on:click={() => loadReplyDraft(selectedThread.id)}>Try again</button>
+                  </div>
+                {:else}
+                  {#key `${selectedThread.id}:${inlineReplyKey}`}
+                    <InlineReply
+                      bind:this={inlineReply}
+                      accounts={mailbox.accounts}
+                      thread={selectedThread}
+                      draft={replyDraft}
+                      replyRecipient={singleReplyRecipients}
+                      replyAllRecipients={allReplyRecipients}
+                      on:saved={(event) => updateDraftLocally(event.detail)}
+                      on:queued={inlineQueued}
+                      on:popout={(event) => openReplyModal(event.detail.draft, event.detail.mode)}
+                    />
+                  {/key}
+                {/if}
+              </footer>
+            {/if}
+          {:else if selectedView === 'drafts'}
+            <div class="empty reader-empty"><strong>Your drafts</strong><span>Select a draft to keep writing, or start a new message.</span><button on:click={() => openComposer()}>Compose</button></div>
+          {:else}
+            <div class="empty reader-empty"><strong>Select a conversation</strong><span>Choose a message from the list.</span></div>
           {/if}
-        {:else if selectedView === 'drafts'}
-          <div class="empty reader-empty"><strong>Your drafts</strong><span>Select a draft to keep writing, or start a new message.</span><button on:click={() => openComposer()}>Compose</button></div>
-        {:else}
-          <div class="empty reader-empty"><strong>Select a conversation</strong><span>Choose a message from the list.</span></div>
-        {/if}
-      </article>
-    </div>
+        </article>
+      </div>
+    {/if}
     <button
       class="mobile-scrim"
       type="button"
@@ -1939,11 +2374,19 @@
         </header>
         <div class="modal-content snooze-options">
           {#each snoozePresets() as preset, index}
-            <button type="button" data-autofocus={index === 0 ? '' : undefined} on:click={() => snoozeUntil(preset.wakeAt)}>
+            <button type="button" title={`Snooze until ${preset.description}`} data-autofocus={index === 0 ? '' : undefined} on:click={() => snoozeUntil(preset.wakeAt)}>
               <span><strong>{preset.label}</strong><small>{preset.description}</small></span>
               <Icon name="chevron" size={16} />
             </button>
           {/each}
+          <form class="snooze-custom" data-testid="custom-snooze" on:submit|preventDefault={snoozeAtCustomTime}>
+            <label>
+              <span>Pick a time</span>
+              <input type="datetime-local" bind:value={customSnoozeValue} data-testid="custom-snooze-input" />
+            </label>
+            <button class="vault-primary-button" type="submit" title="Snooze until the chosen time">Snooze</button>
+          </form>
+          {#if customSnoozeError}<p class="snooze-error" role="alert">{customSnoozeError}</p>{/if}
         </div>
       </div>
     </div>
@@ -1981,144 +2424,4 @@
     </div>
   {/if}
 
-  {#if vaultDialogOpen}
-    <div class="vault-backdrop" role="presentation" on:click|self={closeVaultSettings}>
-      <div
-        class="vault-dialog"
-        data-testid="vault-dialog"
-        data-vault-state={vaultState}
-        bind:this={vaultDialog}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="vault-title"
-        aria-describedby="vault-description"
-        tabindex="-1"
-        on:keydown={handleVaultDialogKeydown}
-      >
-        <header>
-          <div>
-            <small>Account security</small>
-            <h1 id="vault-title">Credential access</h1>
-          </div>
-          <button bind:this={vaultCloseButton} class="icon-button" type="button" aria-label="Close credential settings" on:click={closeVaultSettings}>×</button>
-        </header>
-
-        <div class="vault-content">
-          <div class="vault-state-line">
-            <span class="vault-status-dot" class:is-absent={vaultState === 'absent'} class:is-locked={vaultState === 'locked'} class:is-unlocked={vaultState === 'unlocked'}></span>
-            <strong>{vaultStateLabel}</strong>
-          </div>
-
-          {#if vaultResetting}
-            <div class="vault-panel vault-reset-panel">
-              <h2>Reset credential protection?</h2>
-              <p id="vault-description">This removes every saved account credential from this Mac. Your local mailbox is not deleted, but accounts cannot connect until credentials are added again.</p>
-              <form on:submit|preventDefault={resetVault}>
-                <label>
-                  <span>Type RESET to confirm</span>
-                  <input bind:this={vaultResetInput} bind:value={vaultResetConfirmation} autocomplete="off" spellcheck="false" disabled={vaultBusy} />
-                </label>
-                <div class="vault-actions">
-                  <button type="button" disabled={vaultBusy} on:click={cancelVaultSubpanel}>Cancel</button>
-                  <button class="vault-danger-button" type="submit" disabled={vaultBusy || vaultResetConfirmation !== 'RESET'}>{vaultBusy ? 'Resetting…' : 'Reset credentials'}</button>
-                </div>
-              </form>
-            </div>
-          {:else if vaultChangingPassphrase}
-            <div class="vault-panel">
-              <h2>Change passphrase</h2>
-              <p id="vault-description">Use your current passphrase to set a new one.</p>
-              <form on:submit|preventDefault={changeVaultPassphrase}>
-                <label>
-                  <span>Current passphrase</span>
-                  <input bind:this={vaultCurrentPassphraseInput} bind:value={vaultCurrentPassphrase} type="password" autocomplete="current-password" disabled={vaultBusy} />
-                </label>
-                <label>
-                  <span>New passphrase</span>
-                  <input bind:value={vaultNewPassphrase} type="password" autocomplete="new-password" disabled={vaultBusy} />
-                </label>
-                <label>
-                  <span>Confirm new passphrase</span>
-                  <input bind:value={vaultNewConfirmation} type="password" autocomplete="new-password" disabled={vaultBusy} />
-                </label>
-                <div class="vault-actions">
-                  <button type="button" disabled={vaultBusy} on:click={cancelVaultSubpanel}>Cancel</button>
-                  <button class="vault-primary-button" type="submit" disabled={vaultBusy}>{vaultBusy ? 'Changing…' : 'Change passphrase'}</button>
-                </div>
-              </form>
-            </div>
-          {:else if vaultState === 'absent'}
-            <div class="vault-panel">
-              <h2>Protect account credentials</h2>
-              <p id="vault-description">Choose a passphrase for credentials saved on this Mac. You will enter it again after restarting Mux.</p>
-              <form on:submit|preventDefault={createVault}>
-                <label>
-                  <span>Passphrase</span>
-                  <input bind:this={vaultPassphraseInput} bind:value={vaultPassphrase} type="password" autocomplete="new-password" disabled={vaultBusy} />
-                </label>
-                <label>
-                  <span>Confirm passphrase</span>
-                  <input bind:value={vaultConfirmation} type="password" autocomplete="new-password" disabled={vaultBusy} />
-                </label>
-                <div class="vault-actions">
-                  <button class="vault-primary-button" type="submit" disabled={vaultBusy}>{vaultBusy ? 'Creating…' : 'Create'}</button>
-                </div>
-              </form>
-            </div>
-          {:else if vaultState === 'locked'}
-            <div class="vault-panel">
-              <h2>Unlock account credentials</h2>
-              <p id="vault-description">Your local mailbox stays available while locked. Unlock only when Mux needs to connect or send.</p>
-              <form on:submit|preventDefault={unlockVault}>
-                <label>
-                  <span>Passphrase</span>
-                  <input bind:this={vaultPassphraseInput} bind:value={vaultPassphrase} type="password" autocomplete="current-password" disabled={vaultBusy} />
-                </label>
-                <div class="vault-actions">
-                  <button class="vault-primary-button" type="submit" disabled={vaultBusy}>{vaultBusy ? 'Unlocking…' : 'Unlock'}</button>
-                </div>
-              </form>
-            </div>
-          {:else if vaultState === 'unlocked'}
-            <div class="vault-panel">
-              <h2>Credentials are available</h2>
-              <p id="vault-description">Mux can use saved credentials during this session. They lock again when Mux quits.</p>
-              <section class="vault-provider-card" aria-labelledby="gmail-connect-title">
-                <div>
-                  <h3 id="gmail-connect-title">Gmail</h3>
-                  <p>Authorize this Mac in your browser.</p>
-                </div>
-                {#if gmailOAuthBusy}
-                  <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
-                {:else}
-                  <button class="vault-primary-button" type="button" disabled={vaultBusy} on:click={connectGmail}>Connect Gmail</button>
-                {/if}
-              </section>
-              <div class="vault-actions vault-actions-split">
-                <button type="button" disabled={vaultBusy || gmailOAuthBusy} on:click={showVaultPassphraseChange}>Change passphrase</button>
-                <button bind:this={vaultLockButton} class="vault-primary-button" type="button" disabled={vaultBusy || gmailOAuthBusy} on:click={lockVault}>{vaultBusy ? 'Locking…' : 'Lock now'}</button>
-              </div>
-            </div>
-          {:else}
-            <div class="vault-panel">
-              <h2>Credential settings are unavailable</h2>
-              <p id="vault-description">This build could not open credential settings. Your local mailbox is still available.</p>
-              <div class="vault-actions">
-                <button type="button" on:click={() => refreshVaultStatus(true)}>Try again</button>
-              </div>
-            </div>
-          {/if}
-
-          {#if vaultError}<p class="vault-feedback has-error" role="alert">{vaultError}</p>{/if}
-          {#if vaultMessage}<p class="vault-feedback" role="status">{vaultMessage}</p>{/if}
-        </div>
-
-        {#if !vaultResetting && vaultState !== 'absent'}
-          <footer>
-            <button class="vault-reset-link" type="button" disabled={vaultBusy || gmailOAuthBusy} on:click={showVaultReset}>Reset saved credentials…</button>
-          </footer>
-        {/if}
-      </div>
-    </div>
-  {/if}
 </main>

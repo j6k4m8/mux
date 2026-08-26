@@ -6,6 +6,7 @@ export type AccountSummary = {
   signature: string;
   unread: number;
   total: number;
+  refreshSeconds: number;
 };
 
 export type ThreadSummary = {
@@ -167,6 +168,7 @@ export type ThreadPageInput = {
   view: 'all' | 'inbox' | 'archive' | 'starred' | 'snoozed' | 'sent' | 'trash';
   cursor: string | null;
   limit: number;
+  hiddenAccountIds: string[];
 };
 
 export type ThreadPage = {
@@ -204,6 +206,7 @@ export type SearchInput = {
   cursor: string | null;
   limit: number;
   timezoneOffsetMinutes: number;
+  hiddenAccountIds: string[];
 };
 
 export type SearchPage = {

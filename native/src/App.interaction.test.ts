@@ -20,7 +20,8 @@ const account: AccountSummary = {
   color: '#5168f4',
   signature: 'Jordan',
   unread: 1,
-  total: 2
+  total: 2,
+  refreshSeconds: 60
 };
 
 const threads: ThreadSummary[] = [
@@ -100,11 +101,10 @@ const mailbox: MailboxBootstrap = {
 type IpcCall = { command: string; payload: unknown };
 type DraftLoader = (draftId: string) => unknown;
 
-function installMailboxIpc(draftLoader?: DraftLoader, vaultState = 'absent'): IpcCall[] {
+function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
   const calls: IpcCall[] = [];
   mockIPC((command, payload) => {
     calls.push({ command, payload });
-    if (command === 'vault_status') return { state: vaultState };
     if (command === 'gmail_oauth_begin') {
       return { state: 'connected', accountId: 'gmail-fixture', email: 'reader@example.test' };
     }
@@ -189,13 +189,15 @@ function installMailboxIpc(draftLoader?: DraftLoader, vaultState = 'absent'): Ip
         locked: false
       };
     }
+    if (command === 'resync_all_mail') return { accountsReset: 1 };
+    if (command === 'set_account_refresh') return null;
     throw new Error(`Unexpected IPC command: ${command}`);
   }, { shouldMockEvents: true });
   return calls;
 }
 
-async function renderMailbox(draftLoader?: DraftLoader, vaultState = 'absent') {
-  const calls = installMailboxIpc(draftLoader, vaultState);
+async function renderMailbox(draftLoader?: DraftLoader) {
+  const calls = installMailboxIpc(draftLoader);
   const user = userEvent.setup();
   render(App);
   await waitFor(() => expect(screen.getAllByTestId('thread-row')).toHaveLength(2));
@@ -209,15 +211,244 @@ function blurActiveElement() {
 
 describe('production mailbox interactions', () => {
   test('starts typed Gmail onboarding without sending credentials through IPC', async () => {
-    const { calls, user } = await renderMailbox(undefined, 'unlocked');
-    await user.click(screen.getByRole('button', { name: /Account security/u }));
-    const dialog = screen.getByTestId('vault-dialog');
+    const { calls, user } = await renderMailbox();
+    await user.click(screen.getByRole('button', { name: /Settings/u }));
+    const dialog = screen.getByTestId('settings-screen');
     await user.click(within(dialog).getByRole('button', { name: 'Connect Gmail' }));
 
     await waitFor(() => expect(within(dialog).getByRole('status').textContent).toBe('Connected reader@example.test.'));
     const oauthCall = calls.find((call) => call.command === 'gmail_oauth_begin');
     expect(oauthCall).toBeTruthy();
     expect(JSON.stringify(oauthCall?.payload ?? {})).not.toMatch(/token|secret|credential|clientId/iu);
+  });
+
+  test('re-downloads all mail without asking the store to remove anything', async () => {
+    const { calls, user } = await renderMailbox();
+    await user.click(screen.getByRole('button', { name: /Settings/u }));
+    const dialog = screen.getByTestId('settings-screen');
+    await user.click(within(dialog).getByRole('button', { name: 'Mail' }));
+    await user.click(within(dialog).getByTestId('resync-all'));
+
+    await waitFor(() =>
+      expect(within(dialog).getByRole('status').textContent).toBe(
+        'Re-downloading every message from your provider. Nothing was removed.'
+      )
+    );
+    const resync = calls.filter((call) => call.command === 'resync_all_mail');
+    expect(resync).toHaveLength(1);
+    expect(resync[0]?.payload ?? {}).toEqual({});
+    // Re-syncing must never reach for a delete or purge command of any kind.
+    expect(calls.some((call) => /purge|delete_all|wipe|clear_mail/iu.test(call.command))).toBe(false);
+  });
+
+  test('opens the settings screen from the shortcut and the palette, not a plain comma', async () => {
+    const { user } = await renderMailbox();
+    blurActiveElement();
+    // A bare comma is a typing key, never a navigation key.
+    await user.keyboard(',');
+    expect(screen.queryByTestId('settings-screen')).toBeNull();
+
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    // The settings screen replaces the mailbox rather than floating over it.
+    expect(screen.queryByTestId('mailbox-workspace')).toBeNull();
+    expect(settings.getAttribute('data-section')).toBe('accounts');
+
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByTestId('settings-screen')).toBeNull());
+    expect(screen.getByTestId('mailbox-workspace')).toBeTruthy();
+
+    blurActiveElement();
+    await user.keyboard('{Meta>}k{/Meta}');
+    const palette = screen.getByTestId('command-palette');
+    await user.click(within(palette).getByRole('option', { name: /Open settings/u }));
+    await waitFor(() => expect(screen.getByTestId('settings-screen')).toBeTruthy());
+  });
+
+  test('moves between settings sections and keeps each one to its own controls', async () => {
+    const { user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+
+    // Accounts owns provider sign-in; other sections must not duplicate it.
+    expect(within(settings).getByRole('button', { name: 'Connect Gmail' })).toBeTruthy();
+    expect(within(settings).queryByTestId('resync-all')).toBeNull();
+
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+    expect(settings.getAttribute('data-section')).toBe('appearance');
+    expect(within(settings).queryByRole('button', { name: 'Connect Gmail' })).toBeNull();
+
+    await user.click(within(settings).getByRole('button', { name: 'Shortcuts' }));
+    expect(within(settings).getByText('Open the command palette')).toBeTruthy();
+
+    await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
+    await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
+  });
+
+  test('hiding an account filters the list without stopping its sync', async () => {
+    const { calls, user } = await renderMailbox();
+    const toggle = document.querySelector<HTMLButtonElement>(
+      '[data-action="toggle-account-visibility"]'
+    )!;
+    const accountId = toggle.getAttribute('data-account-id')!;
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+
+    await user.click(toggle);
+    await waitFor(() => {
+      const requests = calls.filter((call) => call.command === 'list_threads');
+      const input = requests.at(-1)?.payload as { input: { hiddenAccountIds: string[] } };
+      expect(input.input.hiddenAccountIds).toEqual([accountId]);
+    });
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    // Hiding is a view filter: it must never reach for a sync or delete command.
+    expect(calls.some((call) => /sync|delete|remove|disable/iu.test(call.command))).toBe(false);
+    expect(window.localStorage.getItem('mux-hidden-accounts')).toBe(JSON.stringify([accountId]));
+
+    await user.click(toggle);
+    await waitFor(() => {
+      const requests = calls.filter((call) => call.command === 'list_threads');
+      const input = requests.at(-1)?.payload as { input: { hiddenAccountIds: string[] } };
+      expect(input.input.hiddenAccountIds).toEqual([]);
+    });
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  test('Enter steps into the conversation so j and k move messages until Escape', async () => {
+    const { user } = await renderMailbox();
+    await waitFor(() => expect(screen.getByTestId('reader-subject')).toBeTruthy());
+    blurActiveElement();
+
+    // Before entering, j and k move the thread selection, not messages.
+    expect(document.querySelector('.message-card.is-focused')).toBeNull();
+
+    await user.keyboard('{Enter}');
+    const focused = await waitFor(() => {
+      const card = document.querySelector('.message-card.is-focused');
+      expect(card).toBeTruthy();
+      return card!;
+    });
+    const firstFocusedId = focused.id;
+
+    await user.keyboard('k');
+    await waitFor(() => {
+      const card = document.querySelector('.message-card.is-focused')!;
+      expect(card.id).not.toBe(firstFocusedId);
+    });
+
+    await user.keyboard('j');
+    await waitFor(() => {
+      expect(document.querySelector('.message-card.is-focused')!.id).toBe(firstFocusedId);
+    });
+
+    // Escape hands navigation back to the folder list.
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(document.querySelector('.message-card.is-focused')).toBeNull());
+    const selectedBefore = screen.getByTestId('reader-subject').textContent;
+    await user.keyboard('j');
+    await waitFor(() =>
+      expect(screen.getByTestId('reader-subject').textContent).not.toBe(selectedBefore)
+    );
+  });
+
+  test('appearance choices apply to the shell and survive a reload', async () => {
+    const { user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+
+    await user.click(within(screen.getByTestId('density')).getByRole('button', { name: 'Sardinemode' }));
+    expect(screen.getByTestId('mux-shell').getAttribute('data-density')).toBe('sardine');
+
+    await user.click(within(screen.getByTestId('text-size')).getByRole('button', { name: 'Large' }));
+    expect(document.documentElement.style.getPropertyValue('--ui-scale')).toBe('1.15');
+
+    await user.click(within(screen.getByTestId('typeface')).getByRole('button', { name: 'Mono' }));
+    expect(document.documentElement.style.getPropertyValue('--app-font')).toContain('monospace');
+
+    const saved = JSON.parse(window.localStorage.getItem('mux-appearance')!);
+    expect(saved.density).toBe('sardine');
+    expect(saved.scale).toBe(1.15);
+    expect(saved.font).toContain('monospace');
+  });
+
+  test('each account carries its own refresh cadence, defaulting to a minute', async () => {
+    const { calls, user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const group = within(settings).getAllByTestId('refresh-interval')[0];
+    const accountId = group.getAttribute('data-account-id')!;
+
+    // The seeded account defaults to one minute.
+    expect(within(group).getByRole('button', { name: '1 min' }).classList.contains('is-active')).toBe(true);
+
+    await user.click(within(group).getByRole('button', { name: '5 min' }));
+    await waitFor(() => {
+      const call = calls.filter((entry) => entry.command === 'set_account_refresh').at(-1);
+      expect(call?.payload).toEqual({ input: { accountId, refreshSeconds: 300 } });
+    });
+    await waitFor(() =>
+      expect(within(settings).getByRole('status').textContent).toBe('Checking for new mail every 5 min.')
+    );
+  });
+
+  test('thread action buttons show icon, text, and shortcut independently', async () => {
+    const { user } = await renderMailbox();
+    const archive = document.querySelector<HTMLButtonElement>('.reader-toolbar [data-action="archive"]')!;
+    // Default: icon and text, no shortcut chip. Every button carries a tooltip.
+    expect(archive.querySelector('svg')).toBeTruthy();
+    expect(archive.querySelector('span')?.textContent).toBe('Archive');
+    expect(archive.querySelector('kbd')).toBeNull();
+    expect(archive.getAttribute('title')).toBe('Archive (E)');
+
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+    const display = within(screen.getByTestId('toolbar-display'));
+    await user.click(display.getByRole('checkbox', { name: 'Key shortcut' }));
+    await user.click(display.getByRole('checkbox', { name: 'Text' }));
+    await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
+
+    const updated = await waitFor(() =>
+      document.querySelector<HTMLButtonElement>('.reader-toolbar [data-action="archive"]')!
+    );
+    expect(updated.querySelector('span')).toBeNull();
+    expect(updated.querySelector('kbd')?.textContent).toBe('E');
+    expect(updated.querySelector('svg')).toBeTruthy();
+
+    const saved = JSON.parse(window.localStorage.getItem('mux-appearance')!);
+    expect(saved.toolbarText).toBe(false);
+    expect(saved.toolbarShortcuts).toBe(true);
+  });
+
+  test('a custom snooze time must be in the future', async () => {
+    const { calls, user } = await renderMailbox();
+    blurActiveElement();
+    await fireEvent.keyDown(window, { key: 'h' });
+    const dialog = screen.getByTestId('snooze-dialog');
+    const input = within(dialog).getByTestId('custom-snooze-input') as HTMLInputElement;
+
+    // A past time is refused rather than silently snoozing into the past.
+    await fireEvent.input(input, { target: { value: '2020-01-01T09:00' } });
+    await user.click(within(dialog).getByRole('button', { name: 'Snooze' }));
+    await waitFor(() => expect(within(dialog).getByRole('alert').textContent).toBe('Pick a time in the future.'));
+    expect(calls.some((call) => call.command === 'snooze_thread')).toBe(false);
+
+    const future = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const stamp = `${future.getFullYear()}-${String(future.getMonth() + 1).padStart(2, '0')}-${String(future.getDate()).padStart(2, '0')}T09:00`;
+    await fireEvent.input(input, { target: { value: stamp } });
+    await user.click(within(dialog).getByRole('button', { name: 'Snooze' }));
+    await waitFor(() => {
+      const call = calls.filter((entry) => entry.command === 'snooze_thread').at(-1);
+      expect((call?.payload as { wakeAt: number }).wakeAt).toBe(new Date(stamp).getTime());
+    });
+  });
+
+  test('the message rail offers one jump target per message', async () => {
+    await renderMailbox();
+    const rail = await waitFor(() => screen.getByTestId('message-rail'));
+    // Thread 1 has two messages, and the removed Newest button must not return.
+    expect(within(rail).getAllByRole('button')).toHaveLength(2);
+    expect(document.querySelector('[data-action="jump-newest"]')).toBeNull();
   });
 
   test('boots the real light mailbox shell and toggles a persisted dark theme', async () => {
@@ -247,7 +478,8 @@ describe('production mailbox interactions', () => {
       color: '#123456',
       signature: '',
       unread: 0,
-      total: 0
+      total: 0,
+      refreshSeconds: 60
     };
     mailbox.accounts.push(literalAllAccount);
     mailbox.viewCounts.push({
@@ -262,7 +494,10 @@ describe('production mailbox interactions', () => {
     });
     try {
       const { calls, user } = await renderMailbox();
-      const literalAccountButton = screen.getByRole('button', { name: /Literal All Account/u });
+      // The row holds both a visibility toggle and the select button, so target the latter.
+      const literalAccountButton = document.querySelector<HTMLButtonElement>(
+        '[data-action="select-account"][data-account-id="all"]'
+      )!;
       const unifiedButton = screen.getByRole('button', { name: /All accounts/u });
 
       await user.click(literalAccountButton);
@@ -392,12 +627,17 @@ describe('production mailbox interactions', () => {
     await fireEvent.keyDown(window, { key: 'h' });
     const snoozeDialog = screen.getByTestId('snooze-dialog');
     expect(document.activeElement).toBe(within(snoozeDialog).getByRole('button', { name: /Later today/u }));
+    // Presets, then the custom time field and its submit, then back to close.
     await user.tab();
+    await user.tab();
+    expect(document.activeElement).toBe(within(snoozeDialog).getByRole('button', { name: /Next week/u }));
+    await user.tab();
+    expect(document.activeElement).toBe(within(snoozeDialog).getByTestId('custom-snooze-input'));
     await user.tab();
     await user.tab();
     expect(document.activeElement).toBe(within(snoozeDialog).getByRole('button', { name: 'Close snooze options' }));
     await user.tab({ shift: true });
-    expect(document.activeElement).toBe(within(snoozeDialog).getByRole('button', { name: /Next week/u }));
+    expect(document.activeElement).toBe(within(snoozeDialog).getByRole('button', { name: 'Snooze' }));
     await fireEvent.keyDown(window, { key: 'Escape' });
     expect(screen.queryByTestId('snooze-dialog')).toBeNull();
 

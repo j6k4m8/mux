@@ -16,7 +16,6 @@ export function mailboxShortcutFor(event) {
   if (event.key === 'Tab' || event.metaKey || event.ctrlKey || event.altKey) return null;
   if (isInteractiveShortcutTarget(event.target)) return null;
   switch (event.key.toLocaleLowerCase()) {
-    case '/': return 'focus-filter';
     case 'j': return 'next-thread';
     case 'k': return 'previous-thread';
     case 'e': return 'archive';
