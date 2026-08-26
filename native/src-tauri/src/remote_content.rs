@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -171,18 +171,37 @@ fn is_public_ip(address: IpAddr) -> bool {
                 || (a == 203 && b == 0 && c == 113))
         }
         IpAddr::V6(value) => {
-            if let Some(mapped) = value.to_ipv4_mapped() {
-                return is_public_ip(IpAddr::V4(mapped));
+            // Any address that carries an IPv4 destination is judged as that IPv4 address,
+            // so a AAAA record cannot smuggle a private target past the v4 rules above.
+            if let Some(embedded) = value.to_ipv4_mapped().or_else(|| ipv4_compatible(value)) {
+                return is_public_ip(IpAddr::V4(embedded));
             }
+            let segments = value.segments();
             !(value.is_loopback()
                 || value.is_unspecified()
                 || value.is_multicast()
-                || (value.segments()[0] & 0xfe00) == 0xfc00
-                || (value.segments()[0] & 0xffc0) == 0xfe80
-                || (value.segments()[0] & 0xffc0) == 0xfec0
-                || (value.segments()[0] == 0x2001 && value.segments()[1] == 0x0db8))
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                // Transition, translation, and discard prefixes tunnel or drop an
+                // attacker-chosen IPv4 destination rather than naming a public host.
+                || segments[0] == 0x2002
+                || (segments[0] == 0x2001 && segments[1] == 0x0000)
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+                || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0))
         }
     }
+}
+
+fn ipv4_compatible(value: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = value.segments();
+    if segments[..6] != [0, 0, 0, 0, 0, 0] {
+        return None;
+    }
+    Some(Ipv4Addr::from(
+        (u32::from(segments[6]) << 16) | u32::from(segments[7]),
+    ))
 }
 
 #[cfg(test)]
@@ -208,6 +227,12 @@ mod tests {
             "fe80::1",
             "2001:db8::1",
             "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "2002:7f00:1::",
+            "2001:0:53aa:64c:2c:1e2f:5efe:a01",
+            "64:ff9b::a00:1",
+            "100::1",
         ] {
             assert!(
                 !is_public_ip(address.parse().unwrap()),
