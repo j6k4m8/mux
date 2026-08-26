@@ -325,26 +325,38 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .message-rail button { width: 7px; height: 7px; flex: 0 0 auto; padding: 0; border-radius: 50%; background: var(--border-strong); cursor: pointer; transition: background 120ms ease, transform 120ms ease; }
 .message-rail button:hover { background: var(--text-faint); transform: scale(1.35); }
 .message-rail button.is-unread { background: var(--accent); }
+/* My own messages read as a distinct colour down the rail. */
+.message-rail button.is-mine { background: color-mix(in srgb, var(--success) 70%, var(--border-strong)); }
+.message-rail button.is-mine.is-unread { background: var(--success); }
 .message-rail button.is-focused { background: var(--accent-strong); transform: scale(1.5); }
 .message-rail button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .message-stack { max-width: 880px; display: grid; gap: var(--stack-gap); margin: 0 auto; }
 .message-card { padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-raised); box-shadow: var(--shadow-sm); transition: background 180ms ease, border-color 180ms ease; }
-.message-card.is-collapsed { background: var(--surface-muted); box-shadow: none; }
+.message-card.is-collapsed { border-color: transparent; background: transparent; box-shadow: none; }
 /* Reader focus: which message j/k is sitting on. */
 .message-card.is-focused { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .message-card-toggle { width: 100%; min-height: var(--card-min-height); display: flex; align-items: center; gap: 11px; padding: var(--card-pad-block) 15px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
-.message-card.is-collapsed .message-card-toggle { min-height: var(--card-collapsed-min-height); padding-block: calc(var(--card-pad-block) * 0.65); }
+.message-card.is-collapsed .message-card-toggle { min-height: 0; align-items: flex-end; padding: 2px 0; background: transparent; }
+.message-card.is-collapsed .message-card-toggle:hover { background: transparent; }
+.message-card.is-collapsed .message-card-toggle:hover .collapsed-bubble { border-color: var(--border-strong); }
+.message-card.is-collapsed .collapse-glyph { display: none; }
+/* My own messages sit on the right with no avatar, like any chat client. */
+.message-card.is-collapsed.is-mine .message-card-toggle { flex-direction: row-reverse; }
+.message-card.is-collapsed.is-mine .avatar { display: none; }
 .message-card-toggle:hover { background: var(--surface-hover); }
 .message-card-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 .message-meta { min-width: 120px; display: flex; flex: 0 1 auto; flex-direction: column; }
 .message-meta strong { color: var(--text); font-size: 12px; }
 .message-meta small { max-width: 320px; margin-top: 2px; overflow: hidden; color: var(--text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .message-card-toggle time { flex: 0 0 auto; align-self: flex-start; margin-left: auto; color: var(--text-faint); font-size: 9px; }
-.collapsed-summary { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
-.collapsed-heading { min-width: 0; display: flex; align-items: baseline; gap: 12px; }
-.collapsed-heading strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.collapsed-summary { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.message-card.is-collapsed.is-mine .collapsed-summary { align-items: flex-end; }
+.collapsed-bubble { max-width: min(78%, 620px); display: flex; flex-direction: column; gap: 2px; padding: 9px 13px; border: 1px solid var(--border); border-radius: 15px 15px 15px 5px; background: var(--surface-raised); transition: border-color 120ms ease; }
+.message-card.is-collapsed.is-mine .collapsed-bubble { border-radius: 15px 15px 5px 15px; border-color: color-mix(in srgb, var(--accent) 26%, var(--border)); background: var(--accent-soft); }
+.collapsed-heading { min-width: 0; display: flex; align-items: baseline; gap: 10px; }
+.collapsed-heading strong { min-width: 0; overflow: hidden; color: var(--text-soft); font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .message-card-toggle .collapsed-heading time { align-self: auto; margin-left: auto; }
-.collapsed-preview { min-width: 0; flex: 1; overflow: hidden; color: var(--text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.collapsed-preview { min-width: 0; color: var(--text); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
 .collapse-glyph { flex: 0 0 auto; align-self: flex-start; color: var(--text-faint); font-size: 12px; }
 .message-body { margin: 1px 24px 22px 64px; color: var(--text-soft); font-size: 13px; line-height: 1.72; overflow-wrap: anywhere; }
 .message-body p, .message-body div { margin: 0 0 .8em; }

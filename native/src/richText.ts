@@ -10,6 +10,17 @@ const MAX_RENDER_TREE_NODES = 50_000;
 const MAX_REMOTE_IMAGE_RESOURCE_ID = 64;
 const MAX_REMOTE_IMAGE_DATA_URL_UNITS = 8 * 1024 * 1024 + 128;
 
+/// Plain-text bodies carry their own structure in newlines. Any run of blank
+/// lines is one paragraph break, so "a\n\n\n\nb" reads the same as "a\n\nb";
+/// single newlines stay as line breaks inside the paragraph.
+export function plainTextParagraphs(value: string): string[][] {
+  return value
+    .replace(/\r\n?/gu, '\n')
+    .split(/\n[ \t]*\n+/u)
+    .map((paragraph) => paragraph.split('\n').map((line) => line.trimEnd()))
+    .filter((lines) => lines.some((line) => line.trim().length > 0));
+}
+
 export function safeRemoteImageDataUrl(value: string): string | null {
   return value.length <= MAX_REMOTE_IMAGE_DATA_URL_UNITS
     && /^data:image\/(?:gif|jpeg|png|webp);base64,[a-z0-9+/]+={0,2}$/iu.test(value)

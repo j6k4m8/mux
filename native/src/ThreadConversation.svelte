@@ -3,13 +3,14 @@
   import { tick } from 'svelte';
   import AttachmentList from './AttachmentList.svelte';
   import RichText from './RichText.svelte';
-  import { parseMessageRichText, safeRemoteImageDataUrl } from './richText';
+  import { parseMessageRichText, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
   import type { AttachmentSummary, MessageSummary, RemoteImageContent, RemoteImageSummary } from './types';
 
   export let messages: MessageSummary[] = [];
   export let attachments: AttachmentSummary[] = [];
   export let accountColor = '#7180ff';
   export let threadUnread = false;
+  export let railPreview = true;
 
   let expandedIds = new Set(messages.slice(-2).map((message) => message.id));
   let bottomAnchor: HTMLDivElement;
@@ -151,6 +152,13 @@
     }).format(timestamp);
   }
 
+  /// Sender, when, and the opening of the message, for the rail's hover card.
+  function railTooltip(message: MessageSummary): string {
+    const preview = message.bodyText.replace(/\s+/gu, ' ').trim().slice(0, 140);
+    const head = `${message.senderName} · ${fullTime(message.sentAt)}`;
+    return preview ? `${head}\n${preview}` : head;
+  }
+
   function toggle(messageId: number) {
     const next = new Set(expandedIds);
     if (next.has(messageId)) next.delete(messageId);
@@ -211,10 +219,11 @@
       <button
         class:is-focused={focusedId === message.id}
         class:is-unread={message.id === unreadMessageId}
+        class:is-mine={message.isFromMe}
         type="button"
         data-message-id={message.id}
         aria-label={`Message ${index + 1} of ${messages.length} from ${message.senderName}`}
-        title={`${message.senderName} · ${fullTime(message.sentAt)}`}
+        title={railPreview ? railTooltip(message) : undefined}
         on:click={() => revealMessage(message.id)}
       ></button>
     {/each}
@@ -229,6 +238,7 @@
       class="message-card"
       class:is-collapsed={!expandedIds.has(message.id)}
       class:is-focused={focusedId === message.id}
+      class:is-mine={message.isFromMe}
       id={`native-message-${message.id}`}
     >
       <button
@@ -244,8 +254,10 @@
           <time>{fullTime(message.sentAt)}</time>
         {:else}
           <span class="collapsed-summary">
-            <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
-            <span class="collapsed-preview">{message.bodyText}</span>
+            <span class="collapsed-bubble">
+              <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
+              <span class="collapsed-preview">{message.bodyText}</span>
+            </span>
           </span>
         {/if}
         <span class="collapse-glyph" aria-hidden="true">{expandedIds.has(message.id) ? '⌃' : '⌄'}</span>
@@ -273,7 +285,9 @@
           {#if message.bodyHtml}
             <RichText nodes={parseMessageRichText(message.bodyHtml)} remoteImages={remoteImageViews[message.id] ?? {}} />
           {:else}
-            <p>{message.bodyText}</p>
+            {#each plainTextParagraphs(message.bodyText) as lines}
+              <p>{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</p>
+            {/each}
           {/if}
           <AttachmentList attachments={attachments.filter((attachment) => attachment.messageId === message.id)} />
         </div>

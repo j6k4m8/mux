@@ -451,6 +451,40 @@ describe('production mailbox interactions', () => {
     expect(document.querySelector('[data-action="jump-newest"]')).toBeNull();
   });
 
+  test('a run of blank lines is one paragraph gap, not several', async () => {
+    await renderMailbox();
+    await waitFor(() => expect(screen.getByTestId('reader-subject')).toBeTruthy());
+    const body = document.querySelector('.message-body')!;
+    // The fixture body has no HTML, so it renders through the plain-text path.
+    const paragraphs = [...body.querySelectorAll('p')];
+    expect(paragraphs.length).toBeGreaterThan(0);
+    // No paragraph may be blank; blank runs collapse rather than stacking gaps.
+    expect(paragraphs.every((node) => node.textContent!.trim().length > 0)).toBe(true);
+  });
+
+  test('a trackpad swipe fires the configured action once', async () => {
+    const { calls } = await renderMailbox();
+    const row = screen.getAllByTestId('thread-row')[0];
+    const threadId = row.getAttribute('data-thread-id');
+
+    // Vertical intent must keep scrolling instead of swiping.
+    await fireEvent.wheel(row, { deltaX: 4, deltaY: 60 });
+    expect(calls.some((call) => call.command === 'apply_thread_action')).toBe(false);
+
+    // Short horizontal movement is below the trigger.
+    await fireEvent.wheel(row, { deltaX: 30, deltaY: 0 });
+    expect(calls.some((call) => call.command === 'apply_thread_action')).toBe(false);
+
+    // Crossing the trigger fires the left action exactly once.
+    await fireEvent.wheel(row, { deltaX: 70, deltaY: 0 });
+    await fireEvent.wheel(row, { deltaX: 70, deltaY: 0 });
+    await waitFor(() => {
+      const actions = calls.filter((call) => call.command === 'apply_thread_action');
+      expect(actions).toHaveLength(1);
+      expect(actions[0]?.payload).toEqual({ threadId: Number(threadId), action: 'archive' });
+    });
+  });
+
   test('boots the real light mailbox shell and toggles a persisted dark theme', async () => {
     const { calls, user } = await renderMailbox();
     const shell = screen.getByTestId('mux-shell');

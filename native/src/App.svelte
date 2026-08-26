@@ -61,6 +61,7 @@
     toolbarCollapseNarrow: boolean;
     swipeLeft: SwipeAction;
     swipeRight: SwipeAction;
+    railPreview: boolean;
   };
   type PaletteCommandId = 'compose' | 'archive' | 'snooze' | 'star' | 'read' | 'inbox' | 'starred' | 'activity' | 'theme' | 'settings';
   type PaletteCommand = { id: PaletteCommandId; title: string; description: string; shortcut: string };
@@ -163,7 +164,8 @@
     toolbarShortcuts: false,
     toolbarCollapseNarrow: true,
     swipeLeft: 'archive',
-    swipeRight: 'snooze'
+    swipeRight: 'snooze',
+    railPreview: true
   };
   let appearance: Appearance = { ...DEFAULT_APPEARANCE };
   let customFont = '';
@@ -383,7 +385,8 @@
         toolbarShortcuts: flag(value.toolbarShortcuts, false),
         toolbarCollapseNarrow: flag(value.toolbarCollapseNarrow, true),
         swipeLeft: swipe(value.swipeLeft, 'archive'),
-        swipeRight: swipe(value.swipeRight, 'snooze')
+        swipeRight: swipe(value.swipeRight, 'snooze'),
+        railPreview: flag(value.railPreview, true)
       };
     } catch {
       return { ...DEFAULT_APPEARANCE };
@@ -1577,16 +1580,17 @@
     return actions;
   })();
 
-  /// Horizontal drag on a thread row. Vertical movement wins so the list still
-  /// scrolls, and the gesture only fires past a deliberate distance.
-  const SWIPE_TRIGGER_PX = 72;
+  /// Two-finger horizontal swipe on a thread row. A pointer drag cannot leave the
+  /// list without losing the gesture, so this reads wheel deltas instead: macOS
+  /// reports a trackpad swipe as horizontal wheel movement.
+  const SWIPE_TRIGGER_PX = 90;
+  /// A gesture ends after this much quiet, so one swipe fires one action.
+  const SWIPE_IDLE_MS = 180;
   let swipeThreadId: number | null = null;
-  let swipeStartX = 0;
-  let swipeStartY = 0;
   let swipeOffset = 0;
-  let swipeLocked = false;
+  let swipeFired = false;
+  let swipeIdleTimer: number | undefined;
 
-  /// Icon, wording, and tone shown behind a row for the action that will fire.
   function swipeIntent(
     thread: ThreadSummary,
     action: SwipeAction
@@ -1635,38 +1639,32 @@
     void applyThreadAction('delete', 'Moved to Trash', thread);
   }
 
-  function swipeStart(event: PointerEvent, thread: ThreadSummary) {
-    if (event.pointerType === 'mouse' && event.button !== 0) return;
-    swipeThreadId = thread.id;
-    swipeStartX = event.clientX;
-    swipeStartY = event.clientY;
-    swipeOffset = 0;
-    swipeLocked = false;
-  }
-
-  function swipeMove(event: PointerEvent, thread: ThreadSummary) {
-    if (swipeThreadId !== thread.id) return;
-    const dx = event.clientX - swipeStartX;
-    const dy = event.clientY - swipeStartY;
-    if (!swipeLocked) {
-      if (Math.abs(dy) > Math.abs(dx)) {
-        swipeThreadId = null;
-        return;
-      }
-      if (Math.abs(dx) < 12) return;
-      swipeLocked = true;
-    }
-    swipeOffset = dx;
-  }
-
-  function swipeEnd(thread: ThreadSummary) {
-    if (swipeThreadId !== thread.id) return;
-    const offset = swipeOffset;
+  function resetSwipe() {
     swipeThreadId = null;
     swipeOffset = 0;
-    swipeLocked = false;
-    if (offset <= -SWIPE_TRIGGER_PX) runSwipeAction(thread, appearance.swipeLeft);
-    else if (offset >= SWIPE_TRIGGER_PX) runSwipeAction(thread, appearance.swipeRight);
+    swipeFired = false;
+  }
+
+  function swipeWheel(event: WheelEvent, thread: ThreadSummary) {
+    // Vertical intent keeps scrolling the list.
+    if (Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
+    if (appearance.swipeLeft === 'none' && appearance.swipeRight === 'none') return;
+    event.preventDefault();
+    if (swipeThreadId !== thread.id) {
+      swipeThreadId = thread.id;
+      swipeOffset = 0;
+      swipeFired = false;
+    }
+    window.clearTimeout(swipeIdleTimer);
+    swipeIdleTimer = window.setTimeout(resetSwipe, SWIPE_IDLE_MS);
+    if (swipeFired) return;
+    // Swiping left reports a positive deltaX, so the row follows the fingers.
+    swipeOffset = Math.max(-160, Math.min(160, swipeOffset - event.deltaX));
+    if (Math.abs(swipeOffset) < SWIPE_TRIGGER_PX) return;
+    swipeFired = true;
+    const action = swipeOffset < 0 ? appearance.swipeLeft : appearance.swipeRight;
+    swipeOffset = 0;
+    runSwipeAction(thread, action);
   }
 
   function accountFor(accountId: string): AccountSummary | undefined {
@@ -1891,6 +1889,7 @@
               <label><input type="checkbox" bind:checked={appearance.toolbarText} on:change={() => applyAppearance(appearance)} /><span>Text</span></label>
               <label><input type="checkbox" bind:checked={appearance.toolbarShortcuts} on:change={() => applyAppearance(appearance)} /><span>Key shortcut</span></label>
               <label><input type="checkbox" bind:checked={appearance.toolbarCollapseNarrow} on:change={() => applyAppearance(appearance)} /><span>Collapse to icons on narrow screens</span></label>
+              <label><input type="checkbox" bind:checked={appearance.railPreview} on:change={() => applyAppearance(appearance)} /><span>Preview a message when hovering its dot</span></label>
             </div>
 
             </section>
@@ -2103,7 +2102,7 @@
                 <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(-1)}>Show previous loaded threads</button>
               {/if}
               {#each renderedThreadWindow.rows as thread (thread.id)}
-                {@const swiping = swipeThreadId === thread.id && swipeLocked}
+                {@const swiping = swipeThreadId === thread.id && swipeOffset !== 0}
                 {@const side = swipeOffset < 0 ? 'left' : 'right'}
                 {@const pending = swipeIntent(thread, swipeOffset < 0 ? appearance.swipeLeft : appearance.swipeRight)}
                 <div class="thread-swipe" class:is-swiping={swiping}>
@@ -2129,10 +2128,7 @@
                   data-thread-id={thread.id}
                   title={`${thread.subject} — swipe left to ${swipeLabel(appearance.swipeLeft).toLocaleLowerCase()}, right to ${swipeLabel(appearance.swipeRight).toLocaleLowerCase()}`}
                   on:click={() => selectThread(thread)}
-                  on:pointerdown={(event) => swipeStart(event, thread)}
-                  on:pointermove={(event) => swipeMove(event, thread)}
-                  on:pointerup={() => swipeEnd(thread)}
-                  on:pointercancel={() => swipeEnd(thread)}
+                  on:wheel|nonpassive={(event) => swipeWheel(event, thread)}
                   aria-pressed={thread.id === selectedThread?.id}
                 >
                   <span class="thread-accent" style:background={accountFor(thread.accountId)?.color}></span>
