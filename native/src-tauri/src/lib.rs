@@ -21,6 +21,7 @@ pub mod store;
 mod worker;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,8 @@ const MAILBOX_CHANGED_EVENT: &str = "mux://mailbox-changed";
 /// How often the refresh timer asks which accounts are due. Individual accounts
 /// keep their own cadence; this only bounds how precisely it is honoured.
 const REFRESH_TICK_SECONDS: u64 = 5;
+/// Multiplier ceiling for the refresh tick after repeated failures.
+const REFRESH_MAX_BACKOFF: u32 = 24;
 
 #[derive(Clone, Copy, Serialize)]
 struct MailboxChangedPayload {
@@ -54,6 +57,8 @@ struct AppState {
     credentials: keychain::CredentialStore,
     gmail_oauth: Arc<gmail_oauth::GmailOAuthCoordinator>,
     worker: Mutex<Option<WorkerController>>,
+    /// Set on exit so the refresh timer stops instead of outliving the window.
+    refresh_stop: Arc<AtomicBool>,
 }
 
 struct NativeWorkerAdapter<G> {
@@ -567,14 +572,33 @@ pub fn run() {
             // The scheduler decides what is actually due, so this tick stays cheap.
             let refresh_path = path.clone();
             let refresh_handle = app.handle().clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(REFRESH_TICK_SECONDS));
-                match gmail::schedule_due_syncs(&refresh_path, now_ms()) {
-                    Ok(0) => {}
-                    Ok(_) => wake_worker_state(&refresh_handle.state::<AppState>()),
-                    Err(error) => {
-                        if std::env::var_os("MUX_LOG_WORKER_ERRORS").is_some() {
-                            eprintln!("Mux refresh: {error}");
+            let refresh_stop = Arc::new(AtomicBool::new(false));
+            let refresh_stop_thread = Arc::clone(&refresh_stop);
+            std::thread::spawn(move || {
+                let mut backoff = 1_u32;
+                while !refresh_stop_thread.load(Ordering::SeqCst) {
+                    // Sleep in slices so quitting does not wait out a whole tick.
+                    let target = REFRESH_TICK_SECONDS * u64::from(backoff);
+                    for _ in 0..target {
+                        if refresh_stop_thread.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                    match gmail::schedule_due_syncs(&refresh_path, now_ms()) {
+                        Ok(scheduled) => {
+                            backoff = 1;
+                            if scheduled > 0 {
+                                wake_worker_state(&refresh_handle.state::<AppState>());
+                            }
+                        }
+                        Err(error) => {
+                            // A failing database should not be retried every few
+                            // seconds forever; back off to a couple of minutes.
+                            backoff = (backoff * 2).min(REFRESH_MAX_BACKOFF);
+                            if std::env::var_os("MUX_LOG_WORKER_ERRORS").is_some() {
+                                eprintln!("Mux refresh: {error}");
+                            }
                         }
                     }
                 }
@@ -585,6 +609,7 @@ pub fn run() {
                 credentials,
                 gmail_oauth: Arc::new(gmail_oauth::GmailOAuthCoordinator::new()),
                 worker: Mutex::new(Some(controller)),
+                refresh_stop,
             });
             Ok(())
         })
@@ -618,6 +643,10 @@ pub fn run() {
         .expect("error while building Mux");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            app_handle
+                .state::<AppState>()
+                .refresh_stop
+                .store(true, Ordering::SeqCst);
             let _ = app_handle.state::<AppState>().gmail_oauth.cancel();
             if let Ok(mut worker) = app_handle.state::<AppState>().worker.lock() {
                 if let Some(controller) = worker.take() {

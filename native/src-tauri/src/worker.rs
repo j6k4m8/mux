@@ -2667,6 +2667,85 @@ mod tests {
     }
 
     #[test]
+    fn one_account_losing_its_credential_leaves_other_accounts_working() {
+        let (_directory, path, worker) = configured_worker(&["account-a", "account-b"]);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE provider_accounts SET credential_ref = 'ref_' || account_id",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        worker
+            .enqueue(item("a-sync", "account-a", WorkKind::Sync), 0)
+            .unwrap();
+        worker
+            .enqueue(item("b-sync", "account-b", WorkKind::Sync), 0)
+            .unwrap();
+
+        let claims = worker.claim_available(1, "worker", 4).unwrap();
+        let blocked = claims
+            .iter()
+            .find(|claim| claim.account_id == "account-a")
+            .expect("account-a work");
+        assert_eq!(
+            worker
+                .acknowledge(blocked, WorkerOutcome::CredentialUnavailable, 2)
+                .unwrap(),
+            WorkState::AuthenticationBlocked
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        // Only the account that lost its credential is blocked.
+        let states: Vec<(String, String)> = connection
+            .prepare("SELECT account_id, auth_state FROM provider_accounts ORDER BY account_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "account-a".to_string(),
+                    "reauthorization_required".to_string()
+                ),
+                ("account-b".to_string(), "ready".to_string())
+            ]
+        );
+        drop(connection);
+
+        // The healthy account still takes acknowledgements normally.
+        let healthy = claims
+            .iter()
+            .find(|claim| claim.account_id == "account-b")
+            .expect("account-b work");
+        assert_eq!(
+            worker
+                .acknowledge(
+                    healthy,
+                    WorkerOutcome::RetryableFailure {
+                        code: "transient".into()
+                    },
+                    3
+                )
+                .unwrap(),
+            WorkState::RetryWait
+        );
+        assert!(
+            worker
+                .snapshot("b-sync")
+                .unwrap()
+                .unwrap()
+                .auth_block_reason
+                .is_none(),
+            "a healthy account must not inherit another account's auth block"
+        );
+    }
+
+    #[test]
     fn credential_unavailable_send_is_pre_submission_safe_and_preserves_retry_budget() {
         let (_directory, path, worker) = configured_worker(&["account-a"]);
         let connection = Connection::open(&path).unwrap();
