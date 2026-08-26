@@ -44,9 +44,9 @@ The bundle is written below `native/src-tauri/target/release/bundle/macos/`. Loc
 - Inline reply that expands into a rich card after 100 characters and can always pop into the composer
 - Delayed send, undo-send, durable operation activity, and explicit recovery from an uncertain send without retrying it
 - Provider-neutral RFC 5322/MIME construction with stable Date/Message-ID/reply threading, multipart alternative/attachments, envelope-only Bcc, deterministic bytes, and an explicit ASCII-only SMTPUTF8 policy
-- Passphrase-encrypted local credential vault whose secrets never cross the Tauri IPC boundary
-- Typed Gmail connect/cancel lifecycle using the system browser, state, PKCE S256, an exact bounded loopback callback, `gmail.modify`, profile identity binding, and vault-only tokens
-- Offline-exercised Gmail bootstrap/history pagination, bounded label reconciliation, vault-only authority lookup, invalid-history rescan, and desired-state mailbox mutations behind provider-neutral Rust batches
+- Provider credentials in the macOS Keychain, never crossing the Tauri IPC boundary
+- Typed Gmail connect/cancel lifecycle using the system browser, state, PKCE S256, an exact bounded loopback callback, `gmail.modify`, profile identity binding, and keychain-only tokens
+- Offline-exercised Gmail bootstrap/history pagination, bounded label reconciliation, keychain-only authority lookup, invalid-history rescan, and desired-state mailbox mutations behind provider-neutral Rust batches
 - Bounded standards-based MIME/charset ingestion with exact binary attachment preservation and a typed 20 MiB raw attachment-read ceiling
 - HTML5-tree sanitization, remote-resource denial, controlled render nodes, and typed external-link opening
 - Responsive navigation and reader layouts down to the configured macOS window minimum
@@ -101,8 +101,8 @@ The offline provider-contract gate exercises atomic worker projection, exact rep
 
 ## Storage and credentials
 
-Mailbox projection, pending intent, Mux metadata, drafts, and the work journal live in SQLite under the operating-system application-data directory. Provider credentials do not live in SQLite. The current vault is passphrase-encrypted and intentionally independent of macOS Keychain, code signing, and an Apple Developer account. It locks at process start, so unattended provider sync is not yet possible.
+Mailbox projection, pending intent, Mux metadata, drafts, and the work journal live in SQLite under the operating-system application-data directory. Provider credentials do not live in SQLite; they live in the macOS Keychain, which the login password already unlocked. Mux therefore asks for no password of its own, and nothing blocks unattended sync.
 
 ## Current boundary
 
-Do not treat this demo as a production email client. The bounded MIME/HTML trust boundary and Gmail adapter are exercised only with hostile/hermetic fixtures; no real mailbox feeds them yet. The authorization lifecycle exists, but live Google consent and provider execution remain unproven. Remote-image consent, attachment quarantine/scanning, S/MIME/PGP, Developer ID signing/notarization, unattended synchronization, and non-macOS builds also remain unproven. See [Known Limitations](docs/KNOWN_LIMITATIONS.md) and [Architecture](docs/ARCHITECTURE.md).
+Do not treat this demo as a production email client. The bounded MIME/HTML trust boundary and Gmail adapter are exercised only with hostile/hermetic fixtures; no real mailbox feeds them yet. The authorization lifecycle exists, but live Google consent and provider execution remain unproven. Remote images are blocked until you consent, and approved ones are fetched in Rust and handed to the interface only as bounded `data:` images; that consent and address policy is tested against hostile fixtures, but no fetch has run against a live host. Attachment quarantine/scanning, S/MIME/PGP, Developer ID signing/notarization, unattended synchronization, and non-macOS builds also remain unproven. See [Known Limitations](docs/KNOWN_LIMITATIONS.md) and [Architecture](docs/ARCHITECTURE.md).

@@ -63,15 +63,16 @@ The current deterministic native demo validates:
 - Rust SQLite schema/migrations, local projection, pending-intent semantics, work journal, undo, and stale-operation rejection;
 - bounded Rust search parsing/AST/FTS and native mailbox/message pagination;
 - drafts, rich compose/reply/reply-all/forward, delayed send, uncertain-send recovery, snooze, and synthetic invitation/RSVP;
-- a Rust-only passphrase vault boundary with lifecycle-only Tauri commands;
+- Rust-only provider credentials in the macOS Keychain, with no credential command on the IPC surface;
 - bounded standards-based MIME/charset ingestion and HTML5-tree sanitization;
 - typed external-link opening plus an exact bundled/development WebView-navigation allowlist;
 - replay/replacement/rethread/deletion-safe search indexing;
 - production-Svelte interactions through typed Tauri IPC mocks;
 - a native 100,000-message isolated performance gate;
-- responsive desktop layouts and a loopback-only internal Vite development URL.
+- responsive desktop layouts and a loopback-only internal Vite development URL;
+- remote-image consent: inert markers in place of blocked resources, view-only and persistent sender/exact-domain allows, and Rust-side URL/address validation. The fetch itself has not run against a live host.
 
-It does not implement real providers, S/MIME/PGP, remote-image consent, attachment quarantine/scanning, real calendar APIs, real AI, provider-facing MCP/plugins, background sync, or proven Windows/Linux/Android/iOS support.
+It does not implement real providers, S/MIME/PGP, attachment quarantine/scanning, real calendar APIs, real AI, provider-facing MCP/plugins, background sync, or proven Windows/Linux/Android/iOS support.
 
 ## Next implementation order
 

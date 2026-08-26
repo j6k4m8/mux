@@ -15,7 +15,10 @@ Mux has no product HTTP API. Svelte calls the allowlisted Rust commands register
 | `get_draft` | Load one full local draft explicitly; draft bodies are never in bootstrap |
 | `open_message_link` | Revalidate and open one normalized absolute HTTP(S) destination through the app-owned native opener |
 | `list_operations` | Bounded payload-free operation activity summaries |
-| `vault_status` | `absent`, `locked`, `unlocked`, or `unavailable`; never secret metadata |
+| `load_remote_image` | Fetch one consented remote image in Rust and return it as a bounded `data:` URL; the WebView never receives the origin URL |
+| `allow_remote_content_sender` | Persist a remote-content allow for that message's sender, scoped to its account |
+| `allow_remote_content_domain` | Persist a remote-content allow for one exact domain, validated against that message's own blocked candidates |
+| `resync_all_mail` | Rewind provider sync bookmarks so the next cycle re-downloads and re-projects every message in place; removes nothing |
 
 ## Mailbox and draft commands
 
@@ -32,23 +35,11 @@ Mux has no product HTTP API. Svelte calls the allowlisted Rust commands register
 
 All mutating commands validate identifiers, input sizes, enum vocabularies, current effective state, and allowed transitions in Rust. Effective views expose the local result immediately; workers process durable work later.
 
-## Vault lifecycle commands
-
-| Command | Purpose |
-| --- | --- |
-| `vault_create` | Create the bounded authenticated vault envelope |
-| `vault_unlock` | Derive the key and unlock Rust-only record access |
-| `vault_lock` | Prevent new secret borrows and zeroize retained vault state |
-| `vault_change_passphrase` | Re-encrypt with a fresh salt/nonce under the stable file lock |
-| `vault_reset` | Explicit destructive recovery after confirmation |
-| `gmail_oauth_begin` | Open one bounded installed-desktop Google authorization and return only connected account identity |
-| `gmail_oauth_cancel` | Request cancellation of the active Google authorization attempt |
-
-There is intentionally no generic credential `get`, `put`, `remove`, list, export, or provider-token command over IPC.
-
 ## Bounds and casing
 
-Tauri serializes Rust snake_case fields to camelCase for the Svelte types. Exact DTOs live in `native/src/types.ts` and `native/src-tauri/src/store.rs`; tests cover their command payload shapes. Opaque cursors are versioned, integrity-checked, scope-bound, restart-stable, and at most 256 bytes. Actual serialized ceilings are 512 KiB for bootstrap, 3 MiB for thread/search pages, 16 MiB for message detail, 28 MiB for attachment content, and 256 KiB for activity; provider batches are limited to 32 MiB before projection. Message pages may contain fewer rows than requested to stay inside their aggregate ceiling. Attachment content is non-streaming, capped at 20 MiB raw, validated against stored metadata before and after the exact blob lookup, and revalidated in Svelte after base64 decoding. Recipient lists, bodies, external destinations, and vault inputs are separately bounded.
+Tauri serializes Rust snake_case fields to camelCase for the Svelte types. Exact DTOs live in `native/src/types.ts` and `native/src-tauri/src/store.rs`; tests cover their command payload shapes. Opaque cursors are versioned, integrity-checked, scope-bound, restart-stable, and at most 256 bytes. Actual serialized ceilings are 512 KiB for bootstrap, 3 MiB for thread/search pages, 16 MiB for message detail, 28 MiB for attachment content, and 256 KiB for activity; provider batches are limited to 32 MiB before projection. Message pages may contain fewer rows than requested to stay inside their aggregate ceiling. Attachment content is non-streaming, capped at 20 MiB raw, validated against stored metadata before and after the exact blob lookup, and revalidated in Svelte after base64 decoding. Recipient lists, bodies, and external destinations are separately bounded.
+
+`load_remote_image` carries the same intent: the frontend never holds a remote URL. Sanitization replaces each blocked resource with an inert marker, and Rust resolves the stored candidate itself over HTTPS with DNS pinned to a pre-validated public address, same-host redirects only, a bitmap content-type allowlist, and a byte ceiling. Nothing is requested before the user consents, and the app CSP grants no `https:` image authority.
 
 `open_message_link` is deliberately narrower than generic opener authority. The frontend has no opener or shell capability; Rust accepts only absolute normalized HTTP(S) URLs without credentials or raw/encoded control characters.
 

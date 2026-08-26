@@ -9,19 +9,19 @@
 - UI rendering treats message data as hostile. HTML is rebuilt through an HTML5 tree into a small allowlist; active content and remote resources are rejected.
 - Message links are normalized and revalidated by a typed Rust command. The frontend has no generic opener authority, and WebView navigation is restricted to exact app/development origins.
 - Provider credentials are excluded from SQLite, fixtures, screenshots, logs, IPC, and release manifests.
-- The credential vault uses a versioned authenticated envelope, bounded Argon2id, XChaCha20-Poly1305, fresh nonces, a stable `0600` lock file, atomic replacement, and zeroizing buffers.
+- Provider credentials live in the macOS Keychain, reached only from Rust through zeroizing buffers. Mux has no password of its own and no lock lifecycle.
 - Send replay is not treated as idempotent. Lost post-submission acknowledgement becomes an explicit uncertain outcome.
 - Workspace databases, build output, dependencies, and transient screenshots are excluded from release manifests.
 
-## Vault threat boundary
+## Credential threat boundary
 
-The vault is an Apple-account-independent local encrypted file. It protects credentials at rest while locked. It does not prevent deletion, offline password guessing, inspection by a compromised live process, or continued use of a credential already borrowed by in-flight provider I/O. Locking prevents new borrows; it cannot safely revoke an already-submitted send. Forgotten passphrases cannot be recovered.
+Keychain items are encrypted under keys tied to the macOS login password and are available only while that user is logged in. They are written with `SecItemAdd`, which sets no per-application ACL, so any process running as the same user can read them without a prompt — the same boundary the mailbox database already has. Requiring presence per read would need `kSecAttrAccessControl` with biometry, which Mux does not yet use. A credential already borrowed by in-flight provider I/O cannot be revoked mid-flight.
 
 ## Not yet production-safe
 
 Do not use real accounts until the following have dedicated adversarial tests and an exercised provider implementation:
 
-- remote-image and tracking-resource consent;
+- remote-image and tracking-resource fetching against a live host; the consent flow, policy scoping, and URL/address validation are adversarially tested, but no test performs a real fetch;
 - streaming/deadline controls for worst-case MIME parsing;
 - S/MIME/PGP processing and attachment quarantine/scanning;
 - provider attachment fetch/cache/preview/open policy;

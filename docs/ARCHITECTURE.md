@@ -11,7 +11,7 @@ Tauri command boundary
    │
 Rust domain/store/workers
    │
-SQLite projection + journal        encrypted credential vault
+SQLite projection + journal        macOS Keychain credentials
 ```
 
 Vite exists only to build the embedded Svelte frontend and to serve it on `127.0.0.1` during `tauri dev`. There is no product HTTP server, browser UI, or Node store.
@@ -25,11 +25,11 @@ Vite exists only to build the embedded Svelte frontend and to serve it on `127.0
 - `worker.rs`: durable work claiming, retries, ordering, and uncertain-send outcomes.
 - `outgoing.rs`, `internet_message.rs`: provider-neutral RFC 5322/MIME construction plus bounded canonical Internet message identities and reply chains.
 - `provider.rs`, `provider_ingest.rs`, `provider_schema.rs`: provider-neutral contracts, atomic projection, label replacement, and bounded full-reconciliation state.
-- `gmail.rs`, `gmail_access.rs`, `google_authorization.rs`: a Gmail bootstrap/history and mailbox-mutation adapter, fixed-origin HTTPS transport, typed vault authority, and bounded installed-desktop authorization lifecycle. These are hermetically exercised; the existing ignored Tidings registration has passed the loader, but live Google execution is absent.
+- `gmail.rs`, `gmail_access.rs`, `google_authorization.rs`: a Gmail bootstrap/history and mailbox-mutation adapter, fixed-origin HTTPS transport, typed keychain authority, and bounded installed-desktop authorization lifecycle. These are hermetically exercised; the existing ignored Tidings registration has passed the loader, but live Google execution is absent.
 - `mime_ingest.rs`: bounded `mail-parser` trust boundary for MIME trees, transfer encodings, charsets, decoded headers, nested messages, and binary attachments.
 - `content.rs`: HTML5-tree sanitization into the controlled rich-text subset with remote resources denied.
 - `navigation.rs`: normalized HTTP(S)-only external-link policy and exact WebView-origin allowlist.
-- `vault.rs`: passphrase vault lifecycle and Rust-only secret access.
+- `keychain.rs`: Rust-only provider credential storage in the macOS Keychain.
 
 ## State model
 
@@ -73,19 +73,21 @@ Serialized Tauri responses have measured aggregate ceilings: 512 KiB bootstrap, 
 
 ## Credentials
 
-Secrets are not stored in SQLite or returned across IPC. Svelte can invoke vault lifecycle commands plus typed Gmail connect/cancel lifecycle commands; client values, authorization codes, and tokens remain in Rust. The installed-desktop flow uses the system browser, random state, PKCE S256, an exact random-port IPv4 loopback redirect with bounded reads/deadlines, fixed Google endpoints, `gmail.modify`, and Gmail profile identity binding. Completed authority is written to the vault while SQLite stores only mailbox identity and an opaque reference. The vault uses a stable lock file, authenticated versioned envelope, bounded Argon2id parameters, XChaCha20-Poly1305, atomic replacement, and zeroizing buffers. It is intentionally independent of Keychain and Apple signing. No live consent grant has run.
+Secrets are not stored in SQLite or returned across IPC. Svelte can invoke typed Gmail connect/cancel lifecycle commands only; client values, authorization codes, and tokens remain in Rust. There is no command that reads, writes, or unlocks a credential, and none that accepts a password. The installed-desktop flow uses the system browser, random state, PKCE S256, an exact random-port IPv4 loopback redirect with bounded reads/deadlines, fixed Google endpoints, `gmail.modify`, and Gmail profile identity binding. Completed authority is written to the macOS Keychain while SQLite stores only mailbox identity and an opaque reference. At startup every stored reference is revalidated against the keychain, and an account whose record is missing or malformed is marked for reauthorization. No live consent grant has run.
 
 ## Hostile-content boundary
 
 Raw messages first pass through bounded standards-based MIME parsing. The boundary enforces raw, tree, header, decoded-text, attachment, address-envelope, and aggregate budgets; handles common charsets and encoded headers/parameters; and preserves accepted binary attachment bytes exactly. HTML is then parsed as an HTML5 tree and serialized only into controlled render nodes. Active/embedded/form/resource content is removed, remote resources are denied, links are normalized and revalidated in Rust, and the WebView cannot navigate away from the exact app/development origin.
 
-This boundary is adversarially tested but is not a complete mail-security product. Remote-image consent, S/MIME/PGP, malware/quarantine policy, and provider-fetched attachment lifecycle remain future work.
+Blocked remote resources leave an inert `<mux-remote-image data-id="N">` marker carrying no URL. Consent is explicit: load once for this view, or persist an allow for the sender or one exact domain. On consent Rust resolves and fetches the image itself — HTTPS only, no credentials or custom ports, DNS pinned to a pre-validated public address, same-host redirects only, a bitmap content-type allowlist, and a byte ceiling — and returns a bounded `data:` URL. The WebView is never granted `https:` image authority.
+
+This boundary is adversarially tested but is not a complete mail-security product. No test fetches from a live host, and S/MIME/PGP, malware/quarantine policy, and provider-fetched attachment lifecycle remain future work.
 
 ## Verification layers
 
 - Node's built-in test runner covers pure UI algorithms.
 - Vitest/jsdom mounts the production Svelte components and uses strict typed Tauri IPC mocks that reject unexpected commands.
-- Rust tests cover migrations, store/search/worker/provider-neutral contracts, content, vault behavior, and the hermetic Gmail synchronization and mutation state machines.
+- Rust tests cover migrations, store/search/worker/provider-neutral contracts, content, keychain storage, and the hermetic Gmail synchronization and mutation state machines.
 - The mandatory offline provider contract runs the production worker projector and Gmail adapter boundary without network access; fixture/source scanning rejects common secret shapes.
 - The release benchmark uses the native schema/store against a temporary 100,000-message database, including populated migration and interrupted-operation recovery.
 - `tauri build` plus an actual `.app` launch is required for a macOS runtime claim.
