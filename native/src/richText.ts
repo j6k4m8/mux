@@ -1,9 +1,24 @@
 export type RichNode =
   | { type: 'text'; text: string }
-  | { type: 'element'; tag: 'p' | 'div' | 'strong' | 'em' | 'u' | 'ul' | 'ol' | 'li' | 'blockquote' | 'br' | 'a'; href?: string; children: RichNode[] }
+  | { type: 'element'; tag: RichTag; href?: string; children: RichNode[] }
   | { type: 'remote-image'; resourceId: number };
 
-const allowedTags = new Set(['p', 'div', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'blockquote', 'br', 'a']);
+export type RichTag =
+  | 'p' | 'div' | 'strong' | 'em' | 'u' | 'ul' | 'ol' | 'li' | 'blockquote' | 'br' | 'a'
+  | 'table' | 'thead' | 'tbody' | 'tfoot' | 'tr' | 'td' | 'th' | 'caption'
+  | 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
+  | 'hr' | 'pre' | 'code' | 'dl' | 'dt' | 'dd' | 'del' | 'sub' | 'sup';
+
+/// Structural and inline markup that survives rendering. Attributes never do,
+/// apart from a revalidated href, so nothing here can carry behaviour.
+const allowedTags = new Set<string>([
+  'p', 'div', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'blockquote', 'br', 'a',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'hr', 'pre', 'code', 'dl', 'dt', 'dd', 'del', 's', 'strike', 'sub', 'sup'
+]);
+/// Void elements carry no children.
+const voidTags = new Set<string>(['br', 'hr']);
 const MAX_RENDER_HTML_UNITS = 8 * 1024 * 1024 + 1024;
 const MAX_RENDER_TREE_DEPTH = 64;
 const MAX_RENDER_TREE_NODES = 50_000;
@@ -150,12 +165,18 @@ function convertNode(
   }
   const children = Array.from(node.childNodes).flatMap((child) => convertNode(child, linkPolicy, budget, depth + 1, allowRemoteImageMarkers));
   if (!allowedTags.has(rawTag)) return children;
-  const tag = rawTag === 'b' ? 'strong' : rawTag === 'i' ? 'em' : rawTag;
+  const tag = rawTag === 'b' ? 'strong' : rawTag === 'i' ? 'em' : rawTag === 's' || rawTag === 'strike' ? 'del' : rawTag;
   if (tag === 'a') {
     const href = linkPolicy(node.getAttribute('href') ?? '');
     return href ? [{ type: 'element', tag, href, children }] : children;
   }
-  return [{ type: 'element', tag: tag as RichNode & string, children } as RichNode];
+  return [
+    {
+      type: 'element',
+      tag: tag as RichTag,
+      children: voidTags.has(tag) ? [] : children
+    }
+  ];
 }
 
 export function parseRichText(value: string): RichNode[] {

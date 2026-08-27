@@ -30,24 +30,10 @@
     {:else if image?.altText}
       <span class="remote-image-placeholder" role="img" aria-label={image.altText}>{image.altText}</span>
     {/if}
-  {:else if node.tag === 'p'}
-    <p><svelte:self nodes={node.children} {remoteImages} /></p>
-  {:else if node.tag === 'div'}
-    <div><svelte:self nodes={node.children} {remoteImages} /></div>
-  {:else if node.tag === 'strong'}
-    <strong><svelte:self nodes={node.children} {remoteImages} /></strong>
-  {:else if node.tag === 'em'}
-    <em><svelte:self nodes={node.children} {remoteImages} /></em>
-  {:else if node.tag === 'u'}
-    <u><svelte:self nodes={node.children} {remoteImages} /></u>
-  {:else if node.tag === 'ul'}
-    <ul><svelte:self nodes={node.children} {remoteImages} /></ul>
-  {:else if node.tag === 'ol'}
-    <ol><svelte:self nodes={node.children} {remoteImages} /></ol>
-  {:else if node.tag === 'li'}
-    <li><svelte:self nodes={node.children} {remoteImages} /></li>
-  {:else if node.tag === 'blockquote'}
-    <blockquote><svelte:self nodes={node.children} {remoteImages} /></blockquote>
+  {:else if node.tag === 'br'}
+    <br />
+  {:else if node.tag === 'hr'}
+    <hr />
   {:else if node.tag === 'a'}
     <a
       href={node.href}
@@ -56,8 +42,8 @@
       on:click={(event) => openMessageLink(event, node.href ?? '')}
       on:auxclick|preventDefault={() => undefined}
     ><svelte:self nodes={node.children} {remoteImages} /></a>
-  {:else if node.tag === 'br'}
-    <br />
+  {:else}
+    <svelte:element this={node.tag}><svelte:self nodes={node.children} {remoteImages} /></svelte:element>
   {/if}
 {/each}
 {#if linkError}<small class="message-link-error" role="alert">{linkError}</small>{/if}

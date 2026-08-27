@@ -304,9 +304,14 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
     let tag = match name.as_str() {
         "b" => Some("strong"),
         "i" => Some("em"),
-        "p" | "div" | "strong" | "em" | "u" | "ul" | "ol" | "li" | "blockquote" | "br" | "a" => {
-            Some(name.as_str())
-        }
+        "strike" | "s" => Some("del"),
+        // Layout and structure carry no behaviour once attributes are stripped, and
+        // dropping them fuses neighbouring text that belonged in separate cells,
+        // headings, or rows.
+        "p" | "div" | "strong" | "em" | "u" | "ul" | "ol" | "li" | "blockquote" | "br" | "a"
+        | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "h1" | "h2"
+        | "h3" | "h4" | "h5" | "h6" | "hr" | "pre" | "code" | "dl" | "dt" | "dd" | "del"
+        | "sub" | "sup" => Some(name.as_str()),
         _ => None,
     };
     let Some(tag) = tag else {
@@ -316,8 +321,10 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
         return;
     };
 
-    if tag == "br" {
-        state.html.push_str("<br>");
+    if tag == "br" || tag == "hr" {
+        state.html.push('<');
+        state.html.push_str(tag);
+        state.html.push('>');
         append_plain_break(&mut state.text);
         return;
     }
@@ -353,7 +360,27 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
     state.html.push_str("</");
     state.html.push_str(tag);
     state.html.push('>');
-    if matches!(tag, "p" | "div" | "li" | "blockquote") {
+    // Every block boundary becomes a line break in the derived plain text, or
+    // words from separate cells and headings run together.
+    if matches!(
+        tag,
+        "p" | "div"
+            | "li"
+            | "blockquote"
+            | "tr"
+            | "td"
+            | "th"
+            | "caption"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "pre"
+            | "dt"
+            | "dd"
+    ) {
         append_plain_break(&mut state.text);
     }
 }
@@ -621,6 +648,69 @@ mod tests {
         .unwrap();
         assert!(!hostile_marker.html.contains("mux-remote-image"));
         assert!(hostile_marker.remote_images.is_empty());
+    }
+
+    #[test]
+    fn structural_markup_survives_while_attributes_and_behaviour_do_not() {
+        let safe = sanitize_html(
+            r#"<h2 style="color:red" onclick="alert(1)">Heading</h2>
+               <table border="1" bgcolor="red"><caption>Cap</caption>
+                 <thead><tr><th width="50">Name</th><th>Total</th></tr></thead>
+                 <tbody><tr><td>Widget</td><td>12</td></tr></tbody>
+               </table>
+               <hr />
+               <pre><code>let x = 1;</code></pre>
+               <dl><dt>Term</dt><dd>Definition</dd></dl>
+               <p><del>gone</del> <s>also gone</s> H<sub>2</sub>O x<sup>2</sup></p>"#,
+        )
+        .expect("bounded HTML");
+
+        // Structure is kept, so cells and headings stay separate.
+        for expected in [
+            "<h2>",
+            "<table>",
+            "<caption>",
+            "<thead>",
+            "<tr>",
+            "<th>",
+            "<tbody>",
+            "<td>",
+            "<hr>",
+            "<pre>",
+            "<code>",
+            "<dl>",
+            "<dt>",
+            "<dd>",
+            "<del>",
+            "<sub>",
+            "<sup>",
+        ] {
+            assert!(safe.html.contains(expected), "missing {expected}");
+        }
+        // Legacy strikethrough normalises onto one tag.
+        assert_eq!(safe.html.matches("<del>").count(), 2);
+        // No attribute survives, so nothing structural can carry behaviour.
+        for forbidden in [
+            "style", "onclick", "border", "bgcolor", "width", "alert", "<s>", "<strike>",
+        ] {
+            assert!(!safe.html.contains(forbidden), "found {forbidden}");
+        }
+        // Each cell and heading ends a line in the derived plain text.
+        assert!(
+            safe.text.contains("Name\nTotal"),
+            "cells must not fuse: {:?}",
+            safe.text
+        );
+        assert!(
+            safe.text.contains("Widget\n12"),
+            "cells must not fuse: {:?}",
+            safe.text
+        );
+        assert!(
+            safe.text.starts_with("Heading\n"),
+            "heading must break: {:?}",
+            safe.text
+        );
     }
 
     #[test]

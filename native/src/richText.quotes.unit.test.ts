@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { newContentParagraphs } from './richText';
+import { newContentParagraphs, parseMessageRichText } from './richText';
 
 const flatten = (value: string) =>
   newContentParagraphs(value).paragraphs.map((lines) => lines.join('\n'));
@@ -66,5 +66,41 @@ describe('new content extraction', () => {
   test('a plain hyphen line is not mistaken for a signature', () => {
     // Only "--" on its own is the RFC signature marker.
     expect(flatten('before\n-\nafter')).toEqual(['before\n-\nafter']);
+  });
+});
+
+describe('render tree structure', () => {
+  const tags = (html: string) =>
+    parseMessageRichText(html)
+      .flatMap(function walk(node): string[] {
+        if (node.type !== 'element') return [];
+        return [node.tag, ...node.children.flatMap(walk)];
+      });
+
+  test('keeps tables, headings, rules, and code', () => {
+    const html = '<h2>Head</h2><table><tr><th>A</th><td>B</td></tr></table><hr><pre><code>x</code></pre>';
+    expect(tags(html)).toEqual(
+      expect.arrayContaining(['h2', 'table', 'tr', 'th', 'td', 'hr', 'pre', 'code'])
+    );
+  });
+
+  test('still drops active and resource elements', () => {
+    const html = '<script>alert(1)</script><img src="https://x.test/a.png"><form><input></form><p>kept</p>';
+    const rendered = tags(html);
+    for (const forbidden of ['script', 'img', 'form', 'input']) {
+      expect(rendered).not.toContain(forbidden);
+    }
+    expect(rendered).toContain('p');
+  });
+
+  test('void elements carry no children', () => {
+    const nodes = parseMessageRichText('<hr><br>');
+    for (const node of nodes) {
+      if (node.type === 'element') expect(node.children).toHaveLength(0);
+    }
+  });
+
+  test('legacy strikethrough normalises onto one tag', () => {
+    expect(tags('<s>a</s><strike>b</strike><del>c</del>')).toEqual(['del', 'del', 'del']);
   });
 });
