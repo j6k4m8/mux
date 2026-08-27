@@ -146,6 +146,9 @@ pub(crate) fn gmail_send_reconciliation_work(
     })
 }
 
+/// Schedules the first bootstrap for a ready account that has never synced.
+/// Terminal work rows are an audit trail, so only work still in flight suppresses
+/// this pass; counting finished rows would wedge a reconnected account forever.
 pub(crate) fn schedule_initial_syncs(
     database_path: &Path,
     now_ms: i64,
@@ -164,6 +167,10 @@ pub(crate) fn schedule_initial_syncs(
                  SELECT 1 FROM provider_work_items work
                  WHERE work.account_id = account.account_id
                    AND work.kind = 'sync' AND work.scope = ?1
+                   AND work.state IN (
+                     'queued', 'executing', 'retry_wait', 'rate_limited',
+                     'authentication_blocked'
+                   )
                )
              ORDER BY account.account_id",
         )?;
@@ -3827,6 +3834,65 @@ mod tests {
             lease_token: "lease".into(),
             lease_expires_at: 10_000,
         }
+    }
+
+    #[test]
+    fn a_reconnected_account_schedules_again_despite_finished_sync_history() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("gmail-reconnect.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute(
+                "INSERT INTO accounts(id, name, email, color, provider)
+                 VALUES('gmail-account', 'Gmail', 'reader@example.test', '#000000', 'gmail')",
+                [],
+            )
+            .expect("account fixture");
+        connection
+            .execute(
+                "INSERT INTO provider_accounts(
+                   account_id, provider_kind, remote_account_id, auth_state,
+                   credential_ref, sync_state, created_at, updated_at
+                 ) VALUES(
+                   'gmail-account', 'gmail', 'subject-1', 'ready',
+                   'gmail/account/a', 'never_synced', 1, 1
+                 )",
+                [],
+            )
+            .expect("provider account fixture");
+        // A long, entirely finished sync history, exactly what a reconnect leaves.
+        for index in 0..40 {
+            connection
+                .execute(
+                    "INSERT INTO provider_work_items(
+                       id, account_id, kind, scope, ordering_key, retry_safety,
+                       payload_json, payload_fingerprint, state, priority, created_at,
+                       available_at, attempt_count, max_attempts, completed_at
+                     ) VALUES(
+                       ?1, 'gmail-account', 'sync', ?2, ?1, 'safe_retry',
+                       '{}', ?3, 'succeeded', 0, 0, 0, 1, 3, 1
+                     )",
+                    params![
+                        format!("old-sync-{index}"),
+                        SYNC_SCOPE,
+                        format!("{index:032}")
+                    ],
+                )
+                .expect("historical sync work");
+        }
+        drop(connection);
+
+        // Finished history must not block the first sync after reconnecting.
+        assert_eq!(
+            schedule_initial_syncs(&path, 1_000).expect("initial schedule"),
+            1
+        );
+        // Work now in flight does suppress a duplicate pass.
+        assert_eq!(
+            schedule_initial_syncs(&path, 2_000).expect("no duplicate schedule"),
+            0
+        );
     }
 
     #[test]
