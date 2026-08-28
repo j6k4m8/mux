@@ -267,6 +267,11 @@ fn schedule_cursor_syncs(
             .and_then(|envelope| envelope.resume_phase().ok())
         {
             Some(phase) => phase,
+            // A cursor that is not a completed history boundary means a bootstrap is
+            // still in progress. Recovering it starts over from page one, so the
+            // periodic refresh must leave it alone; only an explicit resume may
+            // rebuild from scratch. Restarting on a timer never converges.
+            None if only_due => continue,
             None if validate_bounded(cursor, 16 * 1024).is_ok() => GmailSyncPhase::Bootstrap {
                 generation_id: format!("gmail-cursor-recovery-{identity}"),
                 baseline_history_id: None,
@@ -3892,6 +3897,74 @@ mod tests {
         assert_eq!(
             schedule_initial_syncs(&path, 2_000).expect("no duplicate schedule"),
             0
+        );
+    }
+
+    #[test]
+    fn the_refresh_timer_never_restarts_an_unfinished_bootstrap() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("gmail-bootstrap.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute(
+                "INSERT INTO accounts(id, name, email, color, provider)
+                 VALUES('gmail-account', 'Gmail', 'reader@example.test', '#000000', 'gmail')",
+                [],
+            )
+            .expect("account fixture");
+        connection
+            .execute(
+                "INSERT INTO provider_accounts(
+                   account_id, provider_kind, remote_account_id, auth_state,
+                   credential_ref, sync_state, refresh_seconds, created_at, updated_at
+                 ) VALUES(
+                   'gmail-account', 'gmail', 'subject-1', 'ready',
+                   'gmail/account/a', 'scheduled', 60, 1, 1
+                 )",
+                [],
+            )
+            .expect("provider account fixture");
+        // A bootstrap caught mid-flight: not a completed history boundary.
+        let cursor = cursor_json(&GmailSyncPhase::Bootstrap {
+            generation_id: "generation-1".into(),
+            baseline_history_id: Some("120".into()),
+            label_offset: 3,
+            page_token: Some("page-2".into()),
+        })
+        .expect("bootstrap cursor");
+        connection
+            .execute(
+                "INSERT INTO provider_sync_cursors(account_id, scope, cursor, updated_at)
+                 VALUES('gmail-account', 'a:v1', ?1, 1_000)",
+                [&cursor],
+            )
+            .expect("durable cursor");
+        drop(connection);
+
+        // The timer must not touch it, however overdue it looks. Restarting here
+        // discards the pages already fetched and can never converge.
+        for tick in 0..5 {
+            assert_eq!(
+                schedule_due_syncs(&path, 1_000_000 + tick).expect("refresh tick"),
+                0,
+                "tick {tick} restarted an unfinished bootstrap"
+            );
+        }
+        let connection = Connection::open(&path).expect("verify connection");
+        let scheduled: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_work_items WHERE kind = 'sync'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("work count");
+        assert_eq!(scheduled, 0, "no sync work may be enqueued by the timer");
+        // An explicit resume may still rebuild from a cursor it cannot resume.
+        drop(connection);
+        assert_eq!(
+            schedule_resumable_syncs(&path, 2_000_000).expect("explicit resume"),
+            1
         );
     }
 
