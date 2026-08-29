@@ -39,6 +39,10 @@ use crate::worker::{
 
 const WORK_FORMAT_VERSION: u8 = 1;
 pub(crate) const GMAIL_ACCOUNT_SCOPE: &str = "sync:gmail:account:v1";
+/// How long a bootstrap cursor may sit unchanged before the refresh timer treats
+/// its chain as dead and starts a fresh one. Comfortably longer than any single
+/// page takes, so a healthy bootstrap is never interrupted.
+const ABANDONED_BOOTSTRAP_MS: i64 = 10 * 60 * 1000;
 const SYNC_SCOPE: &str = GMAIL_ACCOUNT_SCOPE;
 const MESSAGE_PAGE_SIZE: usize = 10;
 const MAX_LABELS: usize = 10_000;
@@ -225,7 +229,7 @@ fn schedule_cursor_syncs(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let accounts = {
         let mut statement = transaction.prepare(
-            "SELECT account.account_id, cursor.cursor
+            "SELECT account.account_id, cursor.cursor, cursor.updated_at
              FROM provider_accounts account
              JOIN provider_sync_cursors cursor
                ON cursor.account_id = account.account_id AND cursor.scope = 'a:v1'
@@ -248,13 +252,17 @@ fn schedule_cursor_syncs(
         )?;
         let values = statement
             .query_map(params![SYNC_SCOPE, now_ms, i64::from(only_due)], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         values
     };
     let mut scheduled = 0;
-    for (index, (account_id, cursor)) in accounts.iter().enumerate() {
+    for (index, (account_id, cursor, cursor_updated_at)) in accounts.iter().enumerate() {
         let terminal_count = transaction.query_row(
             "SELECT COUNT(*) FROM provider_work_items
              WHERE account_id = ?1 AND kind = 'sync' AND scope = ?2",
@@ -267,11 +275,17 @@ fn schedule_cursor_syncs(
             .and_then(|envelope| envelope.resume_phase().ok())
         {
             Some(phase) => phase,
-            // A cursor that is not a completed history boundary means a bootstrap is
-            // still in progress. Recovering it starts over from page one, so the
-            // periodic refresh must leave it alone; only an explicit resume may
-            // rebuild from scratch. Restarting on a timer never converges.
-            None if only_due => continue,
+            // A cursor that is not a completed history boundary means a bootstrap
+            // was under way. Recovering it restarts from page one, so the periodic
+            // refresh must not touch one that is still moving, or it destroys its
+            // own progress and never converges. A cursor that has not advanced for
+            // a long time belongs to a chain that died, and only the timer can
+            // revive it, so that one is fair game.
+            None if only_due
+                && now_ms.saturating_sub(*cursor_updated_at) < ABANDONED_BOOTSTRAP_MS =>
+            {
+                continue
+            }
             None if validate_bounded(cursor, 16 * 1024).is_ok() => GmailSyncPhase::Bootstrap {
                 generation_id: format!("gmail-cursor-recovery-{identity}"),
                 baseline_history_id: None,
@@ -3942,13 +3956,14 @@ mod tests {
             .expect("durable cursor");
         drop(connection);
 
-        // The timer must not touch it, however overdue it looks. Restarting here
+        // While the cursor keeps moving the timer must not touch it: restarting
         // discards the pages already fetched and can never converge.
         for tick in 0..5 {
+            let now = 1_000 + tick * 1_000;
             assert_eq!(
-                schedule_due_syncs(&path, 1_000_000 + tick).expect("refresh tick"),
+                schedule_due_syncs(&path, now).expect("refresh tick"),
                 0,
-                "tick {tick} restarted an unfinished bootstrap"
+                "tick {tick} restarted a live bootstrap"
             );
         }
         let connection = Connection::open(&path).expect("verify connection");
@@ -3965,6 +3980,62 @@ mod tests {
         assert_eq!(
             schedule_resumable_syncs(&path, 2_000_000).expect("explicit resume"),
             1
+        );
+    }
+
+    #[test]
+    fn the_refresh_timer_revives_a_bootstrap_whose_chain_died() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("gmail-abandoned.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute(
+                "INSERT INTO accounts(id, name, email, color, provider)
+                 VALUES('gmail-account', 'Gmail', 'reader@example.test', '#000000', 'gmail')",
+                [],
+            )
+            .expect("account fixture");
+        connection
+            .execute(
+                "INSERT INTO provider_accounts(
+                   account_id, provider_kind, remote_account_id, auth_state,
+                   credential_ref, sync_state, refresh_seconds, created_at, updated_at
+                 ) VALUES(
+                   'gmail-account', 'gmail', 'subject-1', 'ready',
+                   'gmail/account/a', 'scheduled', 60, 1, 1
+                 )",
+                [],
+            )
+            .expect("provider account fixture");
+        let cursor = cursor_json(&GmailSyncPhase::Bootstrap {
+            generation_id: "generation-1".into(),
+            baseline_history_id: Some("120".into()),
+            label_offset: 40,
+            page_token: Some("page-9".into()),
+        })
+        .expect("bootstrap cursor");
+        connection
+            .execute(
+                "INSERT INTO provider_sync_cursors(account_id, scope, cursor, updated_at)
+                 VALUES('gmail-account', 'a:v1', ?1, 1_000)",
+                [&cursor],
+            )
+            .expect("durable cursor");
+        drop(connection);
+
+        // A retry budget exhausted mid-bootstrap leaves nothing in flight, so the
+        // cursor stops moving. Without the timer the account would never sync again.
+        let long_after = 1_000 + ABANDONED_BOOTSTRAP_MS + 1;
+        assert_eq!(
+            schedule_due_syncs(&path, long_after).expect("revive"),
+            1,
+            "an abandoned bootstrap must be picked back up"
+        );
+        // And the revived work suppresses a second pass while it is in flight.
+        assert_eq!(
+            schedule_due_syncs(&path, long_after + 1_000).expect("no duplicate"),
+            0
         );
     }
 
