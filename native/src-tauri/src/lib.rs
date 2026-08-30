@@ -203,6 +203,21 @@ fn set_account_refresh(
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountIdInput {
+    account_id: String,
+}
+
+/// Asks one account for new mail immediately rather than waiting for its cadence.
+#[tauri::command]
+fn sync_account_now(state: State<'_, AppState>, input: AccountIdInput) -> Result<usize, String> {
+    let scheduled = gmail::sync_account_now(&state.database_path, &input.account_id, now_ms())
+        .map_err(|error| error.to_string())?;
+    wake_worker(&state);
+    Ok(scheduled)
+}
+
 #[tauri::command]
 fn resync_all_mail(state: State<'_, AppState>) -> Result<store::FullResyncRequest, String> {
     let requested = {
@@ -637,7 +652,8 @@ pub fn run() {
             gmail_oauth_begin,
             gmail_oauth_cancel,
             resync_all_mail,
-            set_account_refresh
+            set_account_refresh,
+            sync_account_now
         ])
         .build(tauri::generate_context!())
         .expect("error while building Mux");
@@ -830,6 +846,7 @@ mod tests {
                 "gmail_oauth_cancel",
                 "resync_all_mail",
                 "set_account_refresh",
+                "sync_account_now",
             ]
         );
     }

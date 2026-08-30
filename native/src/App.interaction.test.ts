@@ -191,6 +191,7 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
     }
     if (command === 'resync_all_mail') return { accountsReset: 1 };
     if (command === 'set_account_refresh') return null;
+    if (command === 'sync_account_now') return 1;
     throw new Error(`Unexpected IPC command: ${command}`);
   }, { shouldMockEvents: true });
   return calls;
@@ -214,7 +215,7 @@ describe('production mailbox interactions', () => {
     const { calls, user } = await renderMailbox();
     await user.click(screen.getByRole('button', { name: /Settings/u }));
     const dialog = screen.getByTestId('settings-screen');
-    await user.click(within(dialog).getByRole('button', { name: 'Connect Gmail' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Add Gmail account' }));
 
     await waitFor(() => expect(within(dialog).getByRole('status').textContent).toBe('Connected reader@example.test.'));
     const oauthCall = calls.find((call) => call.command === 'gmail_oauth_begin');
@@ -271,12 +272,12 @@ describe('production mailbox interactions', () => {
     const settings = screen.getByTestId('settings-screen');
 
     // Accounts owns provider sign-in; other sections must not duplicate it.
-    expect(within(settings).getByRole('button', { name: 'Connect Gmail' })).toBeTruthy();
+    expect(within(settings).getByRole('button', { name: 'Add Gmail account' })).toBeTruthy();
     expect(within(settings).queryByTestId('resync-all')).toBeNull();
 
     await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
     expect(settings.getAttribute('data-section')).toBe('appearance');
-    expect(within(settings).queryByRole('button', { name: 'Connect Gmail' })).toBeNull();
+    expect(within(settings).queryByRole('button', { name: 'Add Gmail account' })).toBeNull();
 
     await user.click(within(settings).getByRole('button', { name: 'Shortcuts' }));
     expect(within(settings).getByText('Open the command palette')).toBeTruthy();
@@ -483,6 +484,26 @@ describe('production mailbox interactions', () => {
       expect(actions).toHaveLength(1);
       expect(actions[0]?.payload).toEqual({ threadId: Number(threadId), action: 'archive' });
     });
+  });
+
+  test('sync now asks the one account and says so', async () => {
+    const { calls, user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const button = document.querySelector<HTMLButtonElement>('[data-action="sync-now"]')!;
+    const accountId = button.getAttribute('data-account-id')!;
+
+    await user.click(button);
+    await waitFor(() => {
+      const call = calls.filter((entry) => entry.command === 'sync_account_now').at(-1);
+      expect(call?.payload).toEqual({ input: { accountId } });
+    });
+    await waitFor(() =>
+      expect(within(settings).getByRole('status').textContent).toMatch(/Checking .* for new mail\./u)
+    );
+    // Adding a mailbox is a separate idea from syncing an existing one.
+    expect(within(settings).getByRole('button', { name: 'Add Gmail account' })).toBeTruthy();
+    expect(within(settings).queryByRole('button', { name: 'Connect Gmail' })).toBeNull();
   });
 
   test('boots the real light mailbox shell and toggles a persisted dark theme', async () => {

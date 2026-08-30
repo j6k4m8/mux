@@ -259,9 +259,9 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
     state.visited_nodes += 1;
 
     if node.is_text() {
-        let value = node.text();
-        state.html.push_str(&escape_text(value.as_ref()));
-        state.text.push_str(value.as_ref());
+        let value = strip_invisible_padding(node.text().as_ref());
+        state.html.push_str(&escape_text(&value));
+        state.text.push_str(&value);
         return;
     }
     if !node.is_element() {
@@ -539,6 +539,22 @@ fn normalize_plain_text(value: &str) -> String {
         .to_string()
 }
 
+/// Senders pad a preheader with hundreds of invisible characters so the preview
+/// line in a mail client looks empty. Rendered literally they become a wall of
+/// blank space. Zero-width joiners and non-joiners are left alone because emoji
+/// sequences and Persian orthography need them.
+fn strip_invisible_padding(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !matches!(
+                character,
+                '\u{034f}' | '\u{200b}' | '\u{2060}' | '\u{feff}' | '\u{00ad}'
+            )
+        })
+        .collect()
+}
+
 fn escape_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -648,6 +664,33 @@ mod tests {
         .unwrap();
         assert!(!hostile_marker.html.contains("mux-remote-image"));
         assert!(hostile_marker.remote_images.is_empty());
+    }
+
+    #[test]
+    fn invisible_preheader_padding_is_removed_without_touching_real_text() {
+        let padded = format!("<p>Real subject{}tail</p>", "\u{034f} \u{200b}".repeat(40));
+        let safe = sanitize_html(&padded).expect("bounded HTML");
+        for invisible in ['\u{034f}', '\u{200b}', '\u{2060}', '\u{feff}', '\u{00ad}'] {
+            assert!(!safe.html.contains(invisible), "kept {invisible:?}");
+            assert!(!safe.text.contains(invisible), "kept {invisible:?} in text");
+        }
+        assert!(safe.text.contains("Real subject"));
+        assert!(safe.text.contains("tail"));
+
+        // Emoji sequences and Persian orthography depend on the joiners, so those
+        // must survive untouched.
+        let joined = sanitize_html(
+            "<p>\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{0645}\u{200c}\u{06cc}</p>",
+        )
+        .expect("bounded HTML");
+        assert!(
+            joined.text.contains('\u{200d}'),
+            "emoji joiner was stripped"
+        );
+        assert!(
+            joined.text.contains('\u{200c}'),
+            "persian non-joiner was stripped"
+        );
     }
 
     #[test]

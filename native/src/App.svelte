@@ -294,6 +294,25 @@
     }
   }
 
+  let syncingAccounts: string[] = [];
+
+  async function syncAccountNow(accountId: string, name: string) {
+    settingsError = '';
+    settingsMessage = '';
+    syncingAccounts = [...syncingAccounts, accountId];
+    try {
+      const scheduled = await invoke<number>('sync_account_now', { input: { accountId } });
+      settingsMessage = scheduled > 0
+        ? `Checking ${name} for new mail.`
+        : `${name} is already syncing.`;
+    } catch (cause) {
+      settingsError = settingsErrorText(cause);
+    } finally {
+      syncingAccounts = syncingAccounts.filter((id) => id !== accountId);
+      await refreshMailbox();
+    }
+  }
+
   async function setAccountRefresh(accountId: string, refreshSeconds: number) {
     settingsError = '';
     settingsMessage = '';
@@ -1797,6 +1816,15 @@
                     </div>
                     <div class="settings-account-refresh">
                       <span>Check for new mail</span>
+                      <button
+                        class="settings-sync-now"
+                        type="button"
+                        data-action="sync-now"
+                        data-account-id={account.id}
+                        title={`Check ${account.name} for new mail right now`}
+                        disabled={syncingAccounts.includes(account.id)}
+                        on:click={() => syncAccountNow(account.id, account.name)}
+                      >{syncingAccounts.includes(account.id) ? 'Checking…' : 'Sync now'}</button>
                       <div class="settings-choice-row" role="group" aria-label={`Refresh interval for ${account.name}`} data-testid="refresh-interval" data-account-id={account.id}>
                         {#each refreshChoices as choice}
                           <button
@@ -1815,7 +1843,12 @@
             {/if}
 
             <section class="settings-card">
-              <h3>Connect an account</h3>
+              <h3>Add another account</h3>
+              <p class="settings-hint">
+                {mailbox.accounts.length === 1
+                  ? 'Your account above is already connected and syncing. This adds a second mailbox.'
+                  : 'Connect an additional mailbox alongside the ones above.'}
+              </p>
               <div class="vault-provider-card" aria-labelledby="gmail-connect-title">
                 <div>
                   <h3 id="gmail-connect-title">Gmail</h3>
@@ -1824,7 +1857,7 @@
                 {#if gmailOAuthBusy}
                   <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
                 {:else}
-                  <button class="vault-primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Connect Gmail</button>
+                  <button class="vault-primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Add Gmail account</button>
                 {/if}
               </div>
             </section>

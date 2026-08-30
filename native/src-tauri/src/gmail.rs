@@ -206,19 +206,31 @@ pub(crate) fn schedule_resumable_syncs(
     database_path: &Path,
     now_ms: i64,
 ) -> Result<usize, WorkerError> {
-    schedule_cursor_syncs(database_path, now_ms, false)
+    schedule_cursor_syncs(database_path, now_ms, false, None)
+}
+
+/// Asks one account for new mail right now, ignoring its cadence. A person
+/// pressing the button is an explicit resume, so a cursor the timer would leave
+/// alone may be rebuilt here.
+pub(crate) fn sync_account_now(
+    database_path: &Path,
+    account_id: &str,
+    now_ms: i64,
+) -> Result<usize, WorkerError> {
+    schedule_cursor_syncs(database_path, now_ms, false, Some(account_id))
 }
 
 /// Schedules a delta cycle only for accounts whose own refresh cadence has
 /// elapsed since their last successful sync. Driven by the refresh timer.
 pub(crate) fn schedule_due_syncs(database_path: &Path, now_ms: i64) -> Result<usize, WorkerError> {
-    schedule_cursor_syncs(database_path, now_ms, true)
+    schedule_cursor_syncs(database_path, now_ms, true, None)
 }
 
 fn schedule_cursor_syncs(
     database_path: &Path,
     now_ms: i64,
     only_due: bool,
+    only_account: Option<&str>,
 ) -> Result<usize, WorkerError> {
     if now_ms < 0 {
         return Err(WorkerError::Validation(
@@ -248,16 +260,20 @@ fn schedule_cursor_syncs(
                )
                AND (?3 = 0 OR account.last_sync_at IS NULL
                  OR ?2 - account.last_sync_at >= account.refresh_seconds * 1000)
+               AND (?4 IS NULL OR account.account_id = ?4)
              ORDER BY account.account_id",
         )?;
         let values = statement
-            .query_map(params![SYNC_SCOPE, now_ms, i64::from(only_due)], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
+            .query_map(
+                params![SYNC_SCOPE, now_ms, i64::from(only_due), only_account],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         values
     };
@@ -328,7 +344,9 @@ pub(crate) enum GmailAccessError {
     RetryableBecause(&'static str),
     ReauthorizationRequired,
     Retryable,
-    RateLimited { retry_after_at: i64 },
+    RateLimited {
+        retry_after_at: i64,
+    },
     Permanent,
 }
 
