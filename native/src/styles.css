@@ -367,10 +367,15 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .message-body h4, .message-body h5, .message-body h6 { font-size: 1em; }
 .message-body h1:first-child, .message-body h2:first-child, .message-body h3:first-child { margin-top: 0; }
 .message-body hr { height: 0; margin: 1.2em 0; border: 0; border-top: 1px solid var(--border); }
-.message-body table { width: 100%; margin: .8em 0; border-collapse: collapse; display: block; overflow-x: auto; }
+/* Mail uses tables for layout far more often than for data, so borders are off
+   by default and only a table that declares a header row is drawn as a grid. */
+.message-body table { max-width: 100%; margin: .4em 0; border-collapse: collapse; }
 .message-body caption { margin-bottom: .4em; color: var(--text-faint); font-size: .92em; text-align: left; }
-.message-body th, .message-body td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
-.message-body th { color: var(--text); font-weight: 700; background: var(--surface-muted); }
+.message-body th, .message-body td { padding: 0 4px 0 0; text-align: left; vertical-align: top; }
+.message-body td:last-child, .message-body th:last-child { padding-right: 0; }
+.message-body table:has(th) { display: block; margin: .8em 0; overflow-x: auto; }
+.message-body table:has(th) th, .message-body table:has(th) td { padding: 6px 10px; border: 1px solid var(--border); }
+.message-body table:has(th) th { color: var(--text); font-weight: 700; background: var(--surface-muted); }
 .message-body pre { margin: .8em 0; padding: 11px 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .92em; line-height: 1.5; overflow-x: auto; white-space: pre; }
 .message-body code { padding: 1px 4px; border-radius: 4px; background: var(--surface-muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .92em; }
 .message-body pre code { padding: 0; background: none; }

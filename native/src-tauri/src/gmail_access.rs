@@ -261,7 +261,8 @@ fn read_configured_account(
     database_path: &Path,
     account_id: &str,
 ) -> Result<ConfiguredAccount, GmailAccessError> {
-    let connection = Connection::open(database_path).map_err(|_| GmailAccessError::Retryable)?;
+    let connection = Connection::open(database_path)
+        .map_err(|_| GmailAccessError::RetryableBecause("database"))?;
     connection
         .query_row(
             "SELECT remote_account_id, auth_state, credential_ref
@@ -277,7 +278,7 @@ fn read_configured_account(
             },
         )
         .optional()
-        .map_err(|_| GmailAccessError::Retryable)?
+        .map_err(|_| GmailAccessError::RetryableBecause("database"))?
         .ok_or(GmailAccessError::ReauthorizationRequired)
 }
 
@@ -430,7 +431,7 @@ fn validate_field(value: &str) -> Result<(), GmailAccessError> {
 fn map_credential_error(error: CredentialError) -> GmailAccessError {
     match error {
         // A keychain that cannot answer is a transient condition, not a decision.
-        CredentialError::Unavailable => GmailAccessError::Retryable,
+        CredentialError::Unavailable => GmailAccessError::RetryableBecause("keychain"),
         CredentialError::InvalidIdentifier | CredentialError::LimitExceeded(_) => {
             GmailAccessError::Permanent
         }
@@ -495,7 +496,7 @@ fn decode_refresh_response(
         return Err(GmailAccessError::RateLimited { retry_after_at });
     }
     if status.is_server_error() {
-        return Err(GmailAccessError::Retryable);
+        return Err(GmailAccessError::RetryableBecause("provider_5xx"));
     }
     if !status.is_success() {
         let error: RefreshErrorWire =
@@ -554,7 +555,7 @@ fn read_bounded(
     response
         .take(read_limit)
         .read_to_end(&mut bytes)
-        .map_err(|_| GmailAccessError::Retryable)?;
+        .map_err(|_| GmailAccessError::RetryableBecause("response_read"))?;
     if bytes.len() as u64 > max_bytes {
         return Err(GmailAccessError::Permanent);
     }
@@ -563,7 +564,7 @@ fn read_bounded(
 
 fn classify_transport_error(error: reqwest::Error) -> GmailAccessError {
     if error.is_timeout() || error.is_connect() {
-        GmailAccessError::Retryable
+        GmailAccessError::RetryableBecause("network")
     } else {
         GmailAccessError::Permanent
     }
@@ -750,7 +751,7 @@ mod tests {
                 Zeroizing::new(br#"{}"#.to_vec()),
                 now_ms,
             ),
-            Err(GmailAccessError::Retryable)
+            Err(GmailAccessError::RetryableBecause("provider_5xx"))
         ));
     }
 

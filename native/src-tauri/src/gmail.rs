@@ -323,6 +323,9 @@ fn schedule_cursor_syncs(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GmailAccessError {
     CredentialUnavailable,
+    /// Transient, with the cause named so a stuck account can be diagnosed from
+    /// the durable error code instead of guessing between unrelated failures.
+    RetryableBecause(&'static str),
     ReauthorizationRequired,
     Retryable,
     RateLimited { retry_after_at: i64 },
@@ -3155,6 +3158,9 @@ fn access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
         GmailAccessError::Retryable => WorkerOutcome::RetryableFailure {
             code: "gmail_access_retryable".into(),
         },
+        GmailAccessError::RetryableBecause(reason) => WorkerOutcome::RetryableFailure {
+            code: format!("gmail_access_retryable_{reason}"),
+        },
         GmailAccessError::RateLimited { retry_after_at } => WorkerOutcome::RateLimited {
             code: "gmail_access_rate_limited".into(),
             retry_after_at,
@@ -3173,6 +3179,9 @@ fn send_access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
         },
         GmailAccessError::Retryable => WorkerOutcome::RejectedBeforeSubmission {
             code: "gmail_access_retryable_before_send".into(),
+        },
+        GmailAccessError::RetryableBecause(reason) => WorkerOutcome::RejectedBeforeSubmission {
+            code: format!("gmail_access_retryable_{reason}_before_send"),
         },
         GmailAccessError::RateLimited { retry_after_at } => WorkerOutcome::RateLimited {
             code: "gmail_access_rate_limited".into(),
