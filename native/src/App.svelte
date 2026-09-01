@@ -6,7 +6,24 @@
   import Composer from './Composer.svelte';
   import Icon from './Icon.svelte';
   import InlineReply from './InlineReply.svelte';
+  import { swipeGesture } from './swipeGesture';
+  import type { SwipeSide } from './swipeGesture';
+  import MailboxSidebar from './MailboxSidebar.svelte';
+  import SettingsScreen from './SettingsScreen.svelte';
   import ThreadConversation from './ThreadConversation.svelte';
+  import {
+    applyAppearanceToRoot,
+    densityChoices,
+    DEFAULT_APPEARANCE,
+    DEFAULT_FONT,
+    persistAppearance,
+    readSavedAppearance,
+    refreshChoices,
+    swipeChoices,
+    swipeLabel,
+    textSizes
+  } from './appearance';
+  import type { Appearance, Density, SwipeAction } from './appearance';
   import { replyRecipients } from './replyRecipients.mjs';
   import { isInteractiveShortcutTarget, mailboxShortcutFor } from './shortcuts.mjs';
   import {
@@ -30,6 +47,7 @@
     DraftSummary,
     InvitationSummary,
     MailboxBootstrap,
+    MailboxView,
     MessagePage,
     MessagePageInput,
     MessageSummary,
@@ -37,32 +55,17 @@
     OperationSummary,
     SearchInput,
     SearchPage,
+    SettingsSection,
+    SmartView,
+    Theme,
+    ThreadLookupInput,
     ThreadPage,
     ThreadPageInput,
-    ThreadLookupInput,
-    ThreadSummary
+    ThreadSummary,
+    ViewCountSummary
   } from './types';
 
-  type MailboxView = 'all' | 'inbox' | 'archive' | 'starred' | 'snoozed' | 'sent' | 'trash' | 'drafts';
-  type SmartView = '' | 'unread' | 'attachments' | 'invitations' | 'finance';
-  type Theme = 'light' | 'dark';
   type Notice = { text: string; operationId?: string; until?: number };
-  type GmailOAuthResult = { state: 'connected'; accountId: string; email: string };
-  type SettingsSection = 'accounts' | 'appearance' | 'mail' | 'shortcuts';
-  type Density = 'roomy' | 'default' | 'sardine';
-  type SwipeAction = 'archive' | 'delete' | 'snooze' | 'star' | 'unread' | 'none';
-  type Appearance = {
-    scale: number;
-    font: string;
-    density: Density;
-    toolbarIcons: boolean;
-    toolbarText: boolean;
-    toolbarShortcuts: boolean;
-    toolbarCollapseNarrow: boolean;
-    swipeLeft: SwipeAction;
-    swipeRight: SwipeAction;
-    railPreview: boolean;
-  };
   type PaletteCommandId = 'compose' | 'archive' | 'snooze' | 'star' | 'read' | 'inbox' | 'starred' | 'activity' | 'theme' | 'settings';
   type PaletteCommand = { id: PaletteCommandId; title: string; description: string; shortcut: string };
 
@@ -152,34 +155,14 @@
   let refreshQueued = false;
   let initialRefreshQueued = false;
   let refreshLoop: Promise<void> | null = null;
-  const DEFAULT_FONT = 'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif';
-  const APPEARANCE_KEY = 'mux-appearance';
   const HIDDEN_ACCOUNTS_KEY = 'mux-hidden-accounts';
-  const DEFAULT_APPEARANCE: Appearance = {
-    scale: 1,
-    font: DEFAULT_FONT,
-    density: 'default',
-    toolbarIcons: true,
-    toolbarText: true,
-    toolbarShortcuts: false,
-    toolbarCollapseNarrow: true,
-    swipeLeft: 'archive',
-    swipeRight: 'snooze',
-    railPreview: true
-  };
   let appearance: Appearance = { ...DEFAULT_APPEARANCE };
-  let customFont = '';
   /// True once Enter has stepped into the conversation; j/k then move messages.
   let readerFocused = false;
   /// Accounts hidden from the list. They keep syncing in the background.
   let hiddenAccounts: string[] = [];
   let settingsOpen = false;
-  let settingsSection: SettingsSection = 'accounts';
-  let settingsBusy = false;
-  let settingsError = '';
-  let settingsMessage = '';
-  let resyncBusy = false;
-  let gmailOAuthBusy = false;
+  let settingsScreen: SettingsScreen | undefined;
   let blockingDialogOpen = false;
 
   $: visibleThreads = filter.trim() ? searchRows : threads;
@@ -250,11 +233,7 @@
     }
     setTheme(savedTheme === 'dark' ? 'dark' : 'light', false);
     hiddenAccounts = readHiddenAccounts();
-    const savedAppearance = readSavedAppearance();
-    applyAppearance(savedAppearance, false);
-    customFont = fontChoices.some((choice) => choice.value === savedAppearance.font)
-      ? ''
-      : savedAppearance.font;
+    applyAppearance(readSavedAppearance(), false);
     navigationMediaQuery = window.matchMedia('(max-width: 980px)');
     readerMediaQuery = window.matchMedia('(max-width: 680px)');
     syncResponsiveLayout();
@@ -294,38 +273,6 @@
     }
   }
 
-  let syncingAccounts: string[] = [];
-
-  async function syncAccountNow(accountId: string, name: string) {
-    settingsError = '';
-    settingsMessage = '';
-    syncingAccounts = [...syncingAccounts, accountId];
-    try {
-      const scheduled = await invoke<number>('sync_account_now', { input: { accountId } });
-      settingsMessage = scheduled > 0
-        ? `Checking ${name} for new mail.`
-        : `${name} is already syncing.`;
-    } catch (cause) {
-      settingsError = settingsErrorText(cause);
-    } finally {
-      syncingAccounts = syncingAccounts.filter((id) => id !== accountId);
-      await refreshMailbox();
-    }
-  }
-
-  async function setAccountRefresh(accountId: string, refreshSeconds: number) {
-    settingsError = '';
-    settingsMessage = '';
-    try {
-      await invoke('set_account_refresh', { input: { accountId, refreshSeconds } });
-      await refreshMailbox();
-      const label = refreshChoices.find((choice) => choice.value === refreshSeconds)?.label
-        ?? `${refreshSeconds}s`;
-      settingsMessage = `Checking for new mail every ${label}.`;
-    } catch (cause) {
-      settingsError = settingsErrorText(cause);
-    }
-  }
 
   function toggleAccountVisibility(accountId: string) {
     hiddenAccounts = hiddenAccounts.includes(accountId)
@@ -356,123 +303,13 @@
 
   function applyAppearance(next: Appearance, persist = true) {
     appearance = next;
-    const root = document.documentElement;
-    root.style.setProperty('--ui-scale', String(next.scale));
-    root.style.setProperty('--app-font', next.font);
-    if (!persist) return;
-    try {
-      window.localStorage.setItem(APPEARANCE_KEY, JSON.stringify(next));
-    } catch {
-      // Appearance persistence is optional; the choice still applies this session.
-    }
-  }
-
-  function readSavedAppearance(): Appearance {
-    let raw: string | null = null;
-    try {
-      raw = window.localStorage.getItem(APPEARANCE_KEY);
-    } catch {
-      return { ...DEFAULT_APPEARANCE };
-    }
-    if (!raw) return { ...DEFAULT_APPEARANCE };
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (typeof parsed !== 'object' || parsed === null) throw new Error('shape');
-      const value = parsed as Partial<Appearance>;
-      // Bound anything read back from storage; it is not trusted input.
-      const scale = typeof value.scale === 'number' && Number.isFinite(value.scale)
-        ? Math.min(2, Math.max(0.75, value.scale))
-        : 1;
-      const font = typeof value.font === 'string' && value.font.trim() && value.font.length <= 200
-        ? value.font
-        : DEFAULT_FONT;
-      const density: Density = value.density === 'roomy' || value.density === 'sardine'
-        ? value.density
-        : 'default';
-      const flag = (candidate: unknown, fallback: boolean) =>
-        typeof candidate === 'boolean' ? candidate : fallback;
-      const swipe = (candidate: unknown, fallback: SwipeAction): SwipeAction =>
-        swipeChoices.some((choice) => choice.value === candidate)
-          ? (candidate as SwipeAction)
-          : fallback;
-      return {
-        scale,
-        font,
-        density,
-        toolbarIcons: flag(value.toolbarIcons, true),
-        toolbarText: flag(value.toolbarText, true),
-        toolbarShortcuts: flag(value.toolbarShortcuts, false),
-        toolbarCollapseNarrow: flag(value.toolbarCollapseNarrow, true),
-        swipeLeft: swipe(value.swipeLeft, 'archive'),
-        swipeRight: swipe(value.swipeRight, 'snooze'),
-        railPreview: flag(value.railPreview, true)
-      };
-    } catch {
-      return { ...DEFAULT_APPEARANCE };
-    }
+    applyAppearanceToRoot(next);
+    if (persist) persistAppearance(next);
   }
 
   function toggleTheme() {
     setTheme(theme === 'light' ? 'dark' : 'light');
   }
-
-  const fontChoices: Array<{ label: string; value: string }> = [
-    { label: 'Inter', value: DEFAULT_FONT },
-    { label: 'System', value: '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif' },
-    { label: 'Serif', value: 'ui-serif, "New York", Georgia, "Times New Roman", serif' },
-    { label: 'Mono', value: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace' }
-  ];
-
-  const textSizes: Array<{ label: string; value: number }> = [
-    { label: 'Small', value: 0.9 },
-    { label: 'Default', value: 1 },
-    { label: 'Large', value: 1.15 },
-    { label: 'Larger', value: 1.3 }
-  ];
-
-  const refreshChoices: Array<{ label: string; value: number }> = [
-    { label: '30s', value: 30 },
-    { label: '1 min', value: 60 },
-    { label: '5 min', value: 300 },
-    { label: '15 min', value: 900 },
-    { label: '1 hour', value: 3600 }
-  ];
-
-  const swipeChoices: Array<{ label: string; value: SwipeAction }> = [
-    { label: 'Archive', value: 'archive' },
-    { label: 'Trash', value: 'delete' },
-    { label: 'Snooze', value: 'snooze' },
-    { label: 'Star', value: 'star' },
-    { label: 'Unread', value: 'unread' },
-    { label: 'Nothing', value: 'none' }
-  ];
-
-  const densityChoices: Array<{ label: string; value: Density }> = [
-    { label: 'Roomy', value: 'roomy' },
-    { label: 'Default', value: 'default' },
-    { label: 'Sardinemode', value: 'sardine' }
-  ];
-
-  const settingsSections: Array<{ id: SettingsSection; title: string }> = [
-    { id: 'accounts', title: 'Accounts' },
-    { id: 'appearance', title: 'Appearance' },
-    { id: 'mail', title: 'Mail' },
-    { id: 'shortcuts', title: 'Shortcuts' }
-  ];
-
-  const shortcutReference: Array<{ keys: string; action: string }> = [
-    { keys: '⌘P', action: 'Open the command palette' },
-    { keys: '⌘,', action: 'Open settings' },
-    { keys: 'C', action: 'Compose' },
-    { keys: 'R / A / F', action: 'Reply, reply all, forward' },
-    { keys: 'J / K', action: 'Next or previous conversation' },
-    { keys: 'E', action: 'Archive or restore' },
-    { keys: 'S', action: 'Star' },
-    { keys: 'U', action: 'Toggle unread' },
-    { keys: 'H', action: 'Snooze' },
-    { keys: '⌘F', action: 'Search' },
-    { keys: 'Esc', action: 'Close or step back' }
-  ];
 
   function availablePaletteCommands(): PaletteCommand[] {
     const items: PaletteCommand[] = [
@@ -586,84 +423,16 @@
     document.querySelector<HTMLButtonElement>(`[data-thread-id="${selectedThreadId}"]`)?.focus();
   }
 
-  function readGmailOAuthResult(value: unknown): GmailOAuthResult {
-    if (
-      typeof value === 'object' && value !== null &&
-      'state' in value && value.state === 'connected' &&
-      'accountId' in value && typeof value.accountId === 'string' && value.accountId.length > 0 &&
-      'email' in value && typeof value.email === 'string' && value.email.length > 0
-    ) {
-      return { state: value.state, accountId: value.accountId, email: value.email };
-    }
-    throw new Error('Mux returned an invalid Google authorization result.');
-  }
-
-  function clearSettingsFeedback() {
-    settingsError = '';
-    settingsMessage = '';
-  }
-
-  function settingsErrorText(cause: unknown): string {
-    const text = cause instanceof Error
-      ? cause.message
-      : typeof cause === 'object' && cause !== null && 'message' in cause && typeof cause.message === 'string'
-        ? cause.message
-        : String(cause);
-    return text || 'Mux could not update that setting.';
-  }
-
   async function openSettings(section: SettingsSection = 'accounts') {
     navigationOpen = false;
     closeCommandPalette(false);
-    clearSettingsFeedback();
-    settingsSection = section;
     settingsOpen = true;
+    await tick();
+    settingsScreen?.show(section);
   }
 
   function closeSettings() {
-    if (gmailOAuthBusy) void cancelGmailOAuth();
-    clearSettingsFeedback();
     settingsOpen = false;
-  }
-
-  async function connectGmail() {
-    settingsError = '';
-    settingsMessage = '';
-    gmailOAuthBusy = true;
-    try {
-      const result = readGmailOAuthResult(await invoke<unknown>('gmail_oauth_begin'));
-      settingsMessage = `Connected ${result.email}.`;
-    } catch (cause) {
-      settingsError = settingsErrorText(cause);
-    } finally {
-      gmailOAuthBusy = false;
-    }
-  }
-
-  async function cancelGmailOAuth() {
-    try {
-      await invoke<unknown>('gmail_oauth_cancel');
-      settingsMessage = 'Cancelling…';
-    } catch (cause) {
-      settingsError = settingsErrorText(cause);
-    }
-  }
-
-  async function resyncAllMail() {
-    settingsError = '';
-    settingsMessage = '';
-    resyncBusy = true;
-    try {
-      const requested = await invoke<{ accountsReset: number }>('resync_all_mail');
-      settingsMessage = requested.accountsReset > 0
-        ? 'Re-downloading every message from your provider. Nothing was removed.'
-        : 'No provider account is connected yet, so there is nothing to re-download.';
-      await refreshMailbox();
-    } catch (cause) {
-      settingsError = settingsErrorText(cause);
-    } finally {
-      resyncBusy = false;
-    }
   }
 
   async function subscribeToMailboxChanges() {
@@ -1605,118 +1374,18 @@
     return actions;
   })();
 
-  /// Two-finger horizontal swipe on a thread row. A pointer drag cannot leave the
-  /// list without losing the gesture, so this reads wheel deltas instead: macOS
-  /// reports a trackpad swipe as horizontal wheel movement.
-  const SWIPE_TRIGGER_PX = 110;
-  /// Dragged this far, the gesture is not ambiguous, so it commits at once
-  /// rather than waiting to confirm the fingers have lifted. Waiting is only
-  /// worth it for a swipe that stopped somewhere undecided.
-  const SWIPE_COMMIT_PX = 158;
-  /// How far the row can travel. Comfortably past the decisive distance, so a
-  /// firm swipe reaches it before running out of room.
-  const SWIPE_MAX_OFFSET_PX = 170;
-  /// Travel before a gesture commits to an axis. Below this it could still be
-  /// either, so nothing is decided and nothing moves.
-  const SWIPE_AXIS_LOCK_PX = 14;
-  /// How much more horizontal than vertical a gesture must be to count as a
-  /// swipe. Scrolling a list is rarely this lopsided.
-  const SWIPE_AXIS_RATIO = 1.6;
-  /// Quiet before a gesture with nothing left to protect settles: one already
-  /// past the trigger, or one that turned out to be a scroll.
-  const SWIPE_SETTLE_MS = 200;
-  /// The longest a partial swipe waits before sliding back. A fixed value cannot
-  /// work: long enough to survive a slow drag is long enough to hang after the
-  /// fingers lift, so the wait is measured from the drag's own rhythm.
-  const SWIPE_MAX_QUIET_MS = 450;
-  const SWIPE_QUIET_INTERVALS = 2.5;
-
-  /// Continuous gesture state, deliberately outside Svelte's reactivity. Wheel
-  /// events arrive up to 120 times a second, and assigning a reactive variable
-  /// on each one invalidates this component: the whole thread list re-runs, and
-  /// every rendered row rebuilds its labels, icon, and title string. That work
-  /// is what made the row lag behind the fingers. The offset is written straight
-  /// to the DOM instead, once per frame.
-  const swipe = {
-    node: null as HTMLElement | null,
-    offset: 0,
-    axis: 'undecided' as 'undecided' | 'horizontal' | 'vertical',
-    travelX: 0,
-    travelY: 0,
-    gapMs: 0,
-    lastAt: 0,
-    frame: 0,
-    timer: undefined as number | undefined
-  };
-
-  /// The only swipe state Svelte sees. Each changes a couple of times per
-  /// gesture rather than a couple of times per frame.
-  let swipeThreadId: number | null = null;
-  let swipeSide: 'left' | 'right' = 'left';
+  /// Which row is mid-swipe, and how far along. The gesture itself lives in the
+  /// action; only these discrete facts reach the markup.
+  let swipeRow: number | null = null;
+  let swipeSide: SwipeSide = 'left';
   let swipeArmed = false;
 
-  function paintSwipe() {
-    swipe.frame = 0;
-    swipe.node?.style.setProperty('--swipe-offset', `${swipe.offset}px`);
-  }
-
-  function scheduleSwipePaint() {
-    if (typeof requestAnimationFrame !== 'function') {
-      paintSwipe();
-      return;
-    }
-    // Several wheel events can land in one frame; the row only needs moving once.
-    if (!swipe.frame) swipe.frame = requestAnimationFrame(paintSwipe);
-  }
-
-  function resetSwipe() {
-    window.clearTimeout(swipe.timer);
-    if (swipe.frame && typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(swipe.frame);
-    }
-    // Dropping the property lets the row animate home under its own transition.
-    swipe.node?.style.removeProperty('--swipe-offset');
-    swipe.node = null;
-    swipe.offset = 0;
-    swipe.axis = 'undecided';
-    swipe.travelX = 0;
-    swipe.travelY = 0;
-    swipe.gapMs = 0;
-    swipe.lastAt = 0;
-    swipe.frame = 0;
-    swipe.timer = undefined;
-    swipeThreadId = null;
-    swipeArmed = false;
-  }
-
-  /// A trackpad gesture has no lift event, so the end of one is the moment the
-  /// wheel events stop. The action commits here rather than the instant the row
-  /// crosses the trigger, so a swipe can be taken back by swiping it back.
-  function endSwipeGesture() {
-    const offset = swipe.offset;
-    const axis = swipe.axis;
-    const threadId = swipeThreadId;
-    resetSwipe();
-    if (axis !== 'horizontal' || threadId === null) return;
-    if (Math.abs(offset) < SWIPE_TRIGGER_PX) return;
-    // Resolved now rather than captured, so a refresh mid-gesture cannot act on
-    // a stale copy of the row.
-    const thread = visibleThreads.find((row) => row.id === threadId);
-    if (!thread) return;
-    runSwipeAction(thread, offset < 0 ? appearance.swipeLeft : appearance.swipeRight);
-  }
-
-  function armSwipeTimer() {
-    const armed = swipe.axis === 'horizontal' && Math.abs(swipe.offset) >= SWIPE_TRIGGER_PX;
-    // Until an interval has been measured, assume a slow drag. Guessing fast
-    // would end the gesture before its second event arrived.
-    const paced = swipe.gapMs ? swipe.gapMs * SWIPE_QUIET_INTERVALS : SWIPE_MAX_QUIET_MS;
-    const quiet =
-      armed || swipe.axis !== 'horizontal'
-        ? SWIPE_SETTLE_MS
-        : Math.min(SWIPE_MAX_QUIET_MS, Math.max(SWIPE_SETTLE_MS, paced));
-    window.clearTimeout(swipe.timer);
-    swipe.timer = window.setTimeout(endSwipeGesture, quiet);
+  function swipeStateFor(thread: ThreadSummary) {
+    return (state: { swiping: boolean; side: SwipeSide; armed: boolean }) => {
+      swipeRow = state.swiping ? thread.id : null;
+      swipeSide = state.side;
+      swipeArmed = state.armed;
+    };
   }
 
   function swipeIntent(
@@ -1741,10 +1410,6 @@
       : { label: 'Mark unread', icon: 'mail', tone: 'unread' };
   }
 
-  function swipeLabel(action: SwipeAction): string {
-    return swipeChoices.find((choice) => choice.value === action)?.label ?? 'Nothing';
-  }
-
   function runSwipeAction(thread: ThreadSummary, action: SwipeAction) {
     if (action === 'none') return;
     if (action === 'snooze') {
@@ -1765,66 +1430,6 @@
       return;
     }
     void applyThreadAction('delete', 'Moved to Trash', thread);
-  }
-
-  function swipeWheel(event: WheelEvent, thread: ThreadSummary) {
-    if (appearance.swipeLeft === 'none' && appearance.swipeRight === 'none') return;
-
-    if (swipeThreadId === null) {
-      resetSwipe();
-      swipeThreadId = thread.id;
-      // The wrapper, not the row: the row slides out from under the pointer.
-      swipe.node = event.currentTarget as HTMLElement;
-    }
-
-    // A drag's own rhythm is the only thing separating "still moving slowly"
-    // from "let go", so the interval between events is smoothed and reused.
-    const at = typeof performance === 'object' ? performance.now() : Date.now();
-    if (swipe.lastAt) {
-      const gap = at - swipe.lastAt;
-      swipe.gapMs = swipe.gapMs ? swipe.gapMs * 0.7 + gap * 0.3 : gap;
-    }
-    swipe.lastAt = at;
-    // Every wheel event keeps the live gesture alive, whichever row it came
-    // from, so a row sliding sideways under the cursor cannot end it.
-    armSwipeTimer();
-    if (swipeThreadId !== thread.id) return;
-
-    swipe.travelX += Math.abs(event.deltaX);
-    swipe.travelY += Math.abs(event.deltaY);
-
-    // The axis is decided once per gesture from accumulated travel. Deciding it
-    // per event reads momentum as a swipe: after a vertical flick macOS keeps
-    // sending events whose deltaY has decayed to nearly nothing while a small
-    // deltaX remains, and each one alone looks horizontal.
-    if (swipe.axis === 'undecided') {
-      if (Math.max(swipe.travelX, swipe.travelY) < SWIPE_AXIS_LOCK_PX) return;
-      swipe.axis =
-        swipe.travelX > swipe.travelY * SWIPE_AXIS_RATIO ? 'horizontal' : 'vertical';
-    }
-    // A vertical gesture keeps scrolling the list for the rest of its life.
-    if (swipe.axis === 'vertical') return;
-
-    event.preventDefault();
-    // Swiping left reports a positive deltaX, so the row follows the fingers.
-    swipe.offset = Math.max(
-      -SWIPE_MAX_OFFSET_PX,
-      Math.min(SWIPE_MAX_OFFSET_PX, swipe.offset - event.deltaX)
-    );
-    scheduleSwipePaint();
-
-    // Decisive: act now. Nothing is learned by waiting for a gesture this far in.
-    if (Math.abs(swipe.offset) >= SWIPE_COMMIT_PX) {
-      endSwipeGesture();
-      return;
-    }
-
-    // Only these two ever reach Svelte, and only when they actually flip.
-    const side = swipe.offset < 0 ? 'left' : 'right';
-    if (side !== swipeSide) swipeSide = side;
-    const armed = Math.abs(swipe.offset) >= SWIPE_TRIGGER_PX;
-    if (armed !== swipeArmed) swipeArmed = armed;
-    armSwipeTimer();
   }
 
   function accountFor(accountId: string): AccountSummary | undefined {
@@ -1922,327 +1527,38 @@
     </section>
   {:else if mailbox}
     {#if settingsOpen}
-      <section class="settings-screen" data-testid="settings-screen" data-section={settingsSection}>
-        <nav class="settings-nav" aria-label="Settings sections">
-          <button class="settings-back" type="button" title="Back to mail (Esc)" data-testid="settings-close" on:click={closeSettings}>
-            <span aria-hidden="true"><Icon name="chevron" size={15} /></span>Back to mail
-          </button>
-          <h1>Settings</h1>
-          {#each settingsSections as section}
-            <button
-              class:is-active={settingsSection === section.id}
-              type="button"
-              data-section={section.id}
-              aria-current={settingsSection === section.id ? 'page' : undefined}
-              on:click={() => { settingsSection = section.id; clearSettingsFeedback(); }}
-            >{section.title}</button>
-          {/each}
-        </nav>
-
-        <div class="settings-body">
-          {#if settingsSection === 'accounts'}
-            <header class="settings-heading">
-              <h2>Accounts</h2>
-              <p>Mux keeps each account's sign-in in your Mac's keychain, so it is ready whenever you are.</p>
-            </header>
-
-            {#if mailbox.accounts.length}
-              <ul class="settings-account-list">
-                {#each mailbox.accounts as account (account.id)}
-                  <li>
-                    <div class="settings-account-head">
-                      <span class="settings-account-dot" style:--avatar-color={account.color}></span>
-                      <span><strong>{account.name}</strong><small>{account.email}</small></span>
-                      <em>{account.total} messages</em>
-                    </div>
-                    <div class="settings-account-refresh">
-                      <span>Check for new mail</span>
-                      <button
-                        class="settings-sync-now"
-                        type="button"
-                        data-action="sync-now"
-                        data-account-id={account.id}
-                        title={`Check ${account.name} for new mail right now`}
-                        disabled={syncingAccounts.includes(account.id)}
-                        on:click={() => syncAccountNow(account.id, account.name)}
-                      >{syncingAccounts.includes(account.id) ? 'Checking…' : 'Sync now'}</button>
-                      <div class="settings-choice-row" role="group" aria-label={`Refresh interval for ${account.name}`} data-testid="refresh-interval" data-account-id={account.id}>
-                        {#each refreshChoices as choice}
-                          <button
-                            class:is-active={account.refreshSeconds === choice.value}
-                            type="button"
-                            on:click={() => setAccountRefresh(account.id, choice.value)}
-                          >{choice.label}</button>
-                        {/each}
-                      </div>
-                    </div>
-                  </li>
-                {/each}
-              </ul>
-            {:else}
-              <p class="settings-empty">No accounts yet.</p>
-            {/if}
-
-            <section class="settings-card">
-              <h3>Add another account</h3>
-              <p class="settings-hint">
-                {mailbox.accounts.length === 1
-                  ? 'Your account above is already connected and syncing. This adds a second mailbox.'
-                  : 'Connect an additional mailbox alongside the ones above.'}
-              </p>
-              <div class="provider-card" aria-labelledby="gmail-connect-title">
-                <div>
-                  <h3 id="gmail-connect-title">Gmail</h3>
-                  <p>Sign in through your browser. Mux never sees your Google password.</p>
-                </div>
-                {#if gmailOAuthBusy}
-                  <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
-                {:else}
-                  <button class="primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Add Gmail account</button>
-                {/if}
-              </div>
-            </section>
-          {:else if settingsSection === 'appearance'}
-            <header class="settings-heading">
-              <h2>Appearance</h2>
-              <p>Mux follows this choice on every launch.</p>
-            </header>
-            <section class="settings-card">
-              <h3>Theme</h3>
-              <div class="settings-choice-row" role="group" aria-label="Theme">
-              <button class:is-active={theme === 'light'} type="button" data-action="theme-light" title="Use the light appearance" on:click={() => setTheme('light')}>
-                <span aria-hidden="true"><Icon name="sun" size={16} /></span>Light
-              </button>
-                <button class:is-active={theme === 'dark'} type="button" data-action="theme-dark" title="Use the dark appearance" on:click={() => setTheme('dark')}>
-                  <span aria-hidden="true"><Icon name="moon" size={16} /></span>Dark
-                </button>
-              </div>
-            </section>
-
-            <section class="settings-card">
-              <h3>Text and typeface</h3>
-              <p class="settings-hint">Scales the whole interface, not only message text.</p>
-              <div class="settings-choice-row" role="group" aria-label="Text size" data-testid="text-size">
-              {#each textSizes as size}
-                <button
-                  class:is-active={appearance.scale === size.value}
-                  type="button"
-                  on:click={() => applyAppearance({ ...appearance, scale: size.value })}
-                >{size.label}</button>
-              {/each}
-            </div>
-
-              <div class="settings-choice-row settings-choice-spaced" role="group" aria-label="Typeface" data-testid="typeface">
-              {#each fontChoices as choice}
-                <button
-                  class:is-active={appearance.font === choice.value}
-                  type="button"
-                  style:font-family={choice.value}
-                  on:click={() => { customFont = ''; applyAppearance({ ...appearance, font: choice.value }); }}
-                >{choice.label}</button>
-              {/each}
-            </div>
-            <label class="settings-inline-field">
-              <span>Or name a font installed on this Mac</span>
-              <input
-                bind:value={customFont}
-                data-testid="custom-font"
-                placeholder="Iosevka"
-                spellcheck="false"
-                on:change={() => applyAppearance({ ...appearance, font: customFont.trim() || DEFAULT_FONT })}
-              />
-            </label>
-
-            </section>
-
-            <section class="settings-card">
-              <h3>Thread actions</h3>
-              <p class="settings-hint">What the buttons above a conversation show.</p>
-              <div class="settings-toggle-row" data-testid="toolbar-display">
-              <label><input type="checkbox" bind:checked={appearance.toolbarIcons} on:change={() => applyAppearance(appearance)} /><span>Icon</span></label>
-              <label><input type="checkbox" bind:checked={appearance.toolbarText} on:change={() => applyAppearance(appearance)} /><span>Text</span></label>
-              <label><input type="checkbox" bind:checked={appearance.toolbarShortcuts} on:change={() => applyAppearance(appearance)} /><span>Key shortcut</span></label>
-              <label><input type="checkbox" bind:checked={appearance.toolbarCollapseNarrow} on:change={() => applyAppearance(appearance)} /><span>Collapse to icons on narrow screens</span></label>
-              <label><input type="checkbox" bind:checked={appearance.railPreview} on:change={() => applyAppearance(appearance)} /><span>Preview a message when hovering its dot</span></label>
-            </div>
-
-            </section>
-
-            <section class="settings-card">
-              <h3>Swipe actions</h3>
-              <p class="settings-hint">Drag a conversation sideways in the list.</p>
-            <label class="settings-inline-field">
-              <span>Swipe left</span>
-              <select bind:value={appearance.swipeLeft} data-testid="swipe-left" on:change={() => applyAppearance(appearance)}>
-                {#each swipeChoices as choice}<option value={choice.value}>{choice.label}</option>{/each}
-              </select>
-            </label>
-            <label class="settings-inline-field">
-              <span>Swipe right</span>
-              <select bind:value={appearance.swipeRight} data-testid="swipe-right" on:change={() => applyAppearance(appearance)}>
-                {#each swipeChoices as choice}<option value={choice.value}>{choice.label}</option>{/each}
-              </select>
-            </label>
-
-            </section>
-
-            <section class="settings-card">
-              <h3>Density</h3>
-              <div class="settings-choice-row" role="group" aria-label="Density" data-testid="density">
-              {#each densityChoices as choice}
-                <button
-                  class:is-active={appearance.density === choice.value}
-                  type="button"
-                  data-density-option={choice.value}
-                  on:click={() => applyAppearance({ ...appearance, density: choice.value })}
-                >{choice.label}</button>
-              {/each}
-              </div>
-            </section>
-          {:else if settingsSection === 'mail'}
-            <header class="settings-heading">
-              <h2>Mail</h2>
-              <p>Mux keeps a copy of your mail on this Mac so it opens instantly.</p>
-            </header>
-            <section class="settings-card">
-              <h3>Re-download all mail</h3>
-              <p>Fetches every message from your provider again and refreshes the local copy in place. Nothing is removed, here or on the server. Useful if a message looks wrong or incomplete.</p>
-              <div class="settings-actions">
-                <button class="primary-button" type="button" data-action="resync-all" title="Re-download every message from your provider" data-testid="resync-all" disabled={settingsBusy || resyncBusy || gmailOAuthBusy} on:click={resyncAllMail}>{resyncBusy ? 'Re-downloading…' : 'Re-download all mail'}</button>
-              </div>
-            </section>
-          {:else}
-            <header class="settings-heading">
-              <h2>Shortcuts</h2>
-              <p>These work whenever the message list has focus.</p>
-            </header>
-            <section class="settings-card">
-              <ul class="settings-shortcut-list">
-              {#each shortcutReference as row}
-                <li><kbd>{row.keys}</kbd><span>{row.action}</span></li>
-                {/each}
-              </ul>
-            </section>
-          {/if}
-
-          {#if settingsError}<p class="settings-feedback has-error" role="alert">{settingsError}</p>{/if}
-          {#if settingsMessage}<p class="settings-feedback" role="status">{settingsMessage}</p>{/if}
-        </div>
-      </section>
+      <SettingsScreen
+        bind:this={settingsScreen}
+        {mailbox}
+        {appearance}
+        {theme}
+        {applyAppearance}
+        {setTheme}
+        refreshMailbox={() => refreshMailbox()}
+        close={closeSettings}
+      />
     {:else}
       <div class="workspace-grid" data-testid="mailbox-workspace" inert={blockingDialogOpen}>
-        <nav
-          id="native-navigation"
-          class="sidebar"
-          aria-label="Mailbox navigation"
-          aria-hidden={compactNavigation && !navigationOpen}
-          inert={compactNavigation && !navigationOpen}
-          data-testid="mailbox-navigation"
-        >
-          <button class="compose" data-action="compose" title="Compose a message (C)" data-testid="compose-button" on:click={() => openComposer()}>
-            <Icon name="compose" size={18} /> Compose
-          </button>
-
-          <section class="nav-section">
-            <button class:is-active={selectedView === 'inbox'} data-action="view-inbox" title="Inbox" on:click={() => selectView('inbox')}>
-              <span class="nav-icon"><Icon name="inbox" size={17} /></span><strong>Inbox</strong>
-              <em>{selectedCounts.inbox}</em>
-            </button>
-            <button class:is-active={selectedView === 'starred'} data-action="view-starred" title="Starred conversations" on:click={() => selectView('starred')}>
-              <span class="nav-icon"><Icon name="star" size={17} /></span><strong>Starred</strong>
-              <em>{selectedCounts.starred}</em>
-            </button>
-            <button class:is-active={selectedView === 'snoozed' && !selectedSmartView} data-action="view-snoozed" title="Snoozed conversations" on:click={() => selectView('snoozed')}>
-              <span class="nav-icon"><Icon name="clock" size={17} /></span><strong>Snoozed</strong>
-              <em>{selectedCounts.snoozed}</em>
-            </button>
-            <button class:is-active={selectedView === 'sent'} data-action="view-sent" title="Sent mail" on:click={() => selectView('sent')}>
-              <span class="nav-icon"><Icon name="sent" size={17} /></span><strong>Sent</strong>
-              <em>{selectedCounts.sent}</em>
-            </button>
-            <button class:is-active={selectedView === 'drafts'} data-action="view-drafts" title="Local drafts" on:click={() => selectView('drafts')}>
-              <span class="nav-icon"><Icon name="drafts" size={17} /></span><strong>Drafts</strong>
-              <em>{mailbox.drafts.filter((draft) => selectedAccount === null || draft.accountId === selectedAccount).length}</em>
-            </button>
-            <button class:is-active={selectedView === 'archive'} data-action="view-archive" title="Archived conversations" on:click={() => selectView('archive')}>
-              <span class="nav-icon"><Icon name="archive" size={17} /></span><strong>Archive</strong>
-              <em>{selectedCounts.archive}</em>
-            </button>
-            <button class:is-active={selectedView === 'trash'} data-action="view-trash" title="Trash" on:click={() => selectView('trash')}>
-              <span class="nav-icon"><Icon name="trash" size={17} /></span><strong>Trash</strong>
-              <em>{selectedCounts.trash}</em>
-            </button>
-            <button class:is-active={selectedView === 'all' && !selectedSmartView && !filter} data-action="view-all" title="All mail" on:click={() => selectView('all')}>
-              <span class="nav-icon"><Icon name="allMail" size={17} /></span><strong>All mail</strong>
-              <em>{selectedCounts.all}</em>
-            </button>
-          </section>
-
-          <p class="section-label">Smart views</p>
-          <section class="smart-views">
-            <button class:is-active={selectedSmartView === 'unread'} data-action="smart-unread" title="Unread conversations" on:click={() => selectSmartView('unread', 'is:unread')}>
-              <span class="smart-dot blue"></span><span>Unread</span>
-            </button>
-            <button class:is-active={selectedSmartView === 'attachments'} data-action="smart-attachments" title="Conversations with attachments" on:click={() => selectSmartView('attachments', 'has:attachment')}>
-              <span class="smart-dot violet"></span><span>Attachments</span>
-            </button>
-            <button class:is-active={selectedSmartView === 'invitations'} data-action="smart-invitations" title="Conversations with invitations" on:click={() => selectSmartView('invitations', 'has:invite')}>
-              <span class="smart-dot green"></span><span>Invitations</span>
-            </button>
-            <button class:is-active={selectedSmartView === 'finance'} data-action="smart-finance" title="Finance conversations" on:click={() => selectSmartView('finance', 'category:Finance')}>
-              <span class="smart-dot amber"></span><span>Finance</span>
-            </button>
-          </section>
-
-          <p class="section-label">Accounts</p>
-          <section class="accounts">
-            <button class:is-active={selectedAccount === null} data-action="account-all" title="Show every account together" on:click={() => selectAccount(null)}>
-              <span class="account-dot all"></span><span>All accounts</span>
-              <em>{mailbox.accounts.reduce((total, account) => total + account.unread, 0)}</em>
-            </button>
-            {#each mailbox.accounts as account}
-              {@const hidden = hiddenAccounts.includes(account.id)}
-              <div class="account-row" class:is-hidden={hidden}>
-                <button
-                  class="account-visibility"
-                  type="button"
-                  data-action="toggle-account-visibility"
-                  data-account-id={account.id}
-                  aria-pressed={!hidden}
-                  title={hidden ? `Show ${account.name}` : `Hide ${account.name}`}
-                  aria-label={hidden ? `Show ${account.name}` : `Hide ${account.name}`}
-                  on:click={() => toggleAccountVisibility(account.id)}
-                >
-                  <span class="account-dot" style:background={account.color}></span>
-                </button>
-                <button
-                  class="account-select"
-                  class:is-active={selectedAccount === account.id}
-                  type="button"
-                  data-action="select-account" title={`Show only ${account.name}`}
-                  data-account-id={account.id}
-                  on:click={() => selectAccount(account.id)}
-                >
-                  <span>{account.name}</span>
-                  <em>{account.unread}</em>
-                </button>
-              </div>
-            {/each}
-          </section>
-
-          <button class="settings-button" type="button" data-action="open-settings" title="Settings (⌘,)" on:click={() => openSettings()}>
-            <span class="nav-icon"><Icon name="settings" size={16} /></span><strong>Settings</strong>
-            <kbd>⌘,</kbd>
-          </button>
-
-          <button class="projection-status" type="button" data-action="open-activity" title="Open the local operation journal" on:click={openActivity} aria-haspopup="dialog">
-            <span class:has-error={Boolean(threadError) || !mailboxEventsAvailable}></span>
-            <div>
-              <strong>{threadError ? 'Mailbox needs attention' : mailboxEventsAvailable ? 'Up to date' : 'Refreshes on focus'}</strong>
-              <small>{threadError || (mailboxEventsAvailable ? 'Changes save on this Mac' : 'Live updates are unavailable')}</small>
-            </div>
-          </button>
-        </nav>
+        <MailboxSidebar
+          {mailbox}
+          counts={selectedCounts}
+          {selectedView}
+          {selectedSmartView}
+          {selectedAccount}
+          {hiddenAccounts}
+          {filter}
+          collapsed={compactNavigation}
+          open={navigationOpen}
+          statusError={threadError}
+          liveUpdates={mailboxEventsAvailable}
+          compose={() => openComposer()}
+          {selectView}
+          {selectSmartView}
+          {selectAccount}
+          {toggleAccountVisibility}
+          openSettings={() => openSettings()}
+          {openActivity}
+        />
 
         <section class="thread-pane" aria-label={viewTitle}>
           <header class="pane-heading">
@@ -2276,14 +1592,21 @@
                 <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(-1)}>Show previous loaded threads</button>
               {/if}
               {#each renderedThreadWindow.rows as thread (thread.id)}
-                {@const swiping = swipeThreadId === thread.id}
+                {@const swiping = swipeRow === thread.id}
                 {@const pending = swiping
                   ? swipeIntent(thread, swipeSide === 'left' ? appearance.swipeLeft : appearance.swipeRight)
                   : null}
                 <div
                   class="thread-swipe"
                   class:is-swiping={swiping}
-                  on:wheel|nonpassive={(event) => swipeWheel(event, thread)}
+                  use:swipeGesture={{
+                    enabled: appearance.swipeLeft !== 'none' || appearance.swipeRight !== 'none',
+                    onstate: swipeStateFor(thread),
+                    oncommit: (side) => runSwipeAction(
+                      thread,
+                      side === 'left' ? appearance.swipeLeft : appearance.swipeRight
+                    )
+                  }}
                 >
                   {#if swiping && pending}
                     <div

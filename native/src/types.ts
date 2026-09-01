@@ -214,3 +214,9 @@ export type SearchPage = {
   hasMore: boolean;
   nextCursor: string | null;
 };
+
+export type Theme = 'light' | 'dark';
+export type SettingsSection = 'accounts' | 'appearance' | 'mail' | 'shortcuts';
+
+export type MailboxView = 'all' | 'inbox' | 'archive' | 'starred' | 'snoozed' | 'sent' | 'trash' | 'drafts';
+export type SmartView = '' | 'unread' | 'attachments' | 'invitations' | 'finance';
