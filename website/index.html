@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mux — a local-first mail client for macOS</title>
+  <meta name="description"
+    content="Mux stores your mail in a SQLite database on your own Mac and syncs it with Gmail over Google's API.">
+  <style>
+    :root {
+      --bg: #f4f5f8;
+      --surface: #ffffff;
+      --surface-muted: #f7f8fb;
+      --border: #e4e7ee;
+      --border-strong: #d8dce6;
+      --text: #171a23;
+      --text-soft: #5f6675;
+      --text-faint: #8a91a0;
+      --accent: #4c63ee;
+      --accent-strong: #364de0;
+      --accent-soft: #eef0ff;
+      --radius: 16px;
+      --font: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.6;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .wrap {
+      width: min(1080px, 100% - 40px);
+      margin-inline: auto;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--text-faint);
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 64px 0 72px;
+      color: #f0f3f8;
+      background: radial-gradient(1100px 460px at 18% -8%, #2b3566 0%, transparent 62%), linear-gradient(160deg, #12151f 0%, #0b0d14 70%);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin-bottom: 32px;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, #6274ff, #4a5de8);
+      box-shadow: 0 6px 20px rgba(76, 99, 238, .4);
+    }
+
+    .brand-name {
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: -.01em;
+    }
+
+    .pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin: 0 0 20px;
+      padding: 0;
+      list-style: none;
+    }
+
+    .pills li {
+      padding: 4px 11px;
+      border: 1px solid rgba(255, 255, 255, .17);
+      border-radius: 999px;
+      color: #cfd6e6;
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    h1 {
+      max-width: 17ch;
+      margin: 0 0 16px;
+      font-size: clamp(34px, 6vw, 54px);
+      font-weight: 820;
+      line-height: 1.05;
+      letter-spacing: -.03em;
+    }
+
+    .lede {
+      max-width: 56ch;
+      margin: 0 0 22px;
+      color: #b9c2d4;
+      font-size: clamp(15px, 2vw, 17px);
+    }
+
+    .status {
+      margin: 0;
+      color: #8d97ab;
+      font-size: 12.5px;
+    }
+
+    section {
+      padding: 62px 0;
+    }
+
+    .band {
+      background: var(--surface);
+      border-block: 1px solid var(--border);
+    }
+
+    .section-head {
+      max-width: 60ch;
+      margin-bottom: 30px;
+    }
+
+    .section-head h2 {
+      margin: 0 0 8px;
+      font-size: clamp(23px, 3.4vw, 29px);
+      font-weight: 780;
+      letter-spacing: -.02em;
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--text-soft);
+      font-size: 15px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+
+    .card {
+      padding: 22px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .card h3 {
+      margin: 0 0 7px;
+      font-size: 15px;
+      font-weight: 740;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--text-soft);
+      font-size: 13.5px;
+    }
+
+    .tag {
+      display: inline-block;
+      margin-left: 7px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: var(--surface-muted);
+      color: var(--text-faint);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      vertical-align: 2px;
+    }
+
+    /* ---------- screenshots ---------- */
+    .shots {
+      display: grid;
+      gap: 26px;
+      grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr);
+      align-items: start;
+    }
+
+    @media (max-width: 900px) {
+      .shots {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    figure {
+      margin: 0 0 26px;
+    }
+
+    figure:last-child {
+      margin-bottom: 0;
+    }
+
+    figcaption {
+      margin-top: 11px;
+      color: var(--text-faint);
+      font-size: 12px;
+    }
+
+    .shot {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      box-shadow: 0 22px 60px rgba(18, 25, 45, .15);
+    }
+
+    .rows {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--surface);
+    }
+
+    .rows li {
+      padding: 15px 20px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-soft);
+      font-size: 13.5px;
+    }
+
+    .rows li:last-child {
+      border-bottom: 0;
+    }
+
+    .rows b {
+      color: var(--text);
+      font-weight: 730;
+    }
+
+    .facts {
+      display: grid;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--surface);
+    }
+
+    .fact {
+      display: grid;
+      grid-template-columns: 200px minmax(0, 1fr);
+      gap: 18px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .fact:last-child {
+      border-bottom: 0;
+    }
+
+    @media (max-width: 700px) {
+      .fact {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 4px;
+      }
+    }
+
+    .fact dt {
+      color: var(--text);
+      font-size: 13.5px;
+      font-weight: 730;
+    }
+
+    .fact dd {
+      margin: 0;
+      color: var(--text-soft);
+      font-size: 13.5px;
+    }
+
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: var(--surface-muted);
+      font-family: var(--mono);
+      font-size: .9em;
+    }
+
+    footer {
+      padding: 34px 0 50px;
+      border-top: 1px solid var(--border);
+      color: var(--text-faint);
+      font-size: 12.5px;
+    }
+
+    footer p {
+      margin: 0;
+    }
+
+    .goal {
+      max-width: 60ch;
+      margin: 26px 0 0;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -.01em;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0c0f15;
+        --surface: #11151d;
+        --surface-muted: #151a23;
+        --border: #242b38;
+        --border-strong: #313a49;
+        --text: #f0f3f8;
+        --text-soft: #a8b0bf;
+        --text-faint: #737d8f;
+        --accent: #7d8cff;
+        --accent-strong: #94a0ff;
+        --accent-soft: #222a48;
+      }
+
+      .shot {
+        box-shadow: 0 22px 60px rgba(0, 0, 0, .5);
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <header class="hero">
+    <div class="wrap">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2.5" y="5" width="19" height="14" rx="3"></rect>
+            <path d="M3.5 7.5 12 13l8.5-5.5"></path>
+          </svg>
+        </span>
+        <span class="brand-name">Mux</span>
+      </div>
+
+      <ul class="pills">
+        <li>macOS</li>
+        <li>Android <span class="tag">planned</span></li>
+        <li>Windows <span class="tag">planned</span></li>
+      </ul>
+
+      <h1>A high-efficiency inbox that is not super ugly.</h1>
+      <p class="lede">
+        Mux is a free, open-source, not-hideous mail client. Its key features are (1) not bad, and (2) not ugly.
+      </p>
+    </div>
+  </header>
+
+  <section class="band">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>I made mux because all of the current options are kinda sucky.</h2>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>Webmail</h3>
+          <p>Ads. Tracking. Vendor lock-in. No offline access.</p>
+        </div>
+        <div class="card">
+          <h3>Aging open-source clients</h3>
+          <p>Archaic looks, atrocious UX. Did my best to love them but alas</p>
+        </div>
+        <div class="card">
+          <h3>Premium clients</h3>
+          <p>Subscription fees to read your own email: literally lol, lmao even</p>
+        </div>
+      </div>
+      <p class="goal">Mux is the fourth option. FOSS, beautiful, no sucky subscription fees.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Mux doesn't suck, and moreover, it's actually kinda nice:</h2>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h3>Local-first</h3>
+          <p>Reading, searching, and sorting never hit the network, so they can operate fast and offline. And you can
+            queue messages for delivery when you reconnect.</p>
+        </div>
+        <div class="card">
+          <h3>Every inbox in one place</h3>
+          <p>Multi-account with a unified inbox, and per-account accent colors so you always know
+            which account you are in.</p>
+        </div>
+        <div class="card">
+          <h3>Bring your own AI</h3>
+          <p>If you want a model in your mail, you can BYO, and Mux will (optionally) cap its authority (i.e., read but
+            no send).
+            If you don't, there is no forced AI in Mux.</p>
+        </div>
+        <div class="card">
+          <h3>Keyboard shortcuts, keyboard shortcuts!!</h3>
+          <p><code>j</code>/<code>k</code> to move, Enter to open, <code>⌘F</code> to search,
+            <code>⌘P</code> for the palette. Et cetera, and so on. (All customizable)
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Mux on macOS (with dumb AI slop threads but you get the idea)</h2>
+      </div>
+      <div class="shots">
+        <figure>
+          <img class="shot" src="images/mux-desktop.jpg" width="1500" height="932"
+            alt="Mux showing an account sidebar, a thread list, and a four-message conversation open in the reader">
+          <figcaption>The inbox with a thread open. Earlier already-read messages collapse.
+          </figcaption>
+        </figure>
+        <figure>
+          <img class="shot" src="images/mux-narrow.jpg" width="620" height="1055" loading="lazy"
+            alt="Mux in a narrow window with the thread list as a single column">
+          <figcaption> </figcaption>
+        </figure>
+      </div>
+
+      <figure>
+        <img class="shot" src="images/mux-blocked.jpg" width="1500" height="938" loading="lazy"
+          alt="An HTML message from a shop rendered in Mux, with its two remote images counted and unfetched">
+        <figcaption>Mux doesn't load remote resources unless you give the goahead.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="band">
+    <div class="wrap">
+      <p class="eyebrow">Details</p>
+      <div class="section-head">
+        <h2>The rest of it</h2>
+      </div>
+      <ul class="rows">
+        <li><b>Threading with a chat-style thread view.</b> Quoted replies and signatures fold
+          away, which makes inbox zero a lot less work.</li>
+        <li><b>Remote images loaded only with permission.</b> No tracking by default; enable
+          images and entire domains if you like ’em!</li>
+        <li><b>Sophisticated search.</b> Boolean operators, field filters, and
+          natural-language dates: <code>from:jordan AND (since:1y OR is:starred)</code>.</li>
+        <li><b>Snooze, undo-send, and an outbox queue.</b> Push a thread to later, take
+          back a send, and let queued actions retry with backoff.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="privacy">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Why is Mux a Tauri2 app?</h2>
+      </div>
+      I tried writing Mux in a native framework but ultimately, email is HTML and needs an HTML renderer. So I could
+      either ship a flutter/etc app <i>and</i> a web renderer, or just a web renderer. So here we are.
+  </section>
+
+  <section id="privacy">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>How Mux shares your data</h2>
+      </div>
+
+      <a href="privacy/">doesn't</a>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <p>Mux — a local-first mail client for macOS. <a href="privacy/">Privacy</a>. <a
+          href="https://github.com/j6k4m8/mux">Source on GitHub</a>.</p>
+    </div>
+  </footer>
+
+</body>
+
+</html>
