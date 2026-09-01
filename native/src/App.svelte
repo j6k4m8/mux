@@ -1608,13 +1608,116 @@
   /// Two-finger horizontal swipe on a thread row. A pointer drag cannot leave the
   /// list without losing the gesture, so this reads wheel deltas instead: macOS
   /// reports a trackpad swipe as horizontal wheel movement.
-  const SWIPE_TRIGGER_PX = 90;
-  /// A gesture ends after this much quiet, so one swipe fires one action.
-  const SWIPE_IDLE_MS = 180;
+  const SWIPE_TRIGGER_PX = 110;
+  /// Dragged this far, the gesture is not ambiguous, so it commits at once
+  /// rather than waiting to confirm the fingers have lifted. Waiting is only
+  /// worth it for a swipe that stopped somewhere undecided.
+  const SWIPE_COMMIT_PX = 158;
+  /// How far the row can travel. Comfortably past the decisive distance, so a
+  /// firm swipe reaches it before running out of room.
+  const SWIPE_MAX_OFFSET_PX = 170;
+  /// Travel before a gesture commits to an axis. Below this it could still be
+  /// either, so nothing is decided and nothing moves.
+  const SWIPE_AXIS_LOCK_PX = 14;
+  /// How much more horizontal than vertical a gesture must be to count as a
+  /// swipe. Scrolling a list is rarely this lopsided.
+  const SWIPE_AXIS_RATIO = 1.6;
+  /// Quiet before a gesture with nothing left to protect settles: one already
+  /// past the trigger, or one that turned out to be a scroll.
+  const SWIPE_SETTLE_MS = 200;
+  /// The longest a partial swipe waits before sliding back. A fixed value cannot
+  /// work: long enough to survive a slow drag is long enough to hang after the
+  /// fingers lift, so the wait is measured from the drag's own rhythm.
+  const SWIPE_MAX_QUIET_MS = 450;
+  const SWIPE_QUIET_INTERVALS = 2.5;
+
+  /// Continuous gesture state, deliberately outside Svelte's reactivity. Wheel
+  /// events arrive up to 120 times a second, and assigning a reactive variable
+  /// on each one invalidates this component: the whole thread list re-runs, and
+  /// every rendered row rebuilds its labels, icon, and title string. That work
+  /// is what made the row lag behind the fingers. The offset is written straight
+  /// to the DOM instead, once per frame.
+  const swipe = {
+    node: null as HTMLElement | null,
+    offset: 0,
+    axis: 'undecided' as 'undecided' | 'horizontal' | 'vertical',
+    travelX: 0,
+    travelY: 0,
+    gapMs: 0,
+    lastAt: 0,
+    frame: 0,
+    timer: undefined as number | undefined
+  };
+
+  /// The only swipe state Svelte sees. Each changes a couple of times per
+  /// gesture rather than a couple of times per frame.
   let swipeThreadId: number | null = null;
-  let swipeOffset = 0;
-  let swipeFired = false;
-  let swipeIdleTimer: number | undefined;
+  let swipeSide: 'left' | 'right' = 'left';
+  let swipeArmed = false;
+
+  function paintSwipe() {
+    swipe.frame = 0;
+    swipe.node?.style.setProperty('--swipe-offset', `${swipe.offset}px`);
+  }
+
+  function scheduleSwipePaint() {
+    if (typeof requestAnimationFrame !== 'function') {
+      paintSwipe();
+      return;
+    }
+    // Several wheel events can land in one frame; the row only needs moving once.
+    if (!swipe.frame) swipe.frame = requestAnimationFrame(paintSwipe);
+  }
+
+  function resetSwipe() {
+    window.clearTimeout(swipe.timer);
+    if (swipe.frame && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(swipe.frame);
+    }
+    // Dropping the property lets the row animate home under its own transition.
+    swipe.node?.style.removeProperty('--swipe-offset');
+    swipe.node = null;
+    swipe.offset = 0;
+    swipe.axis = 'undecided';
+    swipe.travelX = 0;
+    swipe.travelY = 0;
+    swipe.gapMs = 0;
+    swipe.lastAt = 0;
+    swipe.frame = 0;
+    swipe.timer = undefined;
+    swipeThreadId = null;
+    swipeArmed = false;
+  }
+
+  /// A trackpad gesture has no lift event, so the end of one is the moment the
+  /// wheel events stop. The action commits here rather than the instant the row
+  /// crosses the trigger, so a swipe can be taken back by swiping it back.
+  function endSwipeGesture() {
+    const offset = swipe.offset;
+    const axis = swipe.axis;
+    const threadId = swipeThreadId;
+    resetSwipe();
+    if (axis !== 'horizontal' || threadId === null) return;
+    if (Math.abs(offset) < SWIPE_TRIGGER_PX) return;
+    // Resolved now rather than captured, so a refresh mid-gesture cannot act on
+    // a stale copy of the row.
+    const thread = visibleThreads.find((row) => row.id === threadId);
+    if (!thread) return;
+    runSwipeAction(thread, offset < 0 ? appearance.swipeLeft : appearance.swipeRight);
+  }
+
+  function armSwipeTimer() {
+    const armed = swipe.axis === 'horizontal' && Math.abs(swipe.offset) >= SWIPE_TRIGGER_PX;
+    // Until an interval has been measured, assume a slow drag. Guessing fast
+    // would end the gesture before its second event arrived.
+    const paced = swipe.gapMs ? swipe.gapMs * SWIPE_QUIET_INTERVALS : SWIPE_MAX_QUIET_MS;
+    const quiet =
+      armed || swipe.axis !== 'horizontal'
+        ? SWIPE_SETTLE_MS
+        : Math.min(SWIPE_MAX_QUIET_MS, Math.max(SWIPE_SETTLE_MS, paced));
+    window.clearTimeout(swipe.timer);
+    swipe.timer = window.setTimeout(endSwipeGesture, quiet);
+  }
 
   function swipeIntent(
     thread: ThreadSummary,
@@ -1664,32 +1767,64 @@
     void applyThreadAction('delete', 'Moved to Trash', thread);
   }
 
-  function resetSwipe() {
-    swipeThreadId = null;
-    swipeOffset = 0;
-    swipeFired = false;
-  }
-
   function swipeWheel(event: WheelEvent, thread: ThreadSummary) {
-    // Vertical intent keeps scrolling the list.
-    if (Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
     if (appearance.swipeLeft === 'none' && appearance.swipeRight === 'none') return;
-    event.preventDefault();
-    if (swipeThreadId !== thread.id) {
+
+    if (swipeThreadId === null) {
+      resetSwipe();
       swipeThreadId = thread.id;
-      swipeOffset = 0;
-      swipeFired = false;
+      // The wrapper, not the row: the row slides out from under the pointer.
+      swipe.node = event.currentTarget as HTMLElement;
     }
-    window.clearTimeout(swipeIdleTimer);
-    swipeIdleTimer = window.setTimeout(resetSwipe, SWIPE_IDLE_MS);
-    if (swipeFired) return;
+
+    // A drag's own rhythm is the only thing separating "still moving slowly"
+    // from "let go", so the interval between events is smoothed and reused.
+    const at = typeof performance === 'object' ? performance.now() : Date.now();
+    if (swipe.lastAt) {
+      const gap = at - swipe.lastAt;
+      swipe.gapMs = swipe.gapMs ? swipe.gapMs * 0.7 + gap * 0.3 : gap;
+    }
+    swipe.lastAt = at;
+    // Every wheel event keeps the live gesture alive, whichever row it came
+    // from, so a row sliding sideways under the cursor cannot end it.
+    armSwipeTimer();
+    if (swipeThreadId !== thread.id) return;
+
+    swipe.travelX += Math.abs(event.deltaX);
+    swipe.travelY += Math.abs(event.deltaY);
+
+    // The axis is decided once per gesture from accumulated travel. Deciding it
+    // per event reads momentum as a swipe: after a vertical flick macOS keeps
+    // sending events whose deltaY has decayed to nearly nothing while a small
+    // deltaX remains, and each one alone looks horizontal.
+    if (swipe.axis === 'undecided') {
+      if (Math.max(swipe.travelX, swipe.travelY) < SWIPE_AXIS_LOCK_PX) return;
+      swipe.axis =
+        swipe.travelX > swipe.travelY * SWIPE_AXIS_RATIO ? 'horizontal' : 'vertical';
+    }
+    // A vertical gesture keeps scrolling the list for the rest of its life.
+    if (swipe.axis === 'vertical') return;
+
+    event.preventDefault();
     // Swiping left reports a positive deltaX, so the row follows the fingers.
-    swipeOffset = Math.max(-160, Math.min(160, swipeOffset - event.deltaX));
-    if (Math.abs(swipeOffset) < SWIPE_TRIGGER_PX) return;
-    swipeFired = true;
-    const action = swipeOffset < 0 ? appearance.swipeLeft : appearance.swipeRight;
-    swipeOffset = 0;
-    runSwipeAction(thread, action);
+    swipe.offset = Math.max(
+      -SWIPE_MAX_OFFSET_PX,
+      Math.min(SWIPE_MAX_OFFSET_PX, swipe.offset - event.deltaX)
+    );
+    scheduleSwipePaint();
+
+    // Decisive: act now. Nothing is learned by waiting for a gesture this far in.
+    if (Math.abs(swipe.offset) >= SWIPE_COMMIT_PX) {
+      endSwipeGesture();
+      return;
+    }
+
+    // Only these two ever reach Svelte, and only when they actually flip.
+    const side = swipe.offset < 0 ? 'left' : 'right';
+    if (side !== swipeSide) swipeSide = side;
+    const armed = Math.abs(swipe.offset) >= SWIPE_TRIGGER_PX;
+    if (armed !== swipeArmed) swipeArmed = armed;
+    armSwipeTimer();
   }
 
   function accountFor(accountId: string): AccountSummary | undefined {
@@ -2141,15 +2276,20 @@
                 <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(-1)}>Show previous loaded threads</button>
               {/if}
               {#each renderedThreadWindow.rows as thread (thread.id)}
-                {@const swiping = swipeThreadId === thread.id && swipeOffset !== 0}
-                {@const side = swipeOffset < 0 ? 'left' : 'right'}
-                {@const pending = swipeIntent(thread, swipeOffset < 0 ? appearance.swipeLeft : appearance.swipeRight)}
-                <div class="thread-swipe" class:is-swiping={swiping}>
+                {@const swiping = swipeThreadId === thread.id}
+                {@const pending = swiping
+                  ? swipeIntent(thread, swipeSide === 'left' ? appearance.swipeLeft : appearance.swipeRight)
+                  : null}
+                <div
+                  class="thread-swipe"
+                  class:is-swiping={swiping}
+                  on:wheel|nonpassive={(event) => swipeWheel(event, thread)}
+                >
                   {#if swiping && pending}
                     <div
                       class="thread-swipe-hint"
-                      class:is-armed={Math.abs(swipeOffset) >= SWIPE_TRIGGER_PX}
-                      data-side={side}
+                      class:is-armed={swipeArmed}
+                      data-side={swipeSide}
                       data-tone={pending.tone}
                       aria-hidden="true"
                     >
@@ -2162,12 +2302,10 @@
                   class:is-selected={thread.id === selectedThread?.id}
                   class:is-unread={thread.unread}
                   class:is-swiping={swiping}
-                  style:--swipe-offset={swipeThreadId === thread.id ? `${swipeOffset}px` : '0px'}
                   data-testid="thread-row"
                   data-thread-id={thread.id}
                   title={`${thread.subject} — swipe left to ${swipeLabel(appearance.swipeLeft).toLocaleLowerCase()}, right to ${swipeLabel(appearance.swipeRight).toLocaleLowerCase()}`}
                   on:click={() => selectThread(thread)}
-                  on:wheel|nonpassive={(event) => swipeWheel(event, thread)}
                   aria-pressed={thread.id === selectedThread?.id}
                 >
                   <span class="thread-accent" style:background={accountFor(thread.accountId)?.color}></span>

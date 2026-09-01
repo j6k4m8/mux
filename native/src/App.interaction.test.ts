@@ -456,34 +456,119 @@ describe('production mailbox interactions', () => {
     await renderMailbox();
     await waitFor(() => expect(screen.getByTestId('reader-subject')).toBeTruthy());
     const body = document.querySelector('.message-body')!;
-    // The fixture body has no HTML, so it renders through the plain-text path.
+    // This fixture arrives without HTML, so it renders through the plain-text path.
     const paragraphs = [...body.querySelectorAll('p')];
     expect(paragraphs.length).toBeGreaterThan(0);
     // No paragraph may be blank; blank runs collapse rather than stacking gaps.
     expect(paragraphs.every((node) => node.textContent!.trim().length > 0)).toBe(true);
   });
 
-  test('a trackpad swipe fires the configured action once', async () => {
+  test('a trackpad swipe fires once, and scroll momentum never fires one', async () => {
     const { calls } = await renderMailbox();
     const row = screen.getAllByTestId('thread-row')[0];
     const threadId = row.getAttribute('data-thread-id');
+    const actions = () => calls.filter((call) => call.command === 'apply_thread_action');
 
-    // Vertical intent must keep scrolling instead of swiping.
+    // A vertical flick, followed by the momentum macOS keeps sending afterwards:
+    // deltaY decays to almost nothing while a small deltaX remains, so each
+    // late event looks horizontal on its own. The gesture committed to vertical
+    // and has to stay there, or scrolling the list archives mail.
     await fireEvent.wheel(row, { deltaX: 4, deltaY: 60 });
-    expect(calls.some((call) => call.command === 'apply_thread_action')).toBe(false);
+    for (let index = 0; index < 12; index += 1) {
+      await fireEvent.wheel(row, { deltaX: 9, deltaY: 0.4 });
+    }
+    expect(actions()).toHaveLength(0);
 
-    // Short horizontal movement is below the trigger.
-    await fireEvent.wheel(row, { deltaX: 30, deltaY: 0 });
-    expect(calls.some((call) => call.command === 'apply_thread_action')).toBe(false);
+    // A gesture has to go quiet before the next one can start.
+    await new Promise((resolve) => setTimeout(resolve, 320));
 
-    // Crossing the trigger fires the left action exactly once.
-    await fireEvent.wheel(row, { deltaX: 70, deltaY: 0 });
-    await fireEvent.wheel(row, { deltaX: 70, deltaY: 0 });
+    // Horizontal, but short of the trigger.
+    await fireEvent.wheel(row, { deltaX: 40, deltaY: 0 });
+    expect(actions()).toHaveLength(0);
+
+    // A decisive swipe does not wait to confirm the fingers lifted.
+    await fireEvent.wheel(row, { deltaX: 90, deltaY: 0 });
+    await fireEvent.wheel(row, { deltaX: 90, deltaY: 0 });
+    expect(actions()).toHaveLength(1);
+    expect(actions()[0]?.payload).toEqual({ threadId: Number(threadId), action: 'archive' });
+  });
+
+  test('a swipe that stops somewhere undecided waits for the gesture to end', async () => {
+    const { calls } = await renderMailbox();
+    const row = screen.getAllByTestId('thread-row')[0];
+    const threadId = row.getAttribute('data-thread-id');
+    const actions = () => calls.filter((call) => call.command === 'apply_thread_action');
+
+    // Past the trigger but short of decisive, so it is still cancellable.
+    await fireEvent.wheel(row, { deltaX: 60, deltaY: 0 });
+    await fireEvent.wheel(row, { deltaX: 60, deltaY: 0 });
+    expect(actions()).toHaveLength(0);
+
     await waitFor(() => {
-      const actions = calls.filter((call) => call.command === 'apply_thread_action');
-      expect(actions).toHaveLength(1);
-      expect(actions[0]?.payload).toEqual({ threadId: Number(threadId), action: 'archive' });
+      expect(actions()).toHaveLength(1);
+      expect(actions()[0]?.payload).toEqual({ threadId: Number(threadId), action: 'archive' });
     });
+  });
+
+  test('a slow drag keeps its progress across gaps between events', async () => {
+    const { calls } = await renderMailbox();
+    const row = screen.getAllByTestId('thread-row')[0];
+    const threadId = row.getAttribute('data-thread-id');
+    const actions = () => calls.filter((call) => call.command === 'apply_thread_action');
+
+    // Dragging slowly means real gaps between wheel events — longer here than a
+    // gesture that is already past the trigger is given. A partial swipe has to
+    // hold what it has built up instead of sliding back between events.
+    for (let index = 0; index < 4; index += 1) {
+      await fireEvent.wheel(row, { deltaX: 30, deltaY: 0 });
+      expect(actions()).toHaveLength(0);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+
+    // Four 30px steps reach the trigger, so it commits once the drag stops.
+    await waitFor(() => {
+      expect(actions()).toHaveLength(1);
+      expect(actions()[0]?.payload).toEqual({ threadId: Number(threadId), action: 'archive' });
+    });
+  });
+
+  test('a row sliding out from under the cursor does not restart the gesture', async () => {
+    const { calls } = await renderMailbox();
+    const [first, second] = screen.getAllByTestId('thread-row');
+    const firstId = first.getAttribute('data-thread-id');
+    const actions = () => calls.filter((call) => call.command === 'apply_thread_action');
+
+    // Past the trigger on the first row, but short of committing outright.
+    await fireEvent.wheel(first, { deltaX: 60, deltaY: 0 });
+    await fireEvent.wheel(first, { deltaX: 60, deltaY: 0 });
+
+    // The row has now translated away from the pointer, so the rest of the same
+    // physical gesture lands on its neighbour. Spread over longer than the idle
+    // window, so a gesture that ignored these would have ended mid-swipe.
+    for (let index = 0; index < 4; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await fireEvent.wheel(second, { deltaX: 20, deltaY: 0 });
+    }
+    expect(actions()).toHaveLength(0);
+
+    // It commits once the gesture actually stops, and for the row it started on.
+    await waitFor(() => {
+      expect(actions()).toHaveLength(1);
+      expect(actions()[0]?.payload).toEqual({ threadId: Number(firstId), action: 'archive' });
+    });
+  });
+
+  test('a swipe taken back before the gesture ends does nothing', async () => {
+    const { calls } = await renderMailbox();
+    const row = screen.getAllByTestId('thread-row')[0];
+    const actions = () => calls.filter((call) => call.command === 'apply_thread_action');
+
+    // Past the trigger but short of decisive, then back to where it started.
+    await fireEvent.wheel(row, { deltaX: 60, deltaY: 0 });
+    await fireEvent.wheel(row, { deltaX: 60, deltaY: 0 });
+    await fireEvent.wheel(row, { deltaX: -120, deltaY: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    expect(actions()).toHaveLength(0);
   });
 
   test('sync now asks the one account and says so', async () => {
