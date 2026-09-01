@@ -870,11 +870,17 @@
     messageLoading = true;
     messageError = '';
     if (!older) {
-      selectedMessages = [];
-      selectedAttachments = [];
+      // Re-reading the thread already on screen must not blank it. Clearing
+      // here swaps in the loading placeholder and rebuilds the conversation
+      // underneath it, which reloads every message body the reader is looking
+      // at — and a background sync re-reads the open thread constantly.
+      if (loadedThreadId !== thread.id) {
+        selectedMessages = [];
+        selectedAttachments = [];
+        loadedThreadId = null;
+      }
       messageCursor = null;
       messageHasMore = false;
-      loadedThreadId = null;
     }
     try {
       const attachmentRows = new Map(
@@ -1849,7 +1855,7 @@
                   ? 'Your account above is already connected and syncing. This adds a second mailbox.'
                   : 'Connect an additional mailbox alongside the ones above.'}
               </p>
-              <div class="vault-provider-card" aria-labelledby="gmail-connect-title">
+              <div class="provider-card" aria-labelledby="gmail-connect-title">
                 <div>
                   <h3 id="gmail-connect-title">Gmail</h3>
                   <p>Sign in through your browser. Mux never sees your Google password.</p>
@@ -1857,7 +1863,7 @@
                 {#if gmailOAuthBusy}
                   <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
                 {:else}
-                  <button class="vault-primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Add Gmail account</button>
+                  <button class="primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Add Gmail account</button>
                 {/if}
               </div>
             </section>
@@ -1966,8 +1972,8 @@
             <section class="settings-card">
               <h3>Re-download all mail</h3>
               <p>Fetches every message from your provider again and refreshes the local copy in place. Nothing is removed, here or on the server. Useful if a message looks wrong or incomplete.</p>
-              <div class="vault-actions">
-                <button class="vault-primary-button" type="button" data-action="resync-all" title="Re-download every message from your provider" data-testid="resync-all" disabled={settingsBusy || resyncBusy || gmailOAuthBusy} on:click={resyncAllMail}>{resyncBusy ? 'Re-downloading…' : 'Re-download all mail'}</button>
+              <div class="settings-actions">
+                <button class="primary-button" type="button" data-action="resync-all" title="Re-download every message from your provider" data-testid="resync-all" disabled={settingsBusy || resyncBusy || gmailOAuthBusy} on:click={resyncAllMail}>{resyncBusy ? 'Re-downloading…' : 'Re-download all mail'}</button>
               </div>
             </section>
           {:else}
@@ -1984,8 +1990,8 @@
             </section>
           {/if}
 
-          {#if settingsError}<p class="vault-feedback has-error" role="alert">{settingsError}</p>{/if}
-          {#if settingsMessage}<p class="vault-feedback" role="status">{settingsMessage}</p>{/if}
+          {#if settingsError}<p class="settings-feedback has-error" role="alert">{settingsError}</p>{/if}
+          {#if settingsMessage}<p class="settings-feedback" role="status">{settingsMessage}</p>{/if}
         </div>
       </section>
     {:else}
@@ -2238,7 +2244,7 @@
                   <h1 data-testid="reader-subject">{selectedThread.subject}</h1>
                   <span class="category-pill">{selectedThread.category}</span>
                 </div>
-                <p>{selectedThread.participants} · {selectedThread.messageCount} messages · {accountFor(selectedThread.accountId)?.name}</p>
+                <p>{selectedThread.participants} · {selectedThread.messageCount} {selectedThread.messageCount === 1 ? 'message' : 'messages'} · {accountFor(selectedThread.accountId)?.name}</p>
               </div>
 
               {#if messageLoading && loadedThreadId !== selectedThread.id}
@@ -2272,7 +2278,9 @@
                   </section>
                 {/if}
 
-                {#key `${selectedThread.id}:${selectedMessages[0]?.id ?? 0}:${selectedMessages.length}`}
+                <!-- Keyed on the thread alone. Keying on the message list as well rebuilt
+                     the whole conversation every time a refresh replaced it. -->
+                {#key selectedThread.id}
                   <ThreadConversation
                     bind:this={threadConversation}
                     messages={selectedMessages}
@@ -2413,7 +2421,7 @@
               <span>Pick a time</span>
               <input type="datetime-local" bind:value={customSnoozeValue} data-testid="custom-snooze-input" />
             </label>
-            <button class="vault-primary-button" type="submit" title="Snooze until the chosen time">Snooze</button>
+            <button class="primary-button" type="submit" title="Snooze until the chosen time">Snooze</button>
           </form>
           {#if customSnoozeError}<p class="snooze-error" role="alert">{customSnoozeError}</p>{/if}
         </div>

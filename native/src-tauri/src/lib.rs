@@ -1,4 +1,5 @@
 pub mod content;
+mod css;
 mod gmail;
 mod gmail_access;
 #[path = "google_authorization.rs"]
@@ -531,7 +532,20 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(
             tauri::plugin::Builder::<tauri::Wry>::new("mux-navigation-policy")
-                .on_navigation(|_webview, url| navigation::allows_webview_navigation(url))
+                .on_navigation(|webview, url| {
+                    if navigation::allows_webview_navigation(url) {
+                        return true;
+                    }
+                    // The reader frame runs no script of its own, so a link
+                    // inside a message reaches Mux only as an attempt to
+                    // navigate. Refuse the navigation and hand the destination
+                    // to the same guarded opener the interface uses.
+                    let app = webview.app_handle().clone();
+                    let _ = navigation::open_external_destination(url.as_str(), |normalized| {
+                        app.opener().open_url(normalized, None::<&str>).map_err(|_| ())
+                    });
+                    false
+                })
                 .build(),
         )
         .plugin(

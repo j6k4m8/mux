@@ -332,11 +332,14 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .message-rail button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .message-stack { max-width: 880px; display: grid; gap: var(--stack-gap); margin: 0 auto; }
 .message-card { padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-raised); box-shadow: var(--shadow-sm); transition: background 180ms ease, border-color 180ms ease; }
-.message-card.is-collapsed { border-color: transparent; background: transparent; box-shadow: none; }
+/* Collapsed messages read as chat, but a thread still reads as a stack of
+   cards, so the card is whispered rather than removed. */
+.message-card.is-collapsed { border-color: color-mix(in srgb, var(--border) 62%, transparent); background: color-mix(in srgb, var(--surface-raised) 55%, transparent); box-shadow: none; }
+.message-card.is-collapsed:hover { border-color: var(--border); }
 /* Reader focus: which message j/k is sitting on. */
 .message-card.is-focused { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .message-card-toggle { width: 100%; min-height: var(--card-min-height); display: flex; align-items: center; gap: 11px; padding: var(--card-pad-block) 15px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
-.message-card.is-collapsed .message-card-toggle { min-height: 0; align-items: flex-start; gap: 10px; padding: 7px 10px; border-radius: 9px; background: transparent; }
+.message-card.is-collapsed .message-card-toggle { min-height: 0; align-items: flex-start; gap: 10px; padding: 7px 10px; border-radius: inherit; background: transparent; }
 .message-card.is-collapsed .message-card-toggle:hover { background: var(--surface-hover); }
 .message-card.is-collapsed .collapse-glyph { display: none; }
 .message-card.is-collapsed .avatar { margin-top: 1px; }
@@ -357,35 +360,12 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .message-body { margin: 1px 24px 22px 64px; color: var(--text-soft); font-size: 13px; line-height: 1.72; overflow-wrap: anywhere; }
 .message-body p, .message-body div { margin: 0 0 .8em; }
 .message-body p:last-child, .message-body div:last-child { margin-bottom: 0; }
-.message-body ul, .message-body ol { margin: .5em 0; padding-left: 1.5em; }
-/* Structure that used to be flattened away now needs to read as structure. */
-.message-body h1, .message-body h2, .message-body h3,
-.message-body h4, .message-body h5, .message-body h6 { margin: 1.1em 0 .45em; color: var(--text); line-height: 1.3; }
-.message-body h1 { font-size: 1.42em; }
-.message-body h2 { font-size: 1.26em; }
-.message-body h3 { font-size: 1.13em; }
-.message-body h4, .message-body h5, .message-body h6 { font-size: 1em; }
-.message-body h1:first-child, .message-body h2:first-child, .message-body h3:first-child { margin-top: 0; }
-.message-body hr { height: 0; margin: 1.2em 0; border: 0; border-top: 1px solid var(--border); }
-/* Mail uses tables for layout far more often than for data, so borders are off
-   by default and only a table that declares a header row is drawn as a grid. */
-.message-body table { max-width: 100%; margin: .4em 0; border-collapse: collapse; }
-.message-body caption { margin-bottom: .4em; color: var(--text-faint); font-size: .92em; text-align: left; }
-.message-body th, .message-body td { padding: 0 4px 0 0; text-align: left; vertical-align: top; }
-.message-body td:last-child, .message-body th:last-child { padding-right: 0; }
-.message-body table:has(th) { display: block; margin: .8em 0; overflow-x: auto; }
-.message-body table:has(th) th, .message-body table:has(th) td { padding: 6px 10px; border: 1px solid var(--border); }
-.message-body table:has(th) th { color: var(--text); font-weight: 700; background: var(--surface-muted); }
-.message-body pre { margin: .8em 0; padding: 11px 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .92em; line-height: 1.5; overflow-x: auto; white-space: pre; }
-.message-body code { padding: 1px 4px; border-radius: 4px; background: var(--surface-muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .92em; }
-.message-body pre code { padding: 0; background: none; }
-.message-body dl { margin: .6em 0; }
-.message-body dt { color: var(--text); font-weight: 700; }
-.message-body dd { margin: 0 0 .5em 1.2em; }
-.message-body del { color: var(--text-faint); }
-.message-body sub, .message-body sup { font-size: .78em; line-height: 0; }
-.message-body a, .rich-editor a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
-.message-body blockquote, .rich-editor blockquote { margin: .9em 0; padding-left: 13px; border-left: 2px solid var(--border-strong); color: var(--text-faint); }
+/* The message itself renders inside its own frame, which carries its own
+   defaults. What remains here dresses the plain-text fallback and the notices
+   that sit alongside the frame. */
+.message-frame { display: block; width: 100%; border: 0; background: transparent; }
+.rich-editor a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.rich-editor blockquote { margin: .9em 0; padding-left: 13px; border-left: 2px solid var(--border-strong); color: var(--text-faint); }
 .remote-resource-notice { min-height: 36px; display: flex; align-items: center; gap: 7px; margin: 0 0 9px; padding: 2px 4px 2px 10px; border-radius: 8px; color: var(--text-faint); background: color-mix(in srgb, var(--surface-muted) 70%, transparent); font-size: 10px; }
 .remote-resource-notice > span:nth-child(2) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-resource-icon { flex: 0 0 auto; font-size: 15px; }
@@ -471,7 +451,10 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .quick-actions button { height: 31px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text-soft); background: var(--surface); cursor: pointer; font-size: 10px; }
 .quick-actions button:hover { color: var(--text); border-color: var(--accent); }
 .quick-actions .format-button { border-color: transparent; background: transparent; }
-.quick-actions .send-button, .composer-actions .send-button, .vault-actions .vault-primary-button { color: #fff; border-color: #5769f4; background: linear-gradient(135deg, #6274ff, #4a5de8); font-weight: 750; }
+.quick-actions .send-button, .composer-actions .send-button, .primary-button { min-height: 36px; padding: 0 15px; border: 1px solid #5769f4; border-radius: 9px; color: #fff; background: linear-gradient(135deg, #6274ff, #4a5de8); cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 750; white-space: nowrap; }
+.primary-button:hover { border-color: #4a5de8; background: linear-gradient(135deg, #566aff, #3f52dd); }
+.primary-button:disabled { cursor: not-allowed; opacity: .55; }
+.primary-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .quick-actions .send-button { min-width: 88px; }
 .quick-actions .send-button:disabled, .composer-actions .send-button:disabled { cursor: not-allowed; opacity: .45; }
 
@@ -497,27 +480,15 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .composer > header { min-height: 70px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px 0 22px; border-bottom: 1px solid var(--border); background: var(--surface-muted); }
 .composer > header small { color: var(--text-faint); font-size: 9px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
 .composer > header h1 { margin: 3px 0 0; color: var(--text); font-size: 17px; }
-.vault-panel h2, .vault-panel h3 { margin: 0 0 7px; color: var(--text); font-size: 18px; letter-spacing: -.02em; }
-.vault-panel > p { margin: 0 0 20px; color: var(--text-soft); font-size: 11px; line-height: 1.55; }
-.vault-provider-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 0 0 16px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.vault-provider-card h3 { margin: 0; color: var(--text); font-size: 12px; }
-.vault-provider-card p { margin: 3px 0 0; color: var(--text-soft); font-size: 10px; }
-.vault-panel form { display: grid; gap: 13px; }
-.vault-panel label { display: grid; gap: 6px; color: var(--text-soft); font-size: 10px; font-weight: 700; }
-.vault-panel input { width: 100%; height: 40px; padding: 0 11px; border: 1px solid var(--border-strong); border-radius: 9px; outline: 0; color: var(--text); background: var(--surface); }
-.vault-panel input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent); }
-.vault-panel input:disabled { opacity: .65; }
-.vault-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 6px; }
-.vault-actions-split { justify-content: space-between; margin-top: 22px; }
-.vault-actions button { min-height: 36px; padding: 0 13px; border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text-soft); background: var(--surface-muted); cursor: pointer; font-size: 11px; }
-.vault-actions button:hover { color: var(--text); border-color: var(--accent); }
-.vault-actions button:disabled { cursor: not-allowed; opacity: .5; }
-.vault-actions .vault-danger-button { color: #fff; border-color: var(--danger); background: var(--danger); font-weight: 750; }
-.vault-reset-panel { padding: 14px; border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border)); border-radius: 12px; background: color-mix(in srgb, var(--danger) 6%, var(--surface)); }
-.vault-feedback { margin: 17px 0 0; padding: 9px 10px; border-radius: 8px; color: var(--text-soft); background: var(--surface-muted); font-size: 10px; line-height: 1.45; }
-.vault-feedback.has-error { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
-.vault-reset-link { padding: 5px 0; color: var(--danger); background: transparent; cursor: pointer; font-size: 10px; }
-.vault-reset-link:disabled { cursor: not-allowed; opacity: .5; }
+.provider-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.provider-card h3 { margin: 0; color: var(--text); font-size: 12px; }
+.provider-card p { margin: 3px 0 0; color: var(--text-soft); font-size: 10px; line-height: 1.5; }
+.settings-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.settings-actions button:not(.primary-button) { min-height: 36px; padding: 0 13px; border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text-soft); background: var(--surface-muted); cursor: pointer; font-size: 11px; }
+.settings-actions button:not(.primary-button):hover { color: var(--text); border-color: var(--accent); }
+.settings-actions button:disabled { cursor: not-allowed; opacity: .5; }
+.settings-feedback { margin: 17px 0 0; padding: 9px 10px; border-radius: 8px; color: var(--text-soft); background: var(--surface-muted); font-size: 10px; line-height: 1.45; }
+.settings-feedback.has-error { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
 
 /* Full-height app screens that stand in for the mailbox grid. */
 /* margin:auto centres without the flex trap where overflowing content escapes
@@ -544,7 +515,6 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .settings-back { color: var(--text-faint) !important; font-size: 11px !important; }
 .settings-back span { display: inline-flex; transform: rotate(180deg); }
 .settings-body { min-height: 0; padding: 30px clamp(24px, 4vw, 56px); overflow-y: auto; }
-.settings-body > .vault-panel { max-width: 520px; margin-bottom: 18px; }
 .settings-heading { max-width: 520px; margin-bottom: 22px; }
 .settings-heading h2 { margin: 0; color: var(--text); font-size: 22px; letter-spacing: -.03em; }
 .settings-heading p { margin: 6px 0 0; color: var(--text-soft); font-size: 11px; line-height: 1.55; }

@@ -1,5 +1,6 @@
 use dom_query::{Document, NodeRef};
 
+use crate::css;
 use crate::navigation::normalize_external_destination;
 
 const MAX_HTML_INPUT_BYTES: usize = 1024 * 1024;
@@ -11,6 +12,8 @@ const HTML_TREE_LIMIT_ERROR: &str = "MIME ingestion rejected: decoded HTML tree 
 pub(crate) const MAX_REMOTE_IMAGES_PER_MESSAGE: usize = 64;
 const MAX_REMOTE_IMAGE_URL_BYTES: usize = 2_048;
 const MAX_REMOTE_IMAGE_ALT_CHARS: usize = 500;
+const MAX_ATTRIBUTE_VALUE_BYTES: usize = 1_024;
+const MAX_STYLE_ATTRIBUTE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ParsedAttachment {
@@ -301,17 +304,34 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
         return;
     }
 
+    if name == "style" {
+        let filtered = css::filter_stylesheet(&node.text());
+        state.blocked_remote_resources = state
+            .blocked_remote_resources
+            .saturating_add(filtered.blocked_remote_resources);
+        if !filtered.css.is_empty() {
+            state.html.push_str("<style>");
+            state.html.push_str(&filtered.css);
+            state.html.push_str("</style>");
+        }
+        return;
+    }
+
     let tag = match name.as_str() {
         "b" => Some("strong"),
         "i" => Some("em"),
         "strike" | "s" => Some("del"),
-        // Layout and structure carry no behaviour once attributes are stripped, and
-        // dropping them fuses neighbouring text that belonged in separate cells,
-        // headings, or rows.
-        "p" | "div" | "strong" | "em" | "u" | "ul" | "ol" | "li" | "blockquote" | "br" | "a"
-        | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "h1" | "h2"
-        | "h3" | "h4" | "h5" | "h6" | "hr" | "pre" | "code" | "dl" | "dt" | "dd" | "del"
-        | "sub" | "sup" => Some(name.as_str()),
+        // Structure and presentation are kept because the reader frame renders
+        // them with scripting disabled, where the worst an element can do is
+        // look wrong. Dropping them fused text that belonged in separate cells,
+        // headings, or rows, and threw away every sender's layout.
+        "p" | "div" | "span" | "strong" | "em" | "u" | "ul" | "ol" | "li" | "blockquote" | "br"
+        | "a" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "col"
+        | "colgroup" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "hr" | "pre" | "code" | "dl"
+        | "dt" | "dd" | "del" | "sub" | "sup" | "font" | "center" | "small" | "big" | "tt"
+        | "abbr" | "cite" | "q" | "samp" | "kbd" | "var" | "mark" | "ins" | "wbr" | "figure"
+        | "figcaption" | "section" | "article" | "header" | "footer" | "main" | "nav" | "aside"
+        | "address" | "time" => Some(name.as_str()),
         _ => None,
     };
     let Some(tag) = tag else {
@@ -321,11 +341,14 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
         return;
     };
 
-    if tag == "br" || tag == "hr" {
+    if matches!(tag, "br" | "hr" | "col" | "wbr") {
         state.html.push('<');
         state.html.push_str(tag);
+        append_sanitized_attributes(node, state);
         state.html.push('>');
-        append_plain_break(&mut state.text);
+        if matches!(tag, "br" | "hr") {
+            append_plain_break(&mut state.text);
+        }
         return;
     }
 
@@ -338,7 +361,9 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
             state
                 .html
                 .push_str(&escape_attribute(&destination.destination));
-            state.html.push_str("\">");
+            state.html.push('"');
+            append_sanitized_attributes(node, state);
+            state.html.push('>');
             for child in node.children() {
                 append_sanitized_node(child, depth + 1, state);
             }
@@ -353,6 +378,7 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
 
     state.html.push('<');
     state.html.push_str(tag);
+    append_sanitized_attributes(node, state);
     state.html.push('>');
     for child in node.children() {
         append_sanitized_node(child, depth + 1, state);
@@ -382,6 +408,47 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
             | "dd"
     ) {
         append_plain_break(&mut state.text);
+    }
+}
+
+/// Presentational attributes only. Nothing here names a resource, a target, or
+/// a handler; `class` and `id` survive because a message's own stylesheet
+/// selects through them, and inside the reader frame they collide with nothing.
+const ALLOWED_ATTRIBUTES: &[&str] = &[
+    "align", "bgcolor", "border", "cellpadding", "cellspacing", "class", "color", "colspan",
+    "dir", "face", "height", "id", "lang", "nowrap", "rowspan", "size", "span", "start", "title",
+    "type", "valign", "width",
+];
+
+fn append_sanitized_attributes(node: NodeRef<'_>, state: &mut HtmlSanitizerState) {
+    for attribute in node.attrs() {
+        let name = attribute.name.local.as_ref().to_ascii_lowercase();
+        let value = attribute.value.as_ref();
+        if name == "style" {
+            if value.len() > MAX_STYLE_ATTRIBUTE_BYTES {
+                continue;
+            }
+            let filtered = css::filter_declarations(value);
+            state.blocked_remote_resources = state
+                .blocked_remote_resources
+                .saturating_add(filtered.blocked_remote_resources);
+            if filtered.css.is_empty() {
+                continue;
+            }
+            state.html.push_str(" style=\"");
+            state.html.push_str(&escape_attribute(&filtered.css));
+            state.html.push('"');
+            continue;
+        }
+        if !ALLOWED_ATTRIBUTES.contains(&name.as_str()) || value.len() > MAX_ATTRIBUTE_VALUE_BYTES
+        {
+            continue;
+        }
+        state.html.push(' ');
+        state.html.push_str(&name);
+        state.html.push_str("=\"");
+        state.html.push_str(&escape_attribute(value));
+        state.html.push('"');
     }
 }
 
@@ -446,7 +513,6 @@ fn drops_entire_subtree(name: &str) -> bool {
             | "form"
             | "frame"
             | "frameset"
-            | "head"
             | "iframe"
             | "img"
             | "input"
@@ -460,10 +526,10 @@ fn drops_entire_subtree(name: &str) -> bool {
             | "script"
             | "select"
             | "source"
-            | "style"
             | "svg"
             | "template"
             | "textarea"
+            | "title"
             | "track"
             | "video"
     )
@@ -602,7 +668,8 @@ mod tests {
                <img src="https://tracker.example/pixel" onerror="steal()"></p>"#,
         )
         .expect("bounded HTML");
-        assert_eq!(safe.blocked_remote_resources, 1);
+        // The tracking pixel and the stylesheet's background fetch both count.
+        assert_eq!(safe.blocked_remote_resources, 2);
         assert!(safe.html.contains("<strong>Hello &amp; welcome</strong>"));
         assert!(safe.html.contains("href=\"https://mux.example/plan\""));
         for forbidden in [
@@ -694,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_markup_survives_while_attributes_and_behaviour_do_not() {
+    fn structural_markup_and_presentation_survive_while_behaviour_does_not() {
         let safe = sanitize_html(
             r#"<h2 style="color:red" onclick="alert(1)">Heading</h2>
                <table border="1" bgcolor="red"><caption>Cap</caption>
@@ -710,12 +777,12 @@ mod tests {
 
         // Structure is kept, so cells and headings stay separate.
         for expected in [
-            "<h2>",
-            "<table>",
+            "<h2 style=\"color: red\">",
+            "<table border=\"1\" bgcolor=\"red\">",
             "<caption>",
             "<thead>",
             "<tr>",
-            "<th>",
+            "<th width=\"50\">",
             "<tbody>",
             "<td>",
             "<hr>",
@@ -728,13 +795,13 @@ mod tests {
             "<sub>",
             "<sup>",
         ] {
-            assert!(safe.html.contains(expected), "missing {expected}");
+            assert!(safe.html.contains(expected), "missing {expected} in {:?}", safe.html);
         }
         // Legacy strikethrough normalises onto one tag.
         assert_eq!(safe.html.matches("<del>").count(), 2);
-        // No attribute survives, so nothing structural can carry behaviour.
+        // Presentation survives; behaviour and the document wrapper do not.
         for forbidden in [
-            "style", "onclick", "border", "bgcolor", "width", "alert", "<s>", "<strike>",
+            "onclick", "alert", "<s>", "<strike>", "<body", "<html", "<head",
         ] {
             assert!(!safe.html.contains(forbidden), "found {forbidden}");
         }
@@ -776,7 +843,7 @@ mod tests {
 
         assert!(safe.html.contains("Safe"));
         assert!(safe.html.contains("href=\"https://example.com/plan\""));
-        assert_eq!(safe.blocked_remote_resources, 6);
+        assert_eq!(safe.blocked_remote_resources, 7);
         for forbidden in [
             "base.test",
             "refresh.test",

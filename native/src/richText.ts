@@ -1,7 +1,6 @@
 export type RichNode =
   | { type: 'text'; text: string }
-  | { type: 'element'; tag: RichTag; href?: string; children: RichNode[] }
-  | { type: 'remote-image'; resourceId: number };
+  | { type: 'element'; tag: RichTag; href?: string; children: RichNode[] };
 
 export type RichTag =
   | 'p' | 'div' | 'strong' | 'em' | 'u' | 'ul' | 'ol' | 'li' | 'blockquote' | 'br' | 'a'
@@ -19,10 +18,8 @@ const allowedTags = new Set<string>([
 ]);
 /// Void elements carry no children.
 const voidTags = new Set<string>(['br', 'hr']);
-const MAX_RENDER_HTML_UNITS = 8 * 1024 * 1024 + 1024;
 const MAX_RENDER_TREE_DEPTH = 64;
 const MAX_RENDER_TREE_NODES = 50_000;
-const MAX_REMOTE_IMAGE_RESOURCE_ID = 64;
 const MAX_REMOTE_IMAGE_DATA_URL_UNITS = 8 * 1024 * 1024 + 128;
 
 /// Where a reply's quoted tail begins. Anything from here down is the previous
@@ -109,45 +106,13 @@ export function safeHref(value: string): string | null {
   }
 }
 
-function hasPercentEncodedControl(value: string): boolean {
-  try {
-    return /[\u0000-\u001f\u007f-\u009f]/u.test(decodeURIComponent(value));
-  } catch {
-    return true;
-  }
-}
-
-/**
- * Message bodies use a stricter link contract than the composer. Incoming
- * content may name only an absolute HTTP(S) destination; it never gets the
- * editor's convenient scheme inference and never turns mailto into ambient
- * navigation authority.
- */
-export function safeMessageHref(value: string): string | null {
-  const trimmed = value.trim();
-  if (
-    !trimmed
-    || new TextEncoder().encode(trimmed).byteLength > 2_048
-    || /[\s\u0000-\u001f\u007f-\u009f]/u.test(trimmed)
-    || hasPercentEncodedControl(trimmed)
-  ) return null;
-  try {
-    const url = new URL(trimmed);
-    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) return null;
-    return url.href;
-  } catch {
-    return null;
-  }
-}
-
 type ParseBudget = { visited: number };
 
 function convertNode(
   node: Node,
   linkPolicy: (value: string) => string | null,
   budget: ParseBudget,
-  depth: number,
-  allowRemoteImageMarkers = false
+  depth: number
 ): RichNode[] {
   if (budget.visited >= MAX_RENDER_TREE_NODES || depth > MAX_RENDER_TREE_DEPTH) return [];
   budget.visited += 1;
@@ -156,14 +121,7 @@ function convertNode(
   }
   if (!(node instanceof HTMLElement)) return [];
   const rawTag = node.tagName.toLocaleLowerCase();
-  if (allowRemoteImageMarkers && rawTag === 'mux-remote-image') {
-    const rawId = node.getAttribute('data-id') ?? '';
-    const resourceId = /^(?:0|[1-9]\d*)$/u.test(rawId) ? Number(rawId) : Number.NaN;
-    return Number.isSafeInteger(resourceId) && resourceId >= 1 && resourceId <= MAX_REMOTE_IMAGE_RESOURCE_ID
-      ? [{ type: 'remote-image', resourceId }]
-      : [];
-  }
-  const children = Array.from(node.childNodes).flatMap((child) => convertNode(child, linkPolicy, budget, depth + 1, allowRemoteImageMarkers));
+  const children = Array.from(node.childNodes).flatMap((child) => convertNode(child, linkPolicy, budget, depth + 1));
   if (!allowedTags.has(rawTag)) return children;
   const tag = rawTag === 'b' ? 'strong' : rawTag === 'i' ? 'em' : rawTag === 's' || rawTag === 'strike' ? 'del' : rawTag;
   if (tag === 'a') {
@@ -186,13 +144,6 @@ export function parseRichText(value: string): RichNode[] {
   return Array.from(document.body.childNodes).flatMap((node) => convertNode(node, safeHref, budget, 0));
 }
 
-export function parseMessageRichText(value: string): RichNode[] {
-  if (!value.trim() || typeof DOMParser === 'undefined') return [];
-  const document = new DOMParser().parseFromString(value.slice(0, MAX_RENDER_HTML_UNITS), 'text/html');
-  const budget: ParseBudget = { visited: 0 };
-  return Array.from(document.body.childNodes).flatMap((node) => convertNode(node, safeMessageHref, budget, 0, true));
-}
-
 function escapeText(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
@@ -203,7 +154,6 @@ function escapeAttribute(value: string): string {
 
 function serializeNode(node: RichNode): string {
   if (node.type === 'text') return escapeText(node.text);
-  if (node.type === 'remote-image') return '';
   if (node.tag === 'br') return '<br>';
   const content = node.children.map(serializeNode).join('');
   if (node.tag === 'a' && node.href) {

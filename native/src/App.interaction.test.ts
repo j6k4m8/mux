@@ -65,8 +65,8 @@ const messages: MessageSummary[] = [
     ccRecipients: 'Bob <bob@example.com>',
     bccRecipients: '',
     sentAt: Date.UTC(2026, 7, 22, 14),
-    bodyText: 'Can we finalize the architecture today?',
-    bodyHtml: '<p>Can we finalize the architecture today?</p>',
+    bodyText: 'Can we finalize the architecture today?\n\n\n\nThe agenda is attached.',
+    bodyHtml: '',
     blockedRemoteResources: 0,
     remoteImages: [],
     isFromMe: false
@@ -514,7 +514,10 @@ describe('production mailbox interactions', () => {
     expect(screen.getAllByTestId('thread-row').map((row) => row.textContent)).toEqual(
       expect.arrayContaining([expect.stringContaining('Architecture sync'), expect.stringContaining('Launch checklist')])
     );
-    expect(screen.getByText('Yes. The architecture decision is recorded.')).toBeTruthy();
+    // A message that does carry HTML is rendered by its own frame, so the
+    // reader's copy of it lives in that document rather than in this one.
+    const frame = document.querySelector('iframe.message-frame');
+    expect(frame?.getAttribute('srcdoc')).toContain('Yes. The architecture decision is recorded.');
     expect(calls.some((call) => call.command === 'mailbox_bootstrap')).toBe(true);
     expect(calls.some((call) => call.command === 'get_thread_messages')).toBe(true);
 

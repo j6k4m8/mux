@@ -2,8 +2,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { tick } from 'svelte';
   import AttachmentList from './AttachmentList.svelte';
-  import RichText from './RichText.svelte';
-  import { newContentParagraphs, parseMessageRichText, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
+  import MessageFrame from './MessageFrame.svelte';
+  import { newContentParagraphs, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
   import type { AttachmentSummary, MessageSummary, RemoteImageContent, RemoteImageSummary } from './types';
 
   export let messages: MessageSummary[] = [];
@@ -12,7 +12,25 @@
   export let threadUnread = false;
   export let railPreview = true;
 
-  let expandedIds = new Set(messages.slice(-2).map((message) => message.id));
+  /// The two newest messages open with the thread. The component now outlives
+  /// each background refresh, so a message that arrives later opens on arrival,
+  /// while one the reader collapsed stays collapsed.
+  const seen = { ids: new Set<number>(), primed: false };
+  let expandedIds = new Set<number>();
+
+  $: {
+    if (!seen.primed && messages.length) {
+      seen.primed = true;
+      seen.ids = new Set(messages.map((message) => message.id));
+      expandedIds = new Set(messages.slice(-2).map((message) => message.id));
+    } else if (seen.primed) {
+      const arrived = messages.filter((message) => !seen.ids.has(message.id));
+      if (arrived.length) {
+        seen.ids = new Set(messages.map((message) => message.id));
+        expandedIds = new Set([...expandedIds, ...arrived.map((message) => message.id)]);
+      }
+    }
+  }
   let bottomAnchor: HTMLDivElement;
   let loadedImageData = new Map<string, string>();
   let loadingMessageIds = new Set<number>();
@@ -55,7 +73,10 @@
     return [...new Set(message.remoteImages.map((image) => image.domain).filter(Boolean))].sort();
   }
 
-  async function fetchRemoteImage(message: MessageSummary, image: RemoteImageSummary): Promise<boolean> {
+  async function fetchRemoteImage(
+    message: MessageSummary,
+    image: RemoteImageSummary
+  ): Promise<[string, string] | null> {
     try {
       const loaded = await invoke<RemoteImageContent>('load_remote_image', {
         input: { messageId: message.id, resourceId: image.id }
@@ -65,10 +86,9 @@
         || loaded.resourceId !== image.id
         || !safeRemoteImageDataUrl(loaded.dataUrl)
       ) throw new Error('invalid remote image response');
-      loadedImageData = new Map(loadedImageData).set(imageKey(message.id, image.id), loaded.dataUrl);
-      return true;
+      return [imageKey(message.id, image.id), loaded.dataUrl];
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -81,8 +101,19 @@
     loadingMessageIds = new Set(loadingMessageIds).add(message.id);
     remoteImageErrors = new Map(remoteImageErrors).set(message.id, '');
     let failed = 0;
+    // Every approved image is applied in one assignment. Applying them one at a
+    // time rebuilds the reader frame's document once per image, which reloads
+    // the message the reader is looking at as many times as it has pictures.
+    const fetched: Array<[string, string]> = [];
     for (const image of images) {
-      if (!await fetchRemoteImage(message, image)) failed += 1;
+      const loaded = await fetchRemoteImage(message, image);
+      if (loaded) fetched.push(loaded);
+      else failed += 1;
+    }
+    if (fetched.length) {
+      const next = new Map(loadedImageData);
+      for (const [key, dataUrl] of fetched) next.set(key, dataUrl);
+      loadedImageData = next;
     }
     const nextLoading = new Set(loadingMessageIds);
     nextLoading.delete(message.id);
@@ -287,7 +318,7 @@
             <small class="remote-resource-error" role="alert">{remoteImageErrors.get(message.id)}</small>
           {/if}
           {#if message.bodyHtml}
-            <RichText nodes={parseMessageRichText(message.bodyHtml)} remoteImages={remoteImageViews[message.id] ?? {}} />
+            <MessageFrame bodyHtml={message.bodyHtml} remoteImages={remoteImageViews[message.id] ?? {}} label={`Message from ${message.senderName || message.senderEmail}`} />
           {:else}
             {#each plainTextParagraphs(message.bodyText) as lines}
               <p>{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</p>

@@ -56,13 +56,21 @@ where
     Ok(destination)
 }
 
-/// The message renderer never needs to navigate its WebView. Production may
-/// load only the exact bundled-app origin; development may additionally load
-/// the single loopback Vite origin configured in tauri.conf.json.
+/// The message reader renders into a sandboxed frame whose document is written
+/// from the `srcdoc` attribute, which WebKit loads as its own navigation.
+const SRCDOC_URL: &str = "about:srcdoc";
+
+/// Nothing here may navigate to a remote destination. Production may load only
+/// the exact bundled-app origin; development may additionally load the single
+/// loopback Vite origin configured in tauri.conf.json; and either may load the
+/// reader frame's own srcdoc document, whose content Mux itself wrote.
 pub fn allows_webview_navigation(url: &Url) -> bool {
     let no_credentials = url.username().is_empty() && url.password().is_none();
     if !no_credentials {
         return false;
+    }
+    if url.as_str() == SRCDOC_URL {
+        return true;
     }
 
     (url.scheme() == PRODUCTION_SCHEME
@@ -169,6 +177,7 @@ mod tests {
             "tauri://localhost/assets/index.js",
             "http://127.0.0.1:1420/",
             "http://127.0.0.1:1420/src/main.ts",
+            "about:srcdoc",
         ] {
             assert!(allows_webview_navigation(&Url::parse(allowed).unwrap()));
         }
@@ -183,6 +192,9 @@ mod tests {
             "tauri://user@localhost/",
             "file:///tmp/index.html",
             "data:text/html,hello",
+            "about:blank",
+            "about:srcdoc?x",
+            "about:config",
         ] {
             assert!(
                 !allows_webview_navigation(&Url::parse(denied).unwrap()),
