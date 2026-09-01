@@ -382,13 +382,19 @@ mod tests {
     #[test]
     fn an_escape_cannot_spell_a_property_or_a_fetch() {
         // `\75` is `u`, so this is `url(...)` by the time the engine reads it.
-        assert_eq!(filter_declarations(r"background: \75 rl(https://tracker.test/x)").css, "");
+        assert_eq!(
+            filter_declarations(r"background: \75 rl(https://tracker.test/x)").css,
+            ""
+        );
         assert_eq!(filter_declarations(r"color: re\64").css, "");
         // A value that opens a string and never closes it swallows what follows.
         let unbalanced = filter_declarations("font-family: \"}; color: red");
         assert_eq!(unbalanced.css, "");
         assert_eq!(unbalanced.blocked_remote_resources, 0);
-        assert_eq!(filter_declarations("font-family: \"Helvetica Neue\"").css, "font-family: \"Helvetica Neue\"");
+        assert_eq!(
+            filter_declarations("font-family: \"Helvetica Neue\"").css,
+            "font-family: \"Helvetica Neue\""
+        );
     }
 
     #[test]
@@ -407,7 +413,10 @@ mod tests {
 
     #[test]
     fn oversized_and_unbalanced_input_is_bounded() {
-        assert_eq!(filter_stylesheet(&"a".repeat(MAX_STYLESHEET_BYTES + 1)).css, "");
+        assert_eq!(
+            filter_stylesheet(&"a".repeat(MAX_STYLESHEET_BYTES + 1)).css,
+            ""
+        );
         assert_eq!(filter_stylesheet(".a { color: red").css, "");
         assert_eq!(
             filter_declarations(&format!("color: {}", "x".repeat(MAX_DECLARATION_BYTES))).css,

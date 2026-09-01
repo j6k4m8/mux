@@ -542,7 +542,9 @@ pub fn run() {
                     // to the same guarded opener the interface uses.
                     let app = webview.app_handle().clone();
                     let _ = navigation::open_external_destination(url.as_str(), |normalized| {
-                        app.opener().open_url(normalized, None::<&str>).map_err(|_| ())
+                        app.opener()
+                            .open_url(normalized, None::<&str>)
+                            .map_err(|_| ())
                     });
                     false
                 })

@@ -343,7 +343,6 @@ pub(crate) enum GmailAccessError {
     /// the durable error code instead of guessing between unrelated failures.
     RetryableBecause(&'static str),
     ReauthorizationRequired,
-    Retryable,
     RateLimited {
         retry_after_at: i64,
     },
@@ -3173,9 +3172,6 @@ fn access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
         GmailAccessError::ReauthorizationRequired => WorkerOutcome::AuthenticationExpired {
             code: "gmail_reauthorization_required".into(),
         },
-        GmailAccessError::Retryable => WorkerOutcome::RetryableFailure {
-            code: "gmail_access_retryable".into(),
-        },
         GmailAccessError::RetryableBecause(reason) => WorkerOutcome::RetryableFailure {
             code: format!("gmail_access_retryable_{reason}"),
         },
@@ -3194,9 +3190,6 @@ fn send_access_error_outcome(error: GmailAccessError) -> WorkerOutcome {
         GmailAccessError::CredentialUnavailable => WorkerOutcome::CredentialUnavailable,
         GmailAccessError::ReauthorizationRequired => WorkerOutcome::AuthenticationExpired {
             code: "gmail_reauthorization_required".into(),
-        },
-        GmailAccessError::Retryable => WorkerOutcome::RejectedBeforeSubmission {
-            code: "gmail_access_retryable_before_send".into(),
         },
         GmailAccessError::RetryableBecause(reason) => WorkerOutcome::RejectedBeforeSubmission {
             code: format!("gmail_access_retryable_{reason}_before_send"),
@@ -4235,7 +4228,7 @@ mod tests {
             .expect("durable history cursor");
         drop(connection);
 
-        let worker = DurableWorker::new(&path, WorkerConfig::default()).expect("durable worker");
+        let _worker = DurableWorker::new(&path, WorkerConfig::default()).expect("durable worker");
         assert_eq!(
             schedule_resumable_syncs(&path, 6_000).expect("resume durable cursor"),
             1
@@ -4310,7 +4303,7 @@ mod tests {
             )
             .expect("corrupt cursor fixture");
         drop(connection);
-        let worker = DurableWorker::new(&path, WorkerConfig::default()).expect("durable worker");
+        let _worker = DurableWorker::new(&path, WorkerConfig::default()).expect("durable worker");
 
         assert_eq!(
             schedule_resumable_syncs(&path, 4).expect("isolated scheduling"),

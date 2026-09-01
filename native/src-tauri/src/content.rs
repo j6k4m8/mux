@@ -415,9 +415,28 @@ fn append_sanitized_node(node: NodeRef<'_>, depth: usize, state: &mut HtmlSaniti
 /// a handler; `class` and `id` survive because a message's own stylesheet
 /// selects through them, and inside the reader frame they collide with nothing.
 const ALLOWED_ATTRIBUTES: &[&str] = &[
-    "align", "bgcolor", "border", "cellpadding", "cellspacing", "class", "color", "colspan",
-    "dir", "face", "height", "id", "lang", "nowrap", "rowspan", "size", "span", "start", "title",
-    "type", "valign", "width",
+    "align",
+    "bgcolor",
+    "border",
+    "cellpadding",
+    "cellspacing",
+    "class",
+    "color",
+    "colspan",
+    "dir",
+    "face",
+    "height",
+    "id",
+    "lang",
+    "nowrap",
+    "rowspan",
+    "size",
+    "span",
+    "start",
+    "title",
+    "type",
+    "valign",
+    "width",
 ];
 
 fn append_sanitized_attributes(node: NodeRef<'_>, state: &mut HtmlSanitizerState) {
@@ -440,8 +459,7 @@ fn append_sanitized_attributes(node: NodeRef<'_>, state: &mut HtmlSanitizerState
             state.html.push('"');
             continue;
         }
-        if !ALLOWED_ATTRIBUTES.contains(&name.as_str()) || value.len() > MAX_ATTRIBUTE_VALUE_BYTES
-        {
+        if !ALLOWED_ATTRIBUTES.contains(&name.as_str()) || value.len() > MAX_ATTRIBUTE_VALUE_BYTES {
             continue;
         }
         state.html.push(' ');
@@ -795,7 +813,11 @@ mod tests {
             "<sub>",
             "<sup>",
         ] {
-            assert!(safe.html.contains(expected), "missing {expected} in {:?}", safe.html);
+            assert!(
+                safe.html.contains(expected),
+                "missing {expected} in {:?}",
+                safe.html
+            );
         }
         // Legacy strikethrough normalises onto one tag.
         assert_eq!(safe.html.matches("<del>").count(), 2);
