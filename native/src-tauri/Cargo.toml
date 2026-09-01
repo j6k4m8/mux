@@ -2,8 +2,9 @@
 name = "mux-native"
 version = "0.1.0"
 description = "Mux desktop mail client"
-authors = ["Mux contributors"]
+authors = ["Jordan Matelsky"]
 edition = "2021"
+license = "Apache-2.0"
 default-run = "mux-native"
 
 [features]
