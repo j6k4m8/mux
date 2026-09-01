@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test } from 'vitest';
 
-import { decodeAttachmentBase64, MAX_ATTACHMENT_BYTES } from '../src/attachmentContent.mjs';
+import { decodeAttachmentBase64, MAX_ATTACHMENT_BYTES } from './attachmentContent';
 
 test('bounded attachment base64 decodes exact binary bytes', () => {
   const expected = Uint8Array.from([0, 1, 127, 128, 254, 255]);

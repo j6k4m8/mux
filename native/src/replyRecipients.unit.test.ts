@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test } from 'vitest';
 
-import { emailAddresses, replyRecipients, shouldExpandInlineReply } from '../src/replyRecipients.mjs';
+import { emailAddresses, replyRecipients, shouldExpandInlineReply } from './replyRecipients';
 
 const messages = [
   {

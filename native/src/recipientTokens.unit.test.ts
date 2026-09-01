@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test } from 'vitest';
 
-import { appendRecipientToken, recipientTokens } from '../src/recipientTokens.mjs';
+import { appendRecipientToken, recipientTokens } from './recipientTokens';
 
 test('recipient chips preserve quoted display-name commas', () => {
   assert.deepEqual(

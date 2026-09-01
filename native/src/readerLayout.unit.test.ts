@@ -1,18 +1,22 @@
 import assert from 'node:assert/strict';
+import { test } from 'vitest';
 import { readFileSync } from 'node:fs';
-import test from 'node:test';
+import { resolve } from 'node:path';
 
-const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+// Resolved from the package root, which is where the test runner starts.
+const styles = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+// A stylesheet that failed to load would make every assertion below vacuous.
+if (!styles.includes('.reader-scroll')) throw new Error('styles.css did not load');
 
-function declarations(selector) {
+function declarations(selector: string) {
   // Every declaration block whose selector list contains an exact match for `selector`.
-  const blocks = [];
+  const blocks: string[] = [];
   const pattern = /(?<selectors>[^{}]+)\{(?<body>[^{}]*)\}/gu;
   for (const match of styles.matchAll(pattern)) {
-    const selectors = match.groups.selectors
+    const selectors = match!.groups!.selectors
       .split(',')
       .map((value) => value.trim().replace(/\s+/gu, ' '));
-    if (selectors.includes(selector)) blocks.push(match.groups.body.trim());
+    if (selectors.includes(selector)) blocks.push(match!.groups!.body.trim());
   }
   return blocks;
 }
@@ -53,8 +57,8 @@ test('the reader column nests no scroller inside the reply card', () => {
   const containers = [];
   const pattern = /(?<selectors>[^{}]+)\{(?<body>[^{}]*)\}/gu;
   for (const match of styles.matchAll(pattern)) {
-    if (!/overflow(-y)?\s*:\s*(auto|scroll)/u.test(match.groups.body)) continue;
-    for (const selector of match.groups.selectors.split(',')) {
+    if (!/overflow(-y)?\s*:\s*(auto|scroll)/u.test(match!.groups!.body)) continue;
+    for (const selector of match!.groups!.selectors.split(',')) {
       const trimmed = selector.trim().replace(/\s+/gu, ' ');
       if (trimmed.endsWith('.rich-editor')) continue;
       if (/^\.(reader|reader-scroll|quick-reply-host|inline-reply)\b/u.test(trimmed)) {

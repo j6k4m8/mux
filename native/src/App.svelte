@@ -24,8 +24,8 @@
     textSizes
   } from './appearance';
   import type { Appearance, Density, SwipeAction } from './appearance';
-  import { replyRecipients } from './replyRecipients.mjs';
-  import { isInteractiveShortcutTarget, mailboxShortcutFor } from './shortcuts.mjs';
+  import { replyRecipients } from './replyRecipients';
+  import { isInteractiveShortcutTarget, mailboxShortcutFor } from './shortcuts';
   import {
     adjacentMailboxWindowStart,
     boundedRefreshRowTarget,
@@ -34,7 +34,7 @@
     mailboxWindowStartForIndex,
     recoverRequiredRow,
     threadPageOrder
-  } from './pagedWindow.mjs';
+  } from './pagedWindow';
   import {
     MAILBOX_CHANGED_EVENT,
     isMailboxChangedPayload,

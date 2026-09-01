@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test } from 'vitest';
 
 import {
   MAILBOX_REFRESH_ROW_TARGET,
@@ -11,14 +11,14 @@ import {
   mailboxWindowStartForIndex,
   recoverRequiredRow,
   threadPageOrder
-} from '../src/pagedWindow.mjs';
+} from './pagedWindow';
 import { performance } from 'node:perf_hooks';
 
-function rows(first, last) {
+function rows(first: number, last: number) {
   return Array.from({ length: last - first + 1 }, (_, index) => ({ id: first + index }));
 }
 
-function threadRows(firstRank, lastRank) {
+function threadRows(firstRank: number, lastRank: number) {
   return Array.from({ length: lastRank - firstRank + 1 }, (_, index) => {
     const rank = firstRank + index;
     return { id: rank, latestAt: 10_000 - rank };
@@ -26,7 +26,7 @@ function threadRows(firstRank, lastRank) {
 }
 
 test('refresh restores the loaded page-two window and selected row', async () => {
-  const requested = [];
+  const requested: Array<string | null> = [];
   const page = await collectPagedWindow({
     minimumRows: 100,
     fetchPage: async (cursor) => {
@@ -46,8 +46,8 @@ test('refresh restores the loaded page-two window and selected row', async () =>
 
 test('a delayed page is discarded after navigation changes generation', async () => {
   let current = true;
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
   const pending = collectPagedWindow({
     minimumRows: 50,
     fetchPage: async () => {

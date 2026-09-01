@@ -1,10 +1,11 @@
-import { emailAddresses } from './replyRecipients.mjs';
+import { emailAddresses } from './replyRecipients';
 
-/** @param {string} value */
-export function recipientTokens(value) {
-  const tokens = [];
+/// Splits a recipient line on separators that are not inside a quoted display
+/// name or an angle-bracketed address.
+export function recipientTokens(value: string): string[] {
+  const tokens: string[] = [];
   let current = '';
-  let quote = null;
+  let quote: string | null = null;
   let angleDepth = 0;
   for (const character of String(value ?? '')) {
     if (quote) {
@@ -30,13 +31,14 @@ export function recipientTokens(value) {
   return tokens;
 }
 
-/** @param {string[]} tokens */
-export function serializeRecipientTokens(tokens) {
+export function serializeRecipientTokens(tokens: string[]): string {
   return tokens.map((token) => token.trim()).filter(Boolean).join(', ');
 }
 
-/** @param {string} existing @param {string} candidate */
-export function appendRecipientToken(existing, candidate) {
+export function appendRecipientToken(
+  existing: string,
+  candidate: string
+): { value: string; error: string } {
   const clean = candidate.trim();
   if (!clean) return { value: serializeRecipientTokens(recipientTokens(existing)), error: '' };
   if (/\r|\n/u.test(clean) || emailAddresses(clean).length !== 1) {

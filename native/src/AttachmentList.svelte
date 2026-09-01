@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onDestroy } from 'svelte';
-  import { decodeAttachmentBase64 } from './attachmentContent.mjs';
+  import { decodeAttachmentBase64 } from './attachmentContent';
   import type { AttachmentContent, AttachmentSummary } from './types';
 
   export let attachments: AttachmentSummary[] = [];

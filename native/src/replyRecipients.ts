@@ -1,23 +1,32 @@
+export type ReplyMode = 'reply' | 'replyAll';
+
+type ReplySource = {
+  senderEmail: string;
+  recipients: string;
+  ccRecipients?: string;
+  isFromMe: boolean;
+};
+
 const addressPattern = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/giu;
 
-/** @param {string} value */
-export function emailAddresses(value) {
+export function emailAddresses(value: string): string[] {
   return value.match(addressPattern) ?? [];
 }
 
-/**
- * @param {Array<{ senderEmail: string, recipients: string, ccRecipients?: string, isFromMe: boolean }>} messages
- * @param {string[]} ownAddresses
- * @param {'reply' | 'replyAll'} mode
- */
-export function replyRecipients(messages, ownAddresses, mode = 'reply') {
+/// Your own addresses never come back as recipients, and a plain reply stops at
+/// the first source that yields anyone.
+export function replyRecipients(
+  messages: ReplySource[],
+  ownAddresses: string[],
+  mode: ReplyMode = 'reply'
+): string {
   const own = new Set(ownAddresses.map((address) => address.trim().toLocaleLowerCase()).filter(Boolean));
   const latestExternal = [...messages].reverse().find((message) => !message.isFromMe);
   const latest = messages.at(-1);
   const candidates = mode === 'replyAll'
     ? [latestExternal?.senderEmail, latest?.senderEmail, latest?.recipients, latest?.ccRecipients, latestExternal?.recipients, latestExternal?.ccRecipients]
     : [latestExternal?.senderEmail, latest?.recipients];
-  const unique = new Map();
+  const unique = new Map<string, string>();
 
   for (const candidate of candidates) {
     for (const address of emailAddresses(candidate ?? '')) {
@@ -30,7 +39,6 @@ export function replyRecipients(messages, ownAddresses, mode = 'reply') {
   return [...unique.values()].join(', ');
 }
 
-/** @param {boolean} expanded @param {string} text @param {string} html */
-export function shouldExpandInlineReply(expanded, text, html) {
+export function shouldExpandInlineReply(expanded: boolean, text: string, html: string): boolean {
   return expanded || text.length > 100 || /<(?:a|strong|em|u|ul|ol|li)\b/iu.test(html);
 }

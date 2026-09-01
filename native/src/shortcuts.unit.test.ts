@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { test } from 'vitest';
 
-import { isInteractiveShortcutTarget, mailboxShortcutFor } from '../src/shortcuts.mjs';
+import { isInteractiveShortcutTarget, mailboxShortcutFor } from './shortcuts';
+import type { ShortcutEvent } from './shortcuts';
 
-function event(key, target = null, modifiers = {}) {
+function event(
+  key: string,
+  target: unknown = null,
+  modifiers: Partial<ShortcutEvent> & { shiftKey?: boolean } = {}
+): ShortcutEvent {
   return { key, target, metaKey: false, ctrlKey: false, altKey: false, ...modifiers };
 }
 
@@ -43,6 +48,6 @@ test('native mailbox shortcuts map only the documented mailbox keys', () => {
 });
 
 test('interactive target detection honors nested controls', () => {
-  const nested = { tagName: 'SPAN', closest: (selector) => selector.includes('button') ? {} : null };
+  const nested = { tagName: 'SPAN', closest: (selector: string) => selector.includes('button') ? {} : null };
   assert.equal(isInteractiveShortcutTarget(nested), true);
 });
