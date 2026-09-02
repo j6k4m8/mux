@@ -238,6 +238,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .topbar-icon-button:hover, .icon-button:hover { color: var(--text); background: var(--surface-hover); }
 
 .workspace-grid { height: calc(100% - var(--topbar)); display: grid; grid-template-columns: 220px 370px minmax(0, 1fr); }
+.workspace-grid.rail-collapsed { grid-template-columns: 58px 370px minmax(0, 1fr); }
 .sidebar, .thread-pane { min-width: 0; min-height: 0; border-right: 1px solid var(--border); }
 .sidebar { display: flex; flex-direction: column; padding: 16px 12px 12px; overflow-y: auto; background: var(--surface); }
 .sidebar button { width: 100%; background: transparent; cursor: pointer; }
@@ -294,6 +295,62 @@ html[data-theme="dark"] .filter { box-shadow: none; }
    fixed views do not have. */
 .folders > button { grid-template-columns: 22px minmax(0, 1fr) auto auto; }
 .folder-account { width: 6px; height: 6px; border-radius: 50%; }
+/* Folder sections: one per account, folded away until asked for. */
+.folder-section {
+  min-height: 30px;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+.folder-section:hover { color: var(--text); background: var(--surface-hover); }
+.folder-section strong { min-width: 0; overflow: hidden; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.folder-section em { color: var(--text-faint); font-size: 10px; font-style: normal; font-weight: 700; }
+.folder-chevron { color: var(--text-faint); font-size: 12px; }
+.folders { margin: 0 0 4px 6px; }
+
+/* The narrow rail. Everything that is a word goes away; the icons stay put so
+   nothing moves sideways when it opens again. */
+.rail-toggle {
+  align-self: flex-end;
+  width: 24px !important;
+  height: 24px;
+  margin-bottom: 4px;
+  border-radius: 7px;
+  color: var(--text-faint);
+  font-size: 14px;
+  cursor: pointer;
+}
+.rail-toggle:hover { color: var(--text); background: var(--surface-hover); }
+.sidebar.is-rail { padding: 12px 9px; }
+.sidebar.is-rail .rail-toggle { align-self: center; }
+.sidebar.is-rail .section-label,
+.sidebar.is-rail .folder-section,
+.sidebar.is-rail .folders,
+.sidebar.is-rail .projection-status,
+.sidebar.is-rail .account-row,
+.sidebar.is-rail .nav-section strong,
+.sidebar.is-rail .nav-section em,
+.sidebar.is-rail .accounts button > span:not(.account-dot),
+.sidebar.is-rail .accounts button > em,
+.sidebar.is-rail .settings-button strong,
+.sidebar.is-rail .settings-button kbd,
+.sidebar.is-rail .smart-views button > span:not(.smart-dot),
+.sidebar.is-rail .compose > span { display: none; }
+.sidebar.is-rail .nav-section button,
+.sidebar.is-rail .accounts button,
+.sidebar.is-rail .settings-button { grid-template-columns: 22px; justify-content: center; padding: 0; }
+.sidebar.is-rail .smart-views button { grid-template-columns: 10px; justify-content: center; padding: 0; }
+/* Nothing in the rail is wider than the rail, so nothing should be scrollable
+   sideways. */
+.sidebar.is-rail { overflow-x: hidden; }
+.sidebar.is-rail .compose { gap: 0; }
 
 .settings-accents { flex-wrap: wrap; }
 .accent-swatch { width: 11px; height: 11px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12); }

@@ -9,7 +9,7 @@ export type MailboxShortcut =
 
 /// Chords reach past a focused field: searching and the palette have to be
 /// available while someone is typing in one.
-export type ChordShortcut = 'search' | 'palette' | 'settings' | 'shortcuts';
+export type ChordShortcut = 'search' | 'palette' | 'settings' | 'shortcuts' | 'toggle-sidebar';
 
 export type ShortcutAction = MailboxShortcut | ChordShortcut;
 
@@ -79,6 +79,13 @@ export const shortcutCatalog: ShortcutDefinition[] = [
     description: 'Run any command by name.',
     group: 'Navigation',
     bindings: [{ key: 'k', command: true }, { key: 'p', command: true, hidden: true }]
+  },
+  {
+    action: 'toggle-sidebar',
+    title: 'Narrow the sidebar',
+    description: 'Shrink the rail to icons, or widen it again.',
+    group: 'Navigation',
+    bindings: [{ key: '\\', command: true }]
   },
   {
     action: 'archive',
@@ -203,7 +210,9 @@ function actionFor(event: ShortcutEvent, command: boolean): ShortcutAction | nul
   return null;
 }
 
-const chordActions = new Set<ShortcutAction>(['search', 'palette', 'settings', 'shortcuts']);
+const chordActions = new Set<ShortcutAction>([
+  'search', 'palette', 'settings', 'shortcuts', 'toggle-sidebar'
+]);
 const mailboxActions = new Set<ShortcutAction>([
   'next-thread', 'previous-thread', 'open-thread', 'archive', 'toggle-star', 'snooze',
   'toggle-unread', 'move', 'reply', 'reply-all', 'forward', 'compose', 'go-to',

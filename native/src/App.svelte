@@ -36,6 +36,13 @@
   import { moveDestinations } from './moveTargets';
   import { motionTiming, slideAway, slideReveal, toastMotion } from './motion';
   import {
+    persistSidebarLayout,
+    readSidebarLayout,
+    toggleFolderAccount,
+    DEFAULT_SIDEBAR_LAYOUT
+  } from './sidebarLayout';
+  import type { SidebarLayout } from './sidebarLayout';
+  import {
     persistThemePreference,
     readThemePreference,
     resolveTheme,
@@ -133,6 +140,7 @@
   let filter = '';
   /// The account folder being read, when one is open instead of a fixed view.
   let selectedContainer: ContainerSummary | null = null;
+  let sidebar: SidebarLayout = DEFAULT_SIDEBAR_LAYOUT;
   let searchField: SearchField;
   let savedSearches: SavedSearch[] = [];
   let searchRows: ThreadSummary[] = [];
@@ -258,6 +266,7 @@
     : selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
   $: offersUndo = noticeOffersUndo(notice, clock);
   $: motion = motionTiming(appearance.animation);
+  $: railCollapsed = sidebar.collapsed && !compactNavigation;
   $: applyAccentToRoot(
     appearance.accent,
     theme,
@@ -303,6 +312,7 @@
 
   onMount(() => {
     destroyed = false;
+    sidebar = readSidebarLayout();
     setTheme(readThemePreference(), false);
     const stopWatchingSystemTheme = watchSystemTheme(systemThemeChanged);
     themeWatchers.push(stopWatchingSystemTheme);
@@ -353,6 +363,18 @@
     document.documentElement.dataset.theme = theme;
   }
 
+
+  /// The narrow rail is a wide-window arrangement: below that the sidebar is
+  /// already an overlay, and shrinking an overlay to icons helps nobody.
+  function toggleRail() {
+    sidebar = { ...sidebar, collapsed: !sidebar.collapsed };
+    persistSidebarLayout(sidebar);
+  }
+
+  function toggleFolderSection(accountId: string) {
+    sidebar = toggleFolderAccount(sidebar, accountId);
+    persistSidebarLayout(sidebar);
+  }
 
   function toggleAccountVisibility(accountId: string) {
     hiddenAccounts = hiddenAccounts.includes(accountId)
@@ -1346,6 +1368,11 @@
       void openSettings();
       return;
     }
+    if (chord === 'toggle-sidebar' && !composerOpen && !settingsOpen) {
+      event.preventDefault();
+      toggleRail();
+      return;
+    }
     if (chord === 'shortcuts' && !composerOpen) {
       event.preventDefault();
       openShortcutSheet();
@@ -1717,7 +1744,12 @@
         close={closeSettings}
       />
     {:else}
-      <div class="workspace-grid" data-testid="mailbox-workspace" inert={blockingDialogOpen}>
+      <div
+        class="workspace-grid"
+        class:rail-collapsed={railCollapsed}
+        data-testid="mailbox-workspace"
+        inert={blockingDialogOpen}
+      >
         <MailboxSidebar
           {mailbox}
           counts={selectedCounts}
@@ -1732,6 +1764,10 @@
           liveUpdates={mailboxEventsAvailable}
           compose={() => openComposer()}
           {selectedContainer}
+          railCollapsed={railCollapsed}
+          openFolderAccounts={sidebar.openFolderAccounts}
+          {toggleRail}
+          {toggleFolderSection}
           {selectView}
           {selectSmartView}
           {selectAccount}

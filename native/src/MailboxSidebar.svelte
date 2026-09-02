@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import { mailboxViews, smartViews } from './mailboxViews';
+  import { folderSectionIsOpen } from './sidebarLayout';
   import type {
     AccountSummary,
     ContainerSummary,
@@ -16,6 +17,9 @@
   export let selectedSmartView: SmartView;
   export let selectedAccount: string | null;
   export let selectedContainer: ContainerSummary | null = null;
+  /// The narrow rail: icons only, no labels, no counts.
+  export let railCollapsed = false;
+  export let openFolderAccounts: string[] = [];
   export let hiddenAccounts: string[] = [];
   export let filter = '';
   export let collapsed = false;
@@ -28,17 +32,22 @@
   export let selectSmartView: (view: Exclude<SmartView, ''>, query: string) => void;
   export let selectAccount: (accountId: string | null) => void;
   export let selectContainer: (container: ContainerSummary) => void;
+  export let toggleRail: () => void;
+  export let toggleFolderSection: (accountId: string) => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openActivity: () => void;
 
-  /// The account's own folders, for the account being read. Under All accounts
-  /// every account's folders are listed, each carrying its account's colour.
-  $: folders = mailbox.containers.filter((container) =>
-    !hiddenAccounts.includes(container.accountId)
-    && (selectedAccount === null || container.accountId === selectedAccount)
-  );
-  $: showFolderAccount = selectedAccount === null && mailbox.accounts.length > 1;
+  /// Folders belong to one account each, so they are listed under the account
+  /// they belong to — one foldable section per visible account that has any.
+  $: folderSections = mailbox.accounts
+    .filter((account) => !hiddenAccounts.includes(account.id))
+    .map((account) => ({
+      account,
+      folders: mailbox.containers.filter((container) => container.accountId === account.id)
+    }))
+    .filter((section) => section.folders.length > 0);
+  $: openFolderAccountId = selectedContainer?.accountId ?? null;
 
   $: draftCount = mailbox.drafts.filter(
     (draft) => selectedAccount === null || draft.accountId === selectedAccount
@@ -54,10 +63,6 @@
     return true;
   }
 
-  function accountFor(accountId: string): AccountSummary | undefined {
-    return mailbox.accounts.find((account) => account.id === accountId);
-  }
-
   function accountLabel(account: AccountSummary, hidden: boolean): string {
     return hidden ? `Show ${account.name}` : `Hide ${account.name}`;
   }
@@ -66,13 +71,25 @@
 <nav
   id="native-navigation"
   class="sidebar"
+  class:is-rail={railCollapsed}
   aria-label="Mailbox navigation"
   aria-hidden={collapsed && !open}
   inert={collapsed && !open}
   data-testid="mailbox-navigation"
 >
+  <button
+    class="rail-toggle"
+    type="button"
+    aria-label={railCollapsed ? 'Widen the sidebar' : 'Narrow the sidebar to icons'}
+    aria-expanded={!railCollapsed}
+    title={railCollapsed ? 'Widen the sidebar (⌘\\)' : 'Narrow the sidebar (⌘\\)'}
+    data-action="toggle-rail"
+    data-testid="rail-toggle"
+    on:click={() => toggleRail()}
+  >{railCollapsed ? '\u203A' : '\u2039'}</button>
+
   <button class="compose" data-action="compose" title="Compose a message (C)" data-testid="compose-button" on:click={() => compose()}>
-    <Icon name="compose" size={18} /> Compose
+    <Icon name="compose" size={18} /><span>Compose</span>
   </button>
 
   <section class="nav-section">
@@ -103,29 +120,45 @@
     {/each}
   </section>
 
-  {#if folders.length}
+  {#if folderSections.length}
     <p class="section-label">Folders</p>
-    <section class="nav-section folders">
-      {#each folders as folder (`${folder.accountId}:${folder.remoteId}`)}
-        <button
-          class:is-active={selectedContainer?.remoteId === folder.remoteId
-            && selectedContainer?.accountId === folder.accountId}
-          data-action="select-folder"
-          data-folder-id={folder.remoteId}
-          title={showFolderAccount
-            ? `${folder.name} — ${accountFor(folder.accountId)?.name ?? folder.accountId}`
-            : folder.name}
-          on:click={() => selectContainer(folder)}
-        >
-          <span class="nav-icon"><Icon name={folder.kind === 'label' ? 'star' : 'archive'} size={15} /></span>
-          <strong>{folder.name}</strong>
-          {#if showFolderAccount}
-            <span class="folder-account" style:background={accountFor(folder.accountId)?.color}></span>
-          {/if}
-          <em>{folder.unread || ''}</em>
-        </button>
-      {/each}
-    </section>
+    {#each folderSections as section (section.account.id)}
+      {@const open = folderSectionIsOpen(openFolderAccounts, section.account.id, openFolderAccountId)}
+      <button
+        class="folder-section"
+        class:is-open={open}
+        type="button"
+        aria-expanded={open}
+        aria-label={`${open ? 'Fold away' : 'Show'} ${section.account.name}'s folders`}
+        data-action="toggle-folder-section"
+        data-account-id={section.account.id}
+        title={`${open ? 'Fold away' : 'Show'} ${section.account.name}'s folders`}
+        on:click={() => toggleFolderSection(section.account.id)}
+      >
+        <span class="account-dot" style:background={section.account.color}></span>
+        <strong>{section.account.name}</strong>
+        <em>{section.folders.length}</em>
+        <span class="folder-chevron" aria-hidden="true">{open ? '\u2304' : '\u203A'}</span>
+      </button>
+      {#if open}
+        <section class="nav-section folders">
+          {#each section.folders as folder (folder.remoteId)}
+            <button
+              class:is-active={selectedContainer?.remoteId === folder.remoteId
+                && selectedContainer?.accountId === folder.accountId}
+              data-action="select-folder"
+              data-folder-id={folder.remoteId}
+              title={`${folder.name} — ${section.account.name}`}
+              on:click={() => selectContainer(folder)}
+            >
+              <span class="nav-icon"><Icon name={folder.kind === 'label' ? 'star' : 'archive'} size={15} /></span>
+              <strong>{folder.name}</strong>
+              <em>{folder.unread || ''}</em>
+            </button>
+          {/each}
+        </section>
+      {/if}
+    {/each}
   {/if}
 
   <p class="section-label">Accounts</p>

@@ -839,6 +839,26 @@ describe('production mailbox interactions', () => {
     await user.click(caret);
     expect(within(reader).getAllByRole('button', { name: /^Expand message/u }).length).toBeGreaterThan(0);
   });
+
+  test('the sidebar narrows to icons and remembers that it did', async () => {
+    const { user } = await renderMailbox();
+    const workspace = screen.getByTestId('mailbox-workspace');
+    const toggle = screen.getByTestId('rail-toggle');
+    expect(workspace.classList.contains('rail-collapsed')).toBe(false);
+
+    await user.click(toggle);
+    expect(workspace.classList.contains('rail-collapsed')).toBe(true);
+    expect(screen.getByTestId('mailbox-navigation').classList.contains('is-rail')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).collapsed).toBe(true);
+
+    // The same chord that narrows it widens it again.
+    blurActiveElement();
+    await fireEvent.keyDown(window, { key: '\\', metaKey: true });
+    expect(workspace.classList.contains('rail-collapsed')).toBe(false);
+    expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).collapsed).toBe(false);
+  });
+
   test('the accent follows the conversation being read, or a colour you pick', async () => {
     const { user } = await renderMailbox();
     const accent = () => document.documentElement.style.getPropertyValue('--accent');
@@ -855,6 +875,7 @@ describe('production mailbox interactions', () => {
     await user.click(within(screen.getByTestId('accent-choice')).getByRole('button', { name: /Current account/u }));
     expect(accent()).toBe(account.color);
   });
+
   test('an account folder is listed, opens on its own, and is a jump target', async () => {
     mailbox.containers.push({
       accountId: account.id,
@@ -868,8 +889,14 @@ describe('production mailbox interactions', () => {
     try {
       const { calls, user } = await renderMailbox();
       const navigation = screen.getByTestId('mailbox-navigation');
-      const folder = within(navigation).getByRole('button', { name: /Zoomie Cycle/u });
+      // Folders are folded away under the account they belong to: an account
+      // can have a great many, and the fixed views are what the rail is for.
+      expect(within(navigation).queryByRole('button', { name: /Zoomie Cycle/u })).toBeNull();
+      const section = within(navigation).getByRole('button', { name: /Work's folders/u });
+      expect(section.getAttribute('aria-expanded')).toBe('false');
+      await user.click(section);
 
+      const folder = within(navigation).getByRole('button', { name: /Zoomie Cycle/u });
       await user.click(folder);
       // A folder is read inside its own account, and lists only its own mail.
       await waitFor(() => {
