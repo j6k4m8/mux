@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
+  import { animationChoices } from './motion';
   import {
     densityChoices,
     DEFAULT_FONT,
@@ -332,6 +333,21 @@
           </select>
         </label>
 
+        </section>
+
+        <section class="settings-card">
+          <h3>Animation</h3>
+          <p>How fast the list, the dialogs, and the toasts move. Your Mac's reduce-motion setting turns them off whatever this says.</p>
+          <div class="settings-choice-row" role="group" aria-label="Animation speed" data-testid="animation-speed">
+          {#each animationChoices as choice}
+            <button
+              class:is-active={appearance.animation === choice.value}
+              type="button"
+              data-animation-option={choice.value}
+              on:click={() => applyAppearance({ ...appearance, animation: choice.value })}
+            >{choice.label}</button>
+          {/each}
+          </div>
         </section>
 
         <section class="settings-card">

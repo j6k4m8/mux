@@ -366,10 +366,20 @@ describe('production mailbox interactions', () => {
     await user.click(within(screen.getByTestId('typeface')).getByRole('button', { name: 'Mono' }));
     expect(document.documentElement.style.getPropertyValue('--app-font')).toContain('monospace');
 
+    await user.click(within(screen.getByTestId('animation-speed')).getByRole('button', { name: 'Zoomie' }));
+    expect(document.documentElement.style.getPropertyValue('--motion-scale')).toBe('0.45');
+    // Picking a speed answers with something moving at it.
+    await waitFor(() => expect(screen.getByTestId('undo-toast').textContent).toContain('Like this!'));
+
+    await user.click(within(screen.getByTestId('animation-speed')).getByRole('button', { name: 'None' }));
+    expect(document.documentElement.style.getPropertyValue('--motion-scale')).toBe('0');
+    await waitFor(() => expect(screen.getByTestId('undo-toast').textContent).toContain('Like this!'));
+
     const saved = JSON.parse(window.localStorage.getItem('mux-appearance')!);
     expect(saved.density).toBe('sardine');
     expect(saved.scale).toBe(1.15);
     expect(saved.font).toContain('monospace');
+    expect(saved.animation).toBe('none');
   });
 
   test('each account carries its own refresh cadence, defaulting to a minute', async () => {

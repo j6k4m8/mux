@@ -17,6 +17,9 @@ export type Notice = {
 
 /// Long enough to read a confirmation, and to notice one replacing another.
 export const CONFIRMATION_MS = 5_000;
+/// A sample is not there to be read: it is there to be watched arriving and
+/// leaving, so it stays only long enough to do both and get out of the way.
+export const SAMPLE_MS = 1_400;
 /// Failures get longer: they are worth reading twice and are not expected.
 export const FAILURE_MS = 10_000;
 /// How long the mailbox offers to take back a change before it goes out.
@@ -29,6 +32,11 @@ export function describeFailure(cause: unknown): string {
 /// Something happened and there is nothing to take back.
 export function confirmationNotice(text: string, now: number = Date.now()): Notice {
   return { text, until: now + CONFIRMATION_MS };
+}
+
+/// A toast shown to demonstrate something rather than to report it.
+export function sampleNotice(text: string, now: number = Date.now()): Notice {
+  return { text, until: now + SAMPLE_MS };
 }
 
 export function failureNotice(cause: unknown, now: number = Date.now()): Notice {

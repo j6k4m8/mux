@@ -3,6 +3,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy, onMount, tick } from 'svelte';
+  import { flip } from 'svelte/animate';
   import Composer from './Composer.svelte';
   import Icon from './Icon.svelte';
   import InlineReply from './InlineReply.svelte';
@@ -32,11 +33,13 @@
   import { trapModalKeydown } from './modalFocus';
   import { mailboxJumpRows } from './jumpDialog';
   import { moveDestinations } from './moveTargets';
+  import { motionTiming, slideAway, slideReveal, toastMotion } from './motion';
   import {
     confirmationNotice,
     failureNotice,
     noticeExpired,
     noticeOffersUndo,
+    sampleNotice,
     undoDeadline,
     undoableNotice
   } from './notices';
@@ -234,6 +237,11 @@
   };
   $: selectedThreadTotal = selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
   $: offersUndo = noticeOffersUndo(notice, clock);
+  $: motion = motionTiming(appearance.animation);
+  /// Swapping mailbox, account, search, or page replaces every row at once.
+  /// That is a new list rather than mail coming and going, so it is keyed: the
+  /// row transitions below are local and stay out of it.
+  $: threadListKey = `${selectedView}|${selectedAccount ?? ''}|${selectedSmartView}|${filter.trim()}|${renderedThreadWindow.start}`;
   $: blockingDialogOpen = commandPaletteOpen || snoozeDialogOpen || activityDialogOpen
     || composerOpen || goToOpen || moveOpen || shortcutSheetOpen;
   $: if (noticeExpired(notice, clock)) notice = null;
@@ -346,9 +354,21 @@
   }
 
   function applyAppearance(next: Appearance, persist = true) {
+    const speedChanged = persist && next.animation !== appearance.animation;
     appearance = next;
     applyAppearanceToRoot(next);
     if (persist) persistAppearance(next);
+    // The setting is about how things move, so the answer to picking one is a
+    // thing moving at that speed.
+    if (speedChanged) void showAnimationSample();
+  }
+
+  /// Clearing first so the toast leaves and arrives again: picking a second
+  /// speed has to show that speed, not quietly reuse the toast already up.
+  async function showAnimationSample() {
+    notice = null;
+    await tick();
+    notice = sampleNotice('Like this!');
   }
 
   function toggleTheme() {
@@ -1666,7 +1686,15 @@
                 <button class="search-more" type="button" title="Load more" on:click={() => moveDraftRenderWindow(-1)}>Show previous loaded drafts</button>
               {/if}
               {#each renderedDraftWindow.rows as draft (draft.id)}
-                <button class="thread-row draft-row" data-testid="thread-row" data-draft-id={draft.id} on:click={() => openSavedDraft(draft)}>
+                <button
+                  class="thread-row draft-row"
+                  data-testid="thread-row"
+                  data-draft-id={draft.id}
+                  animate:flip={{ duration: motion.base }}
+                  in:slideReveal|local={{ duration: motion.base }}
+                  out:slideAway|local={{ duration: motion.base }}
+                  on:click={() => openSavedDraft(draft)}
+                >
                   <span class="thread-accent" style:background={draft.accountColor}></span>
                   <span class="avatar" style:--avatar-color={draft.accountColor}>D</span>
                   <span class="thread-copy">
@@ -1685,6 +1713,7 @@
               {#if renderedThreadWindow.start > 0}
                 <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(-1)}>Show previous loaded threads</button>
               {/if}
+              {#key threadListKey}
               {#each renderedThreadWindow.rows as thread (thread.id)}
                 {@const swiping = swipeRow === thread.id}
                 {@const pending = swiping
@@ -1693,6 +1722,9 @@
                 <div
                   class="thread-swipe"
                   class:is-swiping={swiping}
+                  animate:flip={{ duration: motion.base }}
+                  in:slideReveal|local={{ duration: motion.base }}
+                  out:slideAway|local={{ duration: motion.base }}
                   use:swipeGesture={{
                     enabled: appearance.swipeLeft !== 'none' || appearance.swipeRight !== 'none',
                     onstate: swipeStateFor(thread),
@@ -1746,6 +1778,7 @@
                   <div class="empty"><strong>No {viewTitle.toLocaleLowerCase()} mail</strong><span>{filter ? 'Try a broader search.' : 'Choose another mailbox or account.'}</span></div>
                 {/if}
               {/each}
+              {/key}
               {#if threadError}
                 <div class="empty search-state has-error" role="alert"><strong>Mailbox page could not load</strong><span>{threadError}</span></div>
               {/if}
@@ -1891,7 +1924,13 @@
   {/if}
 
   {#if notice}
-    <div class="undo-toast" role="status" data-testid="undo-toast" inert={blockingDialogOpen}>
+    <div
+      class="undo-toast"
+      role="status"
+      data-testid="undo-toast"
+      inert={blockingDialogOpen}
+      transition:toastMotion={{ duration: motion.base }}
+    >
       <span>{notice.text}</span>
       {#if offersUndo}
         <button on:click={undoNotice}>Undo</button>

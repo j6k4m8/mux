@@ -9,10 +9,13 @@ import {
   noticeExpired,
   noticeOffersUndo,
   noticeRemainingSeconds,
+  sampleNotice,
+  SAMPLE_MS,
   undoableNotice,
   undoDeadline,
   UNDO_MS
 } from './notices';
+import { MOTION_BASE_MS, motionDuration } from './motion';
 
 const now = 1_000_000;
 
@@ -22,6 +25,13 @@ test('a toast with nothing to undo always carries an expiry', () => {
   // Anything thrown reads as something, so a toast can never come up blank.
   assert.equal(failureNotice('plain string', now).text, 'plain string');
   assert.equal(failureNotice({ weird: true }, now).text, '[object Object]');
+});
+
+test('a sample is gone well before a confirmation would be', () => {
+  assert.equal(sampleNotice('Like this!', now).until, now + SAMPLE_MS);
+  assert.ok(SAMPLE_MS < CONFIRMATION_MS);
+  // It still outlasts arriving and leaving at the slowest speed.
+  assert.ok(SAMPLE_MS > 2 * motionDuration('slow', MOTION_BASE_MS, false));
 });
 
 test('undoable work expires only when its undo does', () => {

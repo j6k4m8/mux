@@ -3,6 +3,11 @@
 /// how it reaches the document. Kept out of the components so the settings
 /// screen and the mailbox agree on it without one importing the other.
 
+import { isAnimationSpeed, motionScale } from './motion';
+import type { AnimationSpeed } from './motion';
+
+export type { AnimationSpeed };
+
 export type Density = 'roomy' | 'default' | 'sardine';
 export type SwipeAction = 'archive' | 'delete' | 'snooze' | 'star' | 'unread' | 'none';
 
@@ -17,6 +22,7 @@ export type Appearance = {
   swipeLeft: SwipeAction;
   swipeRight: SwipeAction;
   railPreview: boolean;
+  animation: AnimationSpeed;
 };
 
 export const APPEARANCE_KEY = 'mux-appearance';
@@ -33,7 +39,8 @@ export const DEFAULT_APPEARANCE: Appearance = {
   toolbarCollapseNarrow: true,
   swipeLeft: 'archive',
   swipeRight: 'snooze',
-  railPreview: true
+  railPreview: true,
+  animation: 'medium'
 };
 
 export const fontChoices: Array<{ label: string; value: string }> = [
@@ -77,12 +84,13 @@ export function swipeLabel(action: SwipeAction): string {
   return swipeChoices.find((choice) => choice.value === action)?.label ?? 'Nothing';
 }
 
-/// Scale and font are the two choices the whole document answers to; the rest
-/// are read by the components that care.
+/// Scale, font, and how fast things move are the choices the whole document
+/// answers to; the rest are read by the components that care.
 export function applyAppearanceToRoot(next: Appearance): void {
   const root = document.documentElement;
   root.style.setProperty('--ui-scale', String(next.scale));
   root.style.setProperty('--app-font', next.font);
+  root.style.setProperty('--motion-scale', String(motionScale(next.animation)));
 }
 
 export function persistAppearance(next: Appearance): void {
@@ -132,7 +140,8 @@ export function readSavedAppearance(): Appearance {
       toolbarCollapseNarrow: flag(value.toolbarCollapseNarrow, true),
       swipeLeft: swipe(value.swipeLeft, 'archive'),
       swipeRight: swipe(value.swipeRight, 'snooze'),
-      railPreview: flag(value.railPreview, true)
+      railPreview: flag(value.railPreview, true),
+      animation: isAnimationSpeed(value.animation) ? value.animation : 'medium'
     };
   } catch {
     return { ...DEFAULT_APPEARANCE };
