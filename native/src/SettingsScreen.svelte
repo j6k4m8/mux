@@ -21,6 +21,16 @@
   import type { MailboxBootstrap, SettingsSection, Theme } from './types';
 
   type GmailOAuthResult = { state: 'connected'; accountId: string; email: string };
+  type ImapAccountAdded = { accountId: string; email: string; folders: number };
+
+  /// Mux proves these details against the server before saving anything, so
+  /// this form is where a typo gets caught rather than the sync queue.
+  let imapForm = { displayName: '', email: '', host: '', port: 993, username: '', password: '' };
+  let imapBusy = false;
+  $: imapReady = Boolean(
+    imapForm.email.trim() && imapForm.host.trim() && imapForm.username.trim() && imapForm.password
+      && Number.isInteger(imapForm.port) && imapForm.port > 0 && imapForm.port <= 65535
+  );
 
   export let mailbox: MailboxBootstrap;
   export let appearance: Appearance;
@@ -88,6 +98,48 @@
       return { state: value.state, accountId: value.accountId, email: value.email };
     }
     throw new Error('Mux returned an invalid Google authorization result.');
+  }
+
+  function readImapAccountAdded(value: unknown): ImapAccountAdded {
+    if (
+      typeof value === 'object' && value !== null &&
+      'accountId' in value && typeof value.accountId === 'string' && value.accountId.length > 0 &&
+      'email' in value && typeof value.email === 'string' && value.email.length > 0 &&
+      'folders' in value && typeof value.folders === 'number' && Number.isFinite(value.folders)
+    ) {
+      return { accountId: value.accountId, email: value.email, folders: value.folders };
+    }
+    throw new Error('Mux returned an invalid mailbox result.');
+  }
+
+  async function addImapAccount() {
+    // The submit button is disabled without these, but a form also submits on
+    // Enter, and a half-filled credential is not worth sending anywhere.
+    if (imapBusy || !imapReady) return;
+    settingsError = '';
+    settingsMessage = '';
+    imapBusy = true;
+    try {
+      const result = readImapAccountAdded(await invoke<unknown>('imap_account_add', {
+        input: {
+          displayName: imapForm.displayName.trim(),
+          email: imapForm.email.trim(),
+          host: imapForm.host.trim(),
+          port: imapForm.port,
+          username: imapForm.username.trim(),
+          password: imapForm.password
+        }
+      }));
+      // The password is not kept around once the keychain has it.
+      imapForm = { displayName: '', email: '', host: '', port: 993, username: '', password: '' };
+      const folders = result.folders === 1 ? '1 folder' : `${result.folders} folders`;
+      settingsMessage = `Connected ${result.email} — ${folders}.`;
+      await refreshMailbox();
+    } catch (cause) {
+      settingsError = settingsErrorText(cause);
+    } finally {
+      imapBusy = false;
+    }
   }
 
   async function syncAccountNow(accountId: string, name: string) {
@@ -250,6 +302,43 @@
               <button class="primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Add Gmail account</button>
             {/if}
           </div>
+
+          <form class="provider-form" data-testid="imap-form" on:submit|preventDefault={addImapAccount}>
+            <h3 id="imap-connect-title">IMAP</h3>
+            <p>Any other mail server. Mux reads this mailbox; it cannot yet send from it or change it on the server.</p>
+            <div class="provider-fields">
+              <label>
+                <span>Server</span>
+                <input bind:value={imapForm.host} type="text" autocomplete="off" spellcheck="false" placeholder="imap.example.com" data-testid="imap-host" disabled={imapBusy} />
+              </label>
+              <label class="provider-port">
+                <span>Port</span>
+                <input bind:value={imapForm.port} type="number" min="1" max="65535" data-testid="imap-port" disabled={imapBusy} />
+              </label>
+              <label>
+                <span>Username</span>
+                <input bind:value={imapForm.username} type="text" autocomplete="off" spellcheck="false" data-testid="imap-username" disabled={imapBusy} />
+              </label>
+              <label>
+                <span>Password</span>
+                <input bind:value={imapForm.password} type="password" autocomplete="off" data-testid="imap-password" disabled={imapBusy} />
+              </label>
+              <label>
+                <span>Address</span>
+                <input bind:value={imapForm.email} type="email" autocomplete="off" spellcheck="false" placeholder="you@example.com" data-testid="imap-email" disabled={imapBusy} />
+              </label>
+              <label>
+                <span>Name</span>
+                <input bind:value={imapForm.displayName} type="text" autocomplete="off" placeholder="Optional" data-testid="imap-name" disabled={imapBusy} />
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button class="primary-button" type="submit" data-testid="imap-submit" disabled={imapBusy || !imapReady}>
+                {imapBusy ? 'Checking the server…' : 'Add IMAP account'}
+              </button>
+              <span class="settings-hint">Implicit TLS only. Mux signs in before saving anything.</span>
+            </div>
+          </form>
         </section>
       {:else if settingsSection === 'appearance'}
         <header class="settings-heading">

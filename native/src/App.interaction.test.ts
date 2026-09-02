@@ -110,6 +110,11 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
       return { state: 'connected', accountId: 'gmail-fixture', email: 'reader@example.test' };
     }
     if (command === 'gmail_oauth_cancel') return { state: 'cancel_requested' };
+    if (command === 'imap_account_add') {
+      const input = (payload as { input?: { host?: string; email?: string } })?.input ?? {};
+      if (input.host === 'wrong.example.test') throw new Error('The server refused that username and password');
+      return { accountId: 'imap:fixture', email: input.email, folders: 12 };
+    }
     if (command === 'mailbox_bootstrap') return mailbox;
     if (command === 'list_threads') {
       return { threads, hasMore: false, nextCursor: null } satisfies ThreadPage;
@@ -895,6 +900,58 @@ describe('production mailbox interactions', () => {
     expect(await screen.findByTestId('stats-screen')).toBeTruthy();
     await fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
+  });
+
+  test('adding an imap mailbox verifies it, then clears the password', async () => {
+    const { calls, user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const submit = within(settings).getByTestId('imap-submit') as HTMLButtonElement;
+    // Nothing to submit until the mailbox is actually described.
+    expect(submit.disabled).toBe(true);
+
+    await user.type(within(settings).getByTestId('imap-host'), 'imap.example.test');
+    await user.type(within(settings).getByTestId('imap-username'), 'reader@example.test');
+    await user.type(within(settings).getByTestId('imap-password'), 'swordfish');
+    await user.type(within(settings).getByTestId('imap-email'), 'reader@example.test');
+    expect(submit.disabled).toBe(false);
+    await user.click(submit);
+
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'imap_account_add').at(-1);
+      expect(request?.payload).toMatchObject({
+        input: {
+          host: 'imap.example.test',
+          port: 993,
+          username: 'reader@example.test',
+          email: 'reader@example.test',
+          password: 'swordfish'
+        }
+      });
+    });
+    // What the server showed is reported, and the password does not linger.
+    await waitFor(() => expect(within(settings).getByRole('status').textContent)
+      .toContain('Connected reader@example.test — 12 folders.'));
+    expect((within(settings).getByTestId('imap-password') as HTMLInputElement).value).toBe('');
+    expect(calls.some((call) => call.command === 'mailbox_bootstrap')).toBe(true);
+  });
+
+  test('a mailbox the server refuses is reported and nothing is cleared', async () => {
+    const { user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+
+    await user.type(within(settings).getByTestId('imap-host'), 'wrong.example.test');
+    await user.type(within(settings).getByTestId('imap-username'), 'reader@example.test');
+    await user.type(within(settings).getByTestId('imap-password'), 'swordfish');
+    await user.type(within(settings).getByTestId('imap-email'), 'reader@example.test');
+    await user.click(within(settings).getByTestId('imap-submit'));
+
+    await waitFor(() => expect(within(settings).getByRole('alert').textContent)
+      .toContain('The server refused that username and password'));
+    // The details stay put so the mistake can be corrected rather than retyped.
+    expect((within(settings).getByTestId('imap-host') as HTMLInputElement).value).toBe('wrong.example.test');
+    expect((within(settings).getByTestId('imap-password') as HTMLInputElement).value).toBe('swordfish');
   });
 
   test('the sender shows who else was on the message, and only the caret closes it', async () => {
