@@ -1,8 +1,6 @@
-# Mux Architecture
+# Architecture
 
-## One application boundary
-
-Mux has one executable product path:
+One executable path:
 
 ```text
 Svelte UI
@@ -14,80 +12,79 @@ Rust domain/store/workers
 SQLite projection + journal        macOS Keychain credentials
 ```
 
-Vite exists only to build the embedded Svelte frontend and to serve it on `127.0.0.1` during `tauri dev`. There is no product HTTP server, browser UI, or Node store.
+Vite exists only to build the embedded frontend and to serve it on `127.0.0.1` during `tauri dev`. There is no product HTTP server, browser UI, or Node store, and `scripts/check.mjs` fails if the paths of the removed ones come back.
 
-## Runtime modules
+## Modules worth knowing about
 
-- `native/src`: production Svelte UI and pure UI helpers.
-- `native/src-tauri/src/lib.rs`: typed Tauri command boundary and narrow allowlist.
-- `store.rs`: SQLite migrations, queries, drafts, operations, demo projection, and local commands.
-- `search.rs`: bounded parser, AST, SQL compilation, date semantics, and sender/recipient field predicates.
-- `worker.rs`: durable work claiming, retries, ordering, and uncertain-send outcomes.
-- `outgoing.rs`, `internet_message.rs`: provider-neutral RFC 5322/MIME construction plus bounded canonical Internet message identities and reply chains.
-- `provider.rs`, `provider_ingest.rs`, `provider_schema.rs`: provider-neutral contracts, atomic projection, label replacement, and bounded full-reconciliation state.
-- `gmail.rs`, `gmail_access.rs`, `google_authorization.rs`: a Gmail bootstrap/history and mailbox-mutation adapter, fixed-origin HTTPS transport, typed keychain authority, and bounded installed-desktop authorization lifecycle. These are hermetically exercised; the existing ignored Tidings registration has passed the loader, but live Google execution is absent.
-- `mime_ingest.rs`: bounded `mail-parser` trust boundary for MIME trees, transfer encodings, charsets, decoded headers, nested messages, and binary attachments.
-- `content.rs`: HTML5-tree sanitization into the controlled rich-text subset with remote resources denied.
-- `navigation.rs`: normalized HTTP(S)-only external-link policy and exact WebView-origin allowlist.
-- `keychain.rs`: Rust-only provider credential storage in the macOS Keychain.
+Most of `native/src-tauri/src` is named after what it does. These are the ones whose responsibility is not obvious from the filename:
+
+- `provider.rs`, `provider_ingest.rs`, `provider_schema.rs` — the provider-neutral contract every adapter is written against: atomic projection, container replacement, reconciliation state, and the triggers that keep work identity and error codes honest at the SQL level.
+- `worker.rs` — durable work claiming, leases, retries, ordering, and the uncertain-send outcome.
+- `internet_message.rs` — canonical `Message-ID`, `In-Reply-To`, and bounded `References` values for both received and locally composed mail, which is what makes reply chains real rather than subject-matched.
+- `mime_ingest.rs` — the bounded `mail-parser` trust boundary. Every byte of mail passes through it.
+- `content.rs` — HTML5-tree sanitization into the controlled render subset.
+- `navigation.rs` — the HTTP(S)-only external-link policy and the exact WebView-origin allowlist.
+- `ipc_boundary.rs` — the serialized response ceilings, in one place so no command can quietly pick its own.
+- `provider_conformance.rs` — the projection matrix the worker applies, exercised offline as its own gate.
 
 ## State model
 
-### Confirmed provider projection
+Three layers, and they are not interchangeable.
 
-Provider-confirmed rows describe the last acknowledged remote state. UI code never mutates this layer directly.
+**Confirmed provider projection** describes the last state the provider acknowledged. UI code never mutates it directly.
 
-### Durable pending intent
+**Durable pending intent** is what the user asked for. Actions append an operation and a work item; effective SQLite views overlay pending operations on the confirmed projection, so archive, read, star, and send render immediately and survive a restart.
 
-User actions append operations and work items. Effective SQLite views overlay pending operations on confirmed projection, so archive/read/star/send interactions render immediately and survive process restart.
+Container membership is recorded per message, so a thread is in a folder or carries a label either entirely, not at all, or partially. A pending change overlays that aggregate with the desired end state. This lets a partially labelled thread be normalized without pretending its prior distribution was a boolean — and it is why a confirmed normalization has no exact inverse: the per-message distribution is not recoverable from a thread-level undo. Cancelling before execution is still safe.
 
-Provider label state is explicitly three-valued at the Rust boundary: absent from every locally known remote message, present on all of them, or partial. A pending add/remove overlays that confirmed aggregate with its desired state. This allows a partially labelled Gmail thread to be normalized without pretending that its prior distribution was a Boolean.
-
-### Mux-owned metadata
-
-Drafts, snooze times, invitation responses, operation activity, and future local labels belong to Mux and do not pretend to be provider state.
+**Mux-owned metadata** — drafts, snooze times, invitation responses, operation activity — belongs to Mux and does not pretend to be provider state.
 
 ## Command flow
 
-1. Svelte invokes a typed Tauri command.
-2. Rust validates size, enum, identifier, and state-transition bounds.
-3. One SQLite transaction records the operation and durable work.
-4. Effective views expose local intent immediately.
-5. Workers claim eligible work by scope and ordering key.
-6. The deterministic demo and hermetic Gmail adapter fixtures acknowledge, reconcile, retry, or fail work through the same state machine.
-7. Tauri events trigger a projection refresh; ordinary navigation remains local.
+Svelte invokes a typed command. Rust validates sizes, enums, identifiers, and allowed state transitions. One SQLite transaction records the operation and its durable work. Effective views expose the intent immediately. Workers later claim eligible work by scope and ordering key, and an adapter acknowledges, reconciles, retries, or fails it through the same state machine. A `mux://mailbox-changed` event triggers a refresh; ordinary navigation stays local throughout.
 
-Undo creates a compensating operation. It does not erase history. Stale operations are rejected rather than silently applied.
+Undo appends a compensating operation rather than erasing history. A stale operation is rejected, not silently applied.
 
 ## Sending
 
-Sending remains a special non-idempotent state machine. A draft is locked when queued. The v2 durable snapshot freezes Date, stable Message-ID/client correlation, recipients, bodies, and bounded reply headers before the undo window. Provider-neutral construction emits deterministic standards MIME, keeps Bcc in the transport envelope only, and rejects internationalized envelope addresses until an adapter proves SMTPUTF8 support. Pre-submission failure is retryable according to policy; a lost acknowledgement after submission becomes `outcome_unknown`. Recovery unlocks the exact validated draft snapshot without claiming failure and without resending. There is no generic automatic send replay.
+Sending is the one non-idempotent path and has its own state machine. Queuing locks the draft and freezes a durable snapshot — Date, stable Message-ID and client correlation, recipients, bodies, and bounded reply headers — before the undo window opens; the snapshot is fingerprinted, and the current version is 3, with earlier versions still validated for rows written by earlier builds. Provider-neutral construction emits deterministic standards MIME, keeps Bcc in the transport envelope only, and rejects internationalized envelope addresses until an adapter proves SMTPUTF8 support.
 
-Canonical Internet `Message-ID`, `In-Reply-To`, and bounded `References` values are stored with normalized provider and local messages. A reply prefers the latest persisted message identity, so the first response to received mail and later local responses build a real bounded thread chain. Existing pre-submission v1 work is upgraded atomically by replacing only non-executing work inside the startup transaction; the runtime immutable-work trigger remains enforced.
+Failure before submission is retryable by policy. A lost acknowledgement after submission becomes `outcome_unknown`, and recovery unlocks the exact validated snapshot without claiming failure and without resending. There is no generic automatic replay.
+
+Gmail is the only adapter that carries a send through: it submits the validated snapshot as raw MIME and reconciles what comes back. Without an SMTP client, the later half of this state machine is unreachable for any other account.
 
 ## Search and pagination
 
-Search input is bounded by character count, token count, nesting, field vocabulary, and date validation before SQL compilation. Values use bound SQLite parameters. FTS backs free-text body matching. Provider batches rebuild each affected thread index deterministically, so replay, replacement, rethreading, and tombstones do not retain stale terms. `from:` reads sender fields; `to:` reads To/Cc/Bcc fields. Thread, message, and search APIs use restart-stable, signed, versioned keyset cursors bound to the exact account/view/query/timezone/thread scope and capped at 256 bytes. They are live-view cursors, not historical database snapshots.
+Search input is bounded by character count, token count, nesting depth, field vocabulary, and date validation before any SQL is compiled, and values stay bound parameters. FTS backs free-text body matching. `from:` reads the sender fields; `to:` reads To, Cc, and Bcc. Provider batches rebuild each affected thread's index deterministically, so replay, replacement, rethreading, and tombstones cannot leave stale terms behind.
 
-Serialized Tauri responses have measured aggregate ceilings: 512 KiB bootstrap, 3 MiB thread/search pages, 16 MiB message detail, 28 MiB attachment content, and 256 KiB activity. Message pages split adaptively at the last complete row below the actual serialized ceiling and continue with an opaque cursor. Bootstrap carries draft headers only; full drafts and attachment bytes require exact typed lookups. Attachment reads are non-streaming and capped at 20 MiB raw with declared/stored/decoded length agreement. Provider batches are capped at 32 MiB before projection. The Svelte mailbox retains loaded rows but renders at most 120; conversations render at most 18 cards. Node/jsdom stress tests exercise 50,000 mailbox rows and 10,000 messages, while actual WebView frame timing remains a separate runtime check.
+Thread, message, and search pages use restart-stable signed keyset cursors, versioned and bound to the exact account, view, query, timezone, and thread scope, capped at 256 bytes. They are cursors over the live view, not snapshots of the database.
+
+Serialized responses have measured aggregate ceilings: 512 KiB for bootstrap, 3 MiB for a thread or search page, 16 MiB for message detail, 28 MiB for attachment content, 256 KiB for activity, and 32 MiB for a provider batch before projection. A message page splits at the last complete row below its actual serialized size and continues with a cursor. Bootstrap carries draft headers only; a full draft and attachment bytes each need their own explicit lookup. Attachment reads are non-streaming and capped at 20 MiB raw with declared, stored, and decoded lengths required to agree.
+
+The mailbox keeps every loaded row but renders at most 120 of them.
 
 ## Credentials
 
-Secrets are not stored in SQLite or returned across IPC. Svelte can invoke typed Gmail connect/cancel lifecycle commands only; client values, authorization codes, and tokens remain in Rust. There is no command that reads, writes, or unlocks a credential, and none that accepts a password. The installed-desktop flow uses the system browser, random state, PKCE S256, an exact random-port IPv4 loopback redirect with bounded reads/deadlines, fixed Google endpoints, `gmail.modify`, and Gmail profile identity binding. Completed authority is written to the macOS Keychain while SQLite stores only mailbox identity and an opaque reference. At startup every stored reference is revalidated against the keychain, and an account whose record is missing or malformed is marked for reauthorization. No live consent grant has run.
+Secrets are never stored in SQLite and never cross IPC. Svelte can invoke the Gmail connect and cancel lifecycle commands and nothing else; client values, authorization codes, and tokens stay in Rust. There is no command that reads, writes, or unlocks a credential, and none that accepts a password.
+
+The installed-desktop flow uses the system browser, random state, PKCE S256, an exact random-port IPv4 loopback redirect with bounded reads and deadlines, fixed Google endpoints, `gmail.modify`, and Gmail profile identity binding. Completed authority goes to the macOS Keychain; SQLite keeps only the normalized mailbox identity and an opaque reference. At startup every stored reference is revalidated against the keychain, and an account whose record is missing or malformed is marked for reauthorization.
+
+IMAP connection records — host, port, username, password, TLS policy — are held the same way, decoded in Rust immediately before a session and nowhere else.
 
 ## Hostile-content boundary
 
-Raw messages first pass through bounded standards-based MIME parsing. The boundary enforces raw, tree, header, decoded-text, attachment, address-envelope, and aggregate budgets; handles common charsets and encoded headers/parameters; and preserves accepted binary attachment bytes exactly. HTML is then parsed as an HTML5 tree and serialized only into controlled render nodes. Active/embedded/form/resource content is removed, remote resources are denied, links are normalized and revalidated in Rust, and the WebView cannot navigate away from the exact app/development origin.
+Raw messages pass through bounded standards-based MIME parsing first. The boundary enforces raw, tree, header, decoded-text, attachment, address-envelope, and aggregate budgets, handles common charsets and encoded headers and parameters, and preserves accepted binary attachment bytes exactly.
 
-Blocked remote resources leave an inert `<mux-remote-image data-id="N">` marker carrying no URL. Consent is explicit: load once for this view, or persist an allow for the sender or one exact domain. On consent Rust resolves and fetches the image itself — HTTPS only, no credentials or custom ports, DNS pinned to a pre-validated public address, same-host redirects only, a bitmap content-type allowlist, and a byte ceiling — and returns a bounded `data:` URL. The WebView is never granted `https:` image authority.
+HTML is then parsed as an HTML5 tree and serialized only into controlled render nodes. Active, embedded, form, and resource content is removed, remote resources are denied, and links are normalized and revalidated in Rust. The result renders inside a frame denied `allow-scripts`, and the WebView cannot navigate away from the exact app or development origin.
 
-This boundary is adversarially tested but is not a complete mail-security product. No test fetches from a live host, and S/MIME/PGP, malware/quarantine policy, and provider-fetched attachment lifecycle remain future work.
+A blocked remote resource leaves an inert `<mux-remote-image data-id="N">` marker carrying no URL. Consent is explicit — once for this view, or persisted for the sender or one exact domain — and on consent Rust resolves and fetches the image itself: HTTPS only, no credentials or custom ports, DNS pinned to a pre-validated public address, same-host redirects only, a bitmap content-type allowlist, and a byte ceiling. It comes back as a bounded `data:` URL. The WebView is never granted `https:` image authority.
+
+This boundary is adversarially tested. It is not a complete mail-security product; see [Known Limitations](KNOWN_LIMITATIONS.md).
 
 ## Verification layers
 
-- Node's built-in test runner covers pure UI algorithms.
-- Vitest/jsdom mounts the production Svelte components and uses strict typed Tauri IPC mocks that reject unexpected commands.
-- Rust tests cover migrations, store/search/worker/provider-neutral contracts, content, keychain storage, and the hermetic Gmail synchronization and mutation state machines.
-- The mandatory offline provider contract runs the production worker projector and Gmail adapter boundary without network access; fixture/source scanning rejects common secret shapes.
-- The release benchmark uses the native schema/store against a temporary 100,000-message database, including populated migration and interrupted-operation recovery.
-- `tauri build` plus an actual `.app` launch is required for a macOS runtime claim.
+- Vitest under jsdom covers the pure helpers and mounts the production Svelte components behind strict typed Tauri IPC mocks that throw on an unexpected command.
+- Rust tests cover migrations, the store, search, the worker, the provider-neutral contracts, content sanitization, keychain storage, and the Gmail and IMAP synchronization and mutation state machines.
+- The offline provider contract runs the production worker projector and the adapter boundaries with no network; a repository scan rejects credential-shaped filenames and common secret shapes.
+- The benchmark runs the real schema and store against a temporary 100,000-message database, including a populated migration from the oldest released schema and an interrupted-operation recovery.
+- `npm run build` plus an actual `.app` launch is required before claiming anything about macOS.

@@ -38,6 +38,4 @@ The existing ignored Tidings desktop registration may be supplied as the file
 above. Do not copy it into this repository or add it to a release archive.
 
 This setup enables local development authorization only. It is not evidence of
-a generally distributable or verified Google OAuth application, and no Gmail
-support claim should be made until the live sync and mutation contracts have
-also run successfully.
+a generally distributable or verified Google OAuth application.

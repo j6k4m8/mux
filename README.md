@@ -1,81 +1,64 @@
 # Mux
 
-Mux is a local-first desktop mail client under active development. There is now one application in this repository: a Tauri 2 shell, a Svelte interface, and a Rust/SQLite core. The former Node server and browser UI were removed after their store, search, operation, interaction, and 100,000-message gates were replaced.
+Mux is a local-first desktop mail client: a Tauri 2 shell, a Svelte interface, and a Rust/SQLite core. macOS is the only platform that has been built and run.
 
-The current build opens as a deterministic demo. A Gmail synchronization and mailbox-mutation core plus a bounded installed-desktop Google authorization flow now compile behind the Rust provider boundary and are exercised with hermetic protocol fixtures. The existing ignored Tidings desktop registration has passed Mux's bounded loader, but no Google consent grant, endpoint, or live Gmail account has been exercised. The shipped demo therefore does not yet connect to Gmail, JMAP, IMAP, SMTP, POP, or any other real provider, and Gmail support is not claimed.
+The interface reads the local SQLite projection and nothing else, so ordinary navigation never waits on the network. A background worker syncs each account on its own cadence and pushes changes back out; the mailbox re-reads when it hears the `mux://mailbox-changed` event.
 
 ## Run it on macOS
 
-Requirements:
-
-- Node.js 22.13 or newer
-- Rust stable
-- Xcode Command Line Tools
-
-Install the frontend tools once:
+Requirements: Node.js 22.13 or newer, Rust stable, and the Xcode command line tools.
 
 ```bash
-npm --prefix native install
+npm --prefix native install   # once
+npm run dev                   # open the app
+npm run build                 # build a local .app
 ```
 
-Open the native application:
+The bundle lands under `native/src-tauri/target/release/bundle/macos/`. It is signed with an Apple Development certificate rather than a Developer ID, because a keychain item is bound to the identity that created it and an ad-hoc signature changes with every build — without a stable one macOS asks for the login password again after each rebuild. That is enough for local use and is not a distribution story.
 
-```bash
-npm run dev
-```
+A fresh database seeds a demo mailbox so that the first launch has something to read. To connect a real Gmail account, set up a client registration first: see [Google authorization](docs/GOOGLE_AUTHORIZATION_DEVELOPMENT.md).
 
-Build a local `.app`:
+## Layout
 
-```bash
-npm run build
-```
+- `native/src` — the Svelte interface, plus the pure helpers the components share. Provider-agnostic by rule.
+- `native/src-tauri/src` — the Rust core: store and migrations, search, the durable worker, provider adapters, the MIME/HTML trust boundary, keychain access.
+- `scripts` — the repository-level gates `npm run verify` and `npm run build` call.
+- `website` — the marketing site, built and deployed on its own.
 
-The bundle is written below `native/src-tauri/target/release/bundle/macos/`. Local builds are explicitly ad-hoc signed and do not require an Apple Developer account. Developer ID signing, notarization, hosted-download UX, and Gatekeeper behavior on another Mac are separate work and are not claimed here.
+## Providers
 
-## What works in the demo
+Gmail is the one provider you can connect from the interface. Settings opens the system browser for an installed-desktop authorization, and from then on the account bootstraps, follows the history feed, reconciles labels, and applies archive/read/star/trash mutations through the durable journal.
 
-- Default light interface with a unified three-pane mailbox; optional persisted dark appearance
-- Inbox, Starred, Snoozed, Sent, Drafts, Archive, Trash, All mail, account, and smart views
-- Long demo conversations with collapsible message cards and a simple Show older fallback beyond the initial local page
-- Local search with boolean expressions, phrases, dates, fields, attachment/invitation predicates, and FTS body matching
-- Archive/restore, trash/untrash, read/unread, star/unstar, snooze, delayed undo, stale-undo rejection, and automatic read-on-focus
-- Invitation display and local Accept/Maybe/Decline state
-- Rich compose, reply, reply-all, and forward with safe links, formatting, recipient chips, local drafts, and attachments
-- Inline reply that expands into a rich card after 100 characters and can always pop into the composer
-- Delayed send, undo-send, durable operation activity, and explicit recovery from an uncertain send without retrying it
-- Provider-neutral RFC 5322/MIME construction with stable Date/Message-ID/reply threading, multipart alternative/attachments, envelope-only Bcc, deterministic bytes, and an explicit ASCII-only SMTPUTF8 policy
-- Provider credentials in the macOS Keychain, never crossing the Tauri IPC boundary
-- Typed Gmail connect/cancel lifecycle using the system browser, state, PKCE S256, an exact bounded loopback callback, `gmail.modify`, profile identity binding, and keychain-only tokens
-- Offline-exercised Gmail bootstrap/history pagination, bounded label reconciliation, keychain-only authority lookup, invalid-history rescan, and desired-state mailbox mutations behind provider-neutral Rust batches
-- Bounded standards-based MIME/charset ingestion with exact binary attachment preservation and a typed 20 MiB raw attachment-read ceiling
-- HTML5-tree sanitization, remote-resource denial, controlled render nodes, and typed external-link opening
-- Responsive navigation and reader layouts down to the configured macOS window minimum
-- Keyboard navigation and a working command palette
+There is a complete read-only IMAP sync adapter — implicit TLS, capability re-read after login, UID-only search and fetch, resumable cursors, credentials in the keychain — wired into the worker alongside Gmail. No command creates an IMAP account, so in a normal build it only ever runs for accounts provisioned by its own tests.
 
-All mail content and provider acknowledgements in this build are synthetic.
+Gmail is also the only account that can send. A queued send freezes a durable snapshot, waits out the undo window, and is then submitted to the Gmail API as raw MIME; delayed send, undo-send, and the uncertain-outcome recovery path all sit around that. There is no SMTP transport, so an IMAP account can receive and never reply. There is no JMAP, POP, Exchange, or Outlook adapter.
 
 ## Keyboard
 
-Global mailbox shortcuts are disabled while focus is in an input, editor, button, link, select, or dialog. `Tab` and `Shift-Tab` are never captured by the mailbox shortcut layer.
+Single letters act only when nothing else is listening: they are ignored while focus is in an input, editor, button, link, select, or dialog, and `Tab` is never captured. The command chords stay live inside text fields, since search and the palette have to be reachable while typing. `⌘` and `Ctrl` are interchangeable.
 
 | Key | Action |
 | --- | --- |
-| `/` | Focus search |
 | `j` / `k` | Next / previous conversation |
+| `Enter` | Move focus into the reader |
+| `g` / `Shift-G` | Go to a folder, in any account or this one |
 | `e` | Archive or restore |
-| `h` | Snooze |
+| `b` | Snooze |
 | `s` | Toggle star |
 | `u` | Toggle read state |
-| `r` | Reply |
-| `a` | Reply all |
-| `f` | Forward |
+| `m` | Move within the conversation's own account |
 | `c` | Compose |
-| `⌘K` / `Ctrl-K` | Open command palette outside an editor |
-| `Esc` | Close the topmost modal, mobile reader/navigation, or active search |
+| `r` / `a` / `f` | Reply, reply all, forward |
+| `⌘F` | Focus search |
+| `⌘K` | Command palette |
+| `⌘\` | Narrow the sidebar to icons, or widen it |
+| `⌘,` | Settings |
+| `?` | Show every shortcut |
+| `Esc` | Close the topmost dialog, leave the reader, or clear the search |
 
-Inside the rich editor, the usual formatting shortcuts are available and `⌘K`/`Ctrl-K` inserts a validated `http`, `https`, or `mailto` link.
+The shortcut sheet is generated from the same table the dispatcher reads, so it cannot drift. Inside the rich editor the usual formatting shortcuts apply and `⌘K` inserts a validated `http`, `https`, or `mailto` link.
 
-## Search examples
+## Search
 
 ```text
 from:jane@example.com after:2026-08-01 is:unread
@@ -84,25 +67,23 @@ subject:"architecture review" has:attachment
 has:invite in:all
 ```
 
-Input length, token count, nesting, page size, and date parsing are bounded before SQL compilation. SQL parameters remain bound values.
+The fields are `from`, `to`, `subject`, `account`, `in`, `label`, `category`, `is`, `has`, `after`, `before`, `date`, `filename`, and `domain`. Input length, token count, nesting, page size, and date parsing are all bounded before anything is compiled to SQL, and values stay bound parameters.
 
 ## Verify it
 
 ```bash
-npm run verify
-npm run e2e
-npm run test:provider-contract
-npm run benchmark
+npm run verify                  # boundary checks, Svelte check, UI tests, Vite build, Rust tests, fmt, clippy
+npm run e2e                     # production Svelte components behind strict typed Tauri IPC mocks
+npm run test:provider-contract  # offline worker and adapter conformance
+npm run benchmark               # 100,000 messages across 50,000 threads in a temporary database
 ```
 
-`npm run e2e` is the production-Svelte interaction gate using typed Tauri IPC mocks. It does not use Playwright, start a second product server, or claim WebView/pixel coverage. A release still requires building, launching, and inspecting the actual `.app` on macOS.
-
-The offline provider-contract gate exercises atomic worker projection, exact replay/conflict behavior, cursor crash safety, lease recovery, send uncertainty, and the 32 MiB aggregate batch boundary without a network or real account. The benchmark creates and removes an isolated temporary native database containing 100,000 messages across 50,000 threads, including a populated v12 migration and interrupted-operation recovery. It never touches the application database. Message-detail pages split early when their actual JSON would exceed 16 MiB; attachment bytes use a separate exact lookup capped at 20 MiB raw and 28 MiB serialized.
+`npm run e2e` mounts the real components under jsdom. It renders no macOS window and compares no pixels, so a claim about macOS still needs `npm run build`, a launch, and a look at the running app. The provider contract runs the production worker projector — replay, conflict, cursor crash safety, lease recovery, send uncertainty, batch ceilings — with no network and no account. The benchmark builds and removes its own database, including a populated migration from the oldest released schema and an interrupted-operation recovery, and never touches the application's.
 
 ## Storage and credentials
 
-Mailbox projection, pending intent, Mux metadata, drafts, and the work journal live in SQLite under the operating-system application-data directory. Provider credentials do not live in SQLite; they live in the macOS Keychain, which the login password already unlocked. Mux therefore asks for no password of its own, and nothing blocks unattended sync.
+Mailbox projection, pending intent, Mux's own metadata, drafts, and the work journal live in SQLite under the OS application-data directory. Credentials do not: they live in the macOS Keychain, which the login password has already unlocked. Mux therefore has no password of its own and nothing blocks unattended sync.
 
-## Current boundary
+## Boundary
 
-Do not treat this demo as a production email client. The bounded MIME/HTML trust boundary and Gmail adapter are exercised only with hostile/hermetic fixtures; no real mailbox feeds them yet. The authorization lifecycle exists, but live Google consent and provider execution remain unproven. Remote images are blocked until you consent, and approved ones are fetched in Rust and handed to the interface only as bounded `data:` images; that consent and address policy is tested against hostile fixtures, but no fetch has run against a live host. Attachment quarantine/scanning, S/MIME/PGP, Developer ID signing/notarization, unattended synchronization, and non-macOS builds also remain unproven. See [Known Limitations](docs/KNOWN_LIMITATIONS.md) and [Architecture](docs/ARCHITECTURE.md).
+This is not a production mail client yet. Remote images are blocked until you consent, and an approved one is fetched in Rust and handed to the interface only as a bounded `data:` image. Attachment quarantine and scanning, S/MIME and PGP, Developer ID signing and notarization, and non-macOS builds are all absent. See [Known Limitations](docs/KNOWN_LIMITATIONS.md) for the rest, and [Architecture](docs/ARCHITECTURE.md) for how the pieces fit.
