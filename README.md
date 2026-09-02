@@ -14,7 +14,7 @@ npm run dev                   # open the app
 npm run build                 # build a local .app
 ```
 
-The bundle lands under `native/src-tauri/target/release/bundle/macos/`. It is signed with an Apple Development certificate rather than a Developer ID, because a keychain item is bound to the identity that created it and an ad-hoc signature changes with every build — without a stable one macOS asks for the login password again after each rebuild. That is enough for local use and is not a distribution story.
+The bundle lands under `native/src-tauri/target/release/bundle/macos/`. Signing matters more than it looks: a keychain item is bound to the identity that created it, and an ad-hoc signature is a hash of the binary, so without a stable identity macOS asks for the login password again after every rebuild. `npm run dev` handles that by finding your own Apple Development certificate in the keychain at build time. The committed bundle config signs ad-hoc, so set `signingIdentity` in a local override if you want release bundles to hold their keychain items too. Neither path is a Developer ID, so this is local use and not a distribution story.
 
 A fresh database seeds a demo mailbox so that the first launch has something to read. To connect a real Gmail account, set up a client registration first: see [Google authorization](docs/GOOGLE_AUTHORIZATION_DEVELOPMENT.md).
 
