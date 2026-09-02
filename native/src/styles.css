@@ -10,9 +10,12 @@
   --text: #171a23;
   --text-soft: #5f6675;
   --text-faint: #8a91a0;
+  /* Only --accent is ever set from the appearance setting; the other two are
+     derived from it, so any accent — including an account's own colour — works
+     without anyone having to pick three shades that go together. */
   --accent: #4c63ee;
-  --accent-strong: #364de0;
-  --accent-soft: #eef0ff;
+  --accent-strong: color-mix(in srgb, var(--accent) 86%, #000);
+  --accent-soft: color-mix(in srgb, var(--accent) 10%, #fff);
   --danger: #d83b4c;
   --warning: #c77a09;
   --success: #178563;
@@ -67,8 +70,8 @@ html[data-theme="dark"] {
   --text-soft: #a8b0bf;
   --text-faint: #737d8f;
   --accent: #7d8cff;
-  --accent-strong: #94a0ff;
-  --accent-soft: #222a48;
+  --accent-strong: color-mix(in srgb, var(--accent) 78%, #fff);
+  --accent-soft: color-mix(in srgb, var(--accent) 22%, var(--surface));
   --danger: #ff6c7d;
   --warning: #f4b04e;
   --success: #55cba5;
@@ -248,7 +251,11 @@ html[data-theme="dark"] .filter { box-shadow: none; }
   margin-bottom: 10px;
   border-radius: 11px;
   color: #fff;
-  background: linear-gradient(135deg, #5268f3, #4359dc) !important;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent) 92%, #fff),
+    var(--accent-strong)
+  ) !important;
   box-shadow: 0 7px 17px rgba(69, 89, 222, .22);
   font-size: 14px;
   font-weight: 700;
@@ -287,6 +294,9 @@ html[data-theme="dark"] .filter { box-shadow: none; }
    fixed views do not have. */
 .folders > button { grid-template-columns: 22px minmax(0, 1fr) auto auto; }
 .folder-account { width: 6px; height: 6px; border-radius: 50%; }
+
+.settings-accents { flex-wrap: wrap; }
+.accent-swatch { width: 11px; height: 11px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12); }
 .smart-views { display: grid; gap: 2px; }
 .smart-views button { min-height: 34px; display: grid; grid-template-columns: 10px 1fr; align-items: center; gap: 8px; padding: 0 12px; border-radius: 8px; color: var(--text-soft); background: transparent; text-align: left; cursor: pointer; }
 .smart-views button:hover { color: var(--text); background: var(--surface-hover); }
@@ -582,8 +592,8 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .quick-actions button { height: 31px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text-soft); background: var(--surface); cursor: pointer; font-size: 10px; }
 .quick-actions button:hover { color: var(--text); border-color: var(--accent); }
 .quick-actions .format-button { border-color: transparent; background: transparent; }
-.quick-actions .send-button, .composer-actions .send-button, .primary-button { min-height: 36px; padding: 0 15px; border: 1px solid #5769f4; border-radius: 9px; color: #fff; background: linear-gradient(135deg, #6274ff, #4a5de8); cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 750; white-space: nowrap; }
-.primary-button:hover { border-color: #4a5de8; background: linear-gradient(135deg, #566aff, #3f52dd); }
+.quick-actions .send-button, .composer-actions .send-button, .primary-button { min-height: 36px; padding: 0 15px; border: 1px solid color-mix(in srgb, var(--accent) 88%, #000); border-radius: 9px; color: #fff; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 94%, #fff), var(--accent-strong)); cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 750; white-space: nowrap; }
+.primary-button:hover { border-color: var(--accent-strong); background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent-strong) 88%, #000)); }
 .primary-button:disabled { cursor: not-allowed; opacity: .55; }
 .primary-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .quick-actions .send-button { min-width: 88px; }

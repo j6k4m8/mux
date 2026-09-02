@@ -839,6 +839,22 @@ describe('production mailbox interactions', () => {
     await user.click(caret);
     expect(within(reader).getAllByRole('button', { name: /^Expand message/u }).length).toBeGreaterThan(0);
   });
+  test('the accent follows the conversation being read, or a colour you pick', async () => {
+    const { user } = await renderMailbox();
+    const accent = () => document.documentElement.style.getPropertyValue('--accent');
+    // Following the message is the default, so the account's own colour wins.
+    expect(accent()).toBe(account.color);
+
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+    await user.click(within(screen.getByTestId('accent-choice')).getByRole('button', { name: /Teal/u }));
+    expect(accent()).toBe('#0f8a76');
+    expect(JSON.parse(window.localStorage.getItem('mux-appearance')!).accent).toBe('teal');
+
+    await user.click(within(screen.getByTestId('accent-choice')).getByRole('button', { name: /Current account/u }));
+    expect(accent()).toBe(account.color);
+  });
   test('an account folder is listed, opens on its own, and is a jump target', async () => {
     mailbox.containers.push({
       accountId: account.id,

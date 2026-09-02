@@ -16,6 +16,7 @@
   import SettingsScreen from './SettingsScreen.svelte';
   import ThreadConversation from './ThreadConversation.svelte';
   import {
+    applyAccentToRoot,
     applyAppearanceToRoot,
     densityChoices,
     DEFAULT_APPEARANCE,
@@ -257,6 +258,11 @@
     : selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
   $: offersUndo = noticeOffersUndo(notice, clock);
   $: motion = motionTiming(appearance.animation);
+  $: applyAccentToRoot(
+    appearance.accent,
+    theme,
+    selectedThread ? accountFor(selectedThread.accountId)?.color ?? null : null
+  );
   /// Swapping mailbox, account, search, or page replaces every row at once.
   /// That is a new list rather than mail coming and going, so it is keyed: the
   /// row transitions below are local and stay out of it.

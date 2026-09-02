@@ -5,8 +5,13 @@
 
 import { isAnimationSpeed, motionScale } from './motion';
 import type { AnimationSpeed } from './motion';
+import type { Theme } from './theme';
 
 export type { AnimationSpeed };
+
+/// Where the accent colour comes from. 'account' follows the conversation being
+/// read, so the colour says whose mail this is; the rest are fixed choices.
+export type AccentChoice = 'account' | 'indigo' | 'teal' | 'violet' | 'amber' | 'rose';
 
 export type Density = 'roomy' | 'default' | 'sardine';
 export type SwipeAction = 'archive' | 'delete' | 'snooze' | 'star' | 'unread' | 'none';
@@ -23,6 +28,7 @@ export type Appearance = {
   swipeRight: SwipeAction;
   railPreview: boolean;
   animation: AnimationSpeed;
+  accent: AccentChoice;
 };
 
 export const APPEARANCE_KEY = 'mux-appearance';
@@ -40,7 +46,8 @@ export const DEFAULT_APPEARANCE: Appearance = {
   swipeLeft: 'archive',
   swipeRight: 'snooze',
   railPreview: true,
-  animation: 'medium'
+  animation: 'medium',
+  accent: 'account'
 };
 
 export const fontChoices: Array<{ label: string; value: string }> = [
@@ -79,6 +86,60 @@ export const densityChoices: Array<{ label: string; value: Density }> = [
   { label: 'Default', value: 'default' },
   { label: 'Sardinemode', value: 'sardine' }
 ];
+
+/// Each fixed accent has a light and a dark form. One hex cannot be both:
+/// what reads as a colour on white is nearly black on a dark ground.
+const ACCENT_COLORS: Record<Exclude<AccentChoice, 'account'>, { light: string; dark: string }> = {
+  indigo: { light: '#4c63ee', dark: '#7d8cff' },
+  teal: { light: '#0f8a76', dark: '#4fd1b5' },
+  violet: { light: '#7c4ddb', dark: '#b39aff' },
+  amber: { light: '#b3730a', dark: '#f0b34e' },
+  rose: { light: '#c93b63', dark: '#ff8fab' }
+};
+
+export const accentChoices: Array<{ label: string; value: AccentChoice }> = [
+  { label: 'Current account', value: 'account' },
+  { label: 'Indigo', value: 'indigo' },
+  { label: 'Teal', value: 'teal' },
+  { label: 'Violet', value: 'violet' },
+  { label: 'Amber', value: 'amber' },
+  { label: 'Rose', value: 'rose' }
+];
+
+/// The dot beside a choice, in the theme it will actually be seen in. Following
+/// the message has no fixed colour to show.
+export function accentSwatch(choice: AccentChoice, theme: Theme): string {
+  return choice === 'account' ? '' : ACCENT_COLORS[choice][theme];
+}
+
+export function isAccentChoice(value: unknown): value is AccentChoice {
+  return accentChoices.some((choice) => choice.value === value);
+}
+
+/// Null means "whatever the stylesheet already says", which is how following
+/// the message behaves before anything is selected: the theme's own accent is
+/// already right for the theme, and inventing a stand-in would make the colour
+/// jump on the first selection for no reason.
+export function accentColorFor(
+  choice: AccentChoice,
+  theme: Theme,
+  accountColor: string | null
+): string | null {
+  if (choice === 'account') return accountColor;
+  return ACCENT_COLORS[choice][theme];
+}
+
+/// Only the base accent is set. The stylesheet derives the hover and tint
+/// variants from it, so one colour is all any of this has to supply.
+export function applyAccentToRoot(
+  choice: AccentChoice,
+  theme: Theme,
+  accountColor: string | null
+): void {
+  const color = accentColorFor(choice, theme, accountColor);
+  if (color) document.documentElement.style.setProperty('--accent', color);
+  else document.documentElement.style.removeProperty('--accent');
+}
 
 export function swipeLabel(action: SwipeAction): string {
   return swipeChoices.find((choice) => choice.value === action)?.label ?? 'Nothing';
@@ -141,7 +202,8 @@ export function readSavedAppearance(): Appearance {
       swipeLeft: swipe(value.swipeLeft, 'archive'),
       swipeRight: swipe(value.swipeRight, 'snooze'),
       railPreview: flag(value.railPreview, true),
-      animation: isAnimationSpeed(value.animation) ? value.animation : 'medium'
+      animation: isAnimationSpeed(value.animation) ? value.animation : 'medium',
+      accent: isAccentChoice(value.accent) ? value.accent : 'account'
     };
   } catch {
     return { ...DEFAULT_APPEARANCE };

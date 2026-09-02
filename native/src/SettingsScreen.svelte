@@ -7,6 +7,8 @@
   import type { ThemePreference } from './theme';
   import { shortcutCatalog, shortcutChips, visibleBindings } from './shortcuts';
   import {
+    accentChoices,
+    accentSwatch,
     densityChoices,
     DEFAULT_FONT,
     fontChoices,
@@ -269,6 +271,24 @@
             >
               {#if choice.value !== 'system'}
                 <span aria-hidden="true"><Icon name={choice.value === 'light' ? 'sun' : 'moon'} size={16} /></span>
+              {/if}{choice.label}
+            </button>
+          {/each}
+          </div>
+        </section>
+
+        <section class="settings-card">
+          <h3>Accent</h3>
+          <div class="settings-choice-row settings-accents" role="group" aria-label="Accent colour" data-testid="accent-choice">
+          {#each accentChoices as choice}
+            <button
+              class:is-active={appearance.accent === choice.value}
+              type="button"
+              data-accent-option={choice.value}
+              on:click={() => applyAppearance({ ...appearance, accent: choice.value })}
+            >
+              {#if accentSwatch(choice.value, theme)}
+                <span class="accent-swatch" style:background={accentSwatch(choice.value, theme)} aria-hidden="true"></span>
               {/if}{choice.label}
             </button>
           {/each}
