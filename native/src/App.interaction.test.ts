@@ -95,7 +95,8 @@ const mailbox: MailboxBootstrap = {
     { accountId: null, inbox: 2, archive: 0, starred: 1, sent: 1, all: 2, snoozed: 0, trash: 0 },
     { accountId: account.id, inbox: 2, archive: 0, starred: 1, sent: 1, all: 2, snoozed: 0, trash: 0 }
   ],
-  drafts: []
+  drafts: [],
+  containers: []
 };
 
 type IpcCall = { command: string; payload: unknown };
@@ -808,6 +809,50 @@ describe('production mailbox interactions', () => {
 
     expect(screen.queryByTestId('command-palette')).toBeNull();
     expect(screen.getByTestId('mux-shell').dataset.theme).toBe('dark');
+  });
+
+  test('an account folder is listed, opens on its own, and is a jump target', async () => {
+    mailbox.containers.push({
+      accountId: account.id,
+      remoteId: 'Label_17',
+      name: 'Zoomie Cycle',
+      kind: 'label',
+      role: 'custom',
+      unread: 1,
+      total: 3
+    });
+    try {
+      const { calls, user } = await renderMailbox();
+      const navigation = screen.getByTestId('mailbox-navigation');
+      const folder = within(navigation).getByRole('button', { name: /Zoomie Cycle/u });
+
+      await user.click(folder);
+      // A folder is read inside its own account, and lists only its own mail.
+      await waitFor(() => {
+        const request = calls.filter((call) => call.command === 'list_threads').at(-1);
+        expect(request?.payload).toMatchObject({
+          input: { accountId: account.id, view: 'all', containerId: 'Label_17' }
+        });
+      });
+      expect(folder.classList.contains('is-active')).toBe(true);
+      expect(within(screen.getByTestId('thread-list-header')).getByRole('heading').textContent).toBe('Zoomie Cycle');
+
+      // Leaving for a fixed view takes the folder scope with it.
+      await user.click(within(navigation).getByRole('button', { name: /Inbox/u }));
+      await waitFor(() => {
+        const request = calls.filter((call) => call.command === 'list_threads').at(-1);
+        expect((request?.payload as { input: { containerId: string | null } }).input.containerId).toBeNull();
+      });
+
+      blurActiveElement();
+      await fireEvent.keyDown(window, { key: 'g' });
+      const dialog = await screen.findByTestId('go-to-dialog');
+      await user.type(within(dialog).getByRole('textbox', { name: 'Go to filter' }), 'zoomie');
+      expect(within(dialog).getAllByRole('option')[0].textContent).toContain('Zoomie Cycle');
+      await fireEvent.keyDown(dialog, { key: 'Escape' });
+    } finally {
+      mailbox.containers.pop();
+    }
   });
 
   test('jumps to a folder with g without leaving the keyboard', async () => {

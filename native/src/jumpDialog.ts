@@ -3,11 +3,12 @@
 /// navigation.
 
 import { mailboxViews, smartViews } from './mailboxViews';
-import type { AccountSummary, MailboxView, SmartView } from './types';
+import type { AccountSummary, ContainerSummary, MailboxView, SmartView } from './types';
 
 export type JumpTarget =
   | { kind: 'view'; view: MailboxView; accountId: string | null }
   | { kind: 'smart'; smart: Exclude<SmartView, ''>; query: string; accountId: string | null }
+  | { kind: 'container'; accountId: string; remoteId: string }
   | { kind: 'account'; accountId: string | null };
 
 /// What a filtered list dialog needs to draw one row. The command palette and
@@ -26,6 +27,9 @@ export type JumpRow = ListRow & { target: JumpTarget };
 
 export type JumpRowOptions = {
   accounts: AccountSummary[];
+  /// The accounts' own folders. They belong to one account each, so they only
+  /// appear under that account's scope.
+  containers?: ContainerSummary[];
   /// The account being read. Its rows come first.
   selectedAccount: string | null;
   /// Set to limit the list to one account, which is what ⇧G does.
@@ -51,6 +55,7 @@ export function mailboxJumpRows(options: JumpRowOptions): JumpRow[] {
   }
 
   const rows: JumpRow[] = [];
+  const containers = options.containers ?? [];
   for (const scope of scopes) {
     const priority = scope.id === selectedAccount;
     for (const view of mailboxViews) {
@@ -61,6 +66,20 @@ export function mailboxJumpRows(options: JumpRowOptions): JumpRow[] {
         dot: scope.dot,
         priority,
         target: { kind: 'view', view: view.id, accountId: scope.id }
+      });
+    }
+    for (const folder of containers) {
+      // A folder exists in exactly one account, so it is not offered under the
+      // unified scope where it could not be opened.
+      if (scope.id === null || folder.accountId !== scope.id) continue;
+      rows.push({
+        id: `folder:${folder.accountId}:${folder.remoteId}`,
+        title: folder.name,
+        subtitle: `${scope.label} · ${scope.detail}`,
+        dot: scope.dot,
+        chip: folder.kind === 'label' ? 'label' : 'folder',
+        priority,
+        target: { kind: 'container', accountId: folder.accountId, remoteId: folder.remoteId }
       });
     }
     for (const smart of smartViews) {

@@ -64,6 +64,7 @@
   import type {
     AccountSummary,
     AttachmentSummary,
+    ContainerSummary,
     DraftHeaderSummary,
     DraftSummary,
     InvitationSummary,
@@ -120,6 +121,8 @@
   let messageRequest = 0;
   let loadedThreadId: number | null = null;
   let filter = '';
+  /// The account folder being read, when one is open instead of a fixed view.
+  let selectedContainer: ContainerSummary | null = null;
   let searchField: SearchField;
   let savedSearches: SavedSearch[] = [];
   let searchRows: ThreadSummary[] = [];
@@ -218,7 +221,7 @@
     invitations: 'Invitations',
     finance: 'Finance'
   } as const)[selectedSmartView];
-  $: viewTitle = smartViewTitle || ({
+  $: viewTitle = selectedContainer?.name || smartViewTitle || ({
     all: 'All mail',
     inbox: 'Inbox',
     archive: 'Archive',
@@ -240,13 +243,15 @@
     all: 0,
     trash: 0
   };
-  $: selectedThreadTotal = selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
+  $: selectedThreadTotal = selectedContainer
+    ? selectedContainer.total
+    : selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
   $: offersUndo = noticeOffersUndo(notice, clock);
   $: motion = motionTiming(appearance.animation);
   /// Swapping mailbox, account, search, or page replaces every row at once.
   /// That is a new list rather than mail coming and going, so it is keyed: the
   /// row transitions below are local and stay out of it.
-  $: threadListKey = `${selectedView}|${selectedAccount ?? ''}|${selectedSmartView}|${filter.trim()}|${renderedThreadWindow.start}`;
+  $: threadListKey = `${selectedView}|${selectedAccount ?? ''}|${selectedSmartView}|${selectedContainer?.remoteId ?? ''}|${filter.trim()}|${renderedThreadWindow.start}`;
   $: blockingDialogOpen = commandPaletteOpen || snoozeDialogOpen || activityDialogOpen
     || composerOpen || goToOpen || moveOpen || shortcutSheetOpen;
   $: if (noticeExpired(notice, clock)) notice = null;
@@ -274,6 +279,7 @@
   $: goToRows = mailbox && goToOpen
     ? mailboxJumpRows({
         accounts: mailbox.accounts,
+        containers: mailbox.containers,
         selectedAccount,
         scoped: goToScoped,
         scopeAccountId: selectedAccount
@@ -451,6 +457,14 @@
     if (!row) return;
     if (row.target.kind === 'account') {
       selectAccount(row.target.accountId);
+      return;
+    }
+    if (row.target.kind === 'container') {
+      const target = row.target;
+      const folder = mailbox?.containers.find((container) =>
+        container.accountId === target.accountId && container.remoteId === target.remoteId
+      );
+      if (folder) selectContainer(folder);
       return;
     }
     selectedAccount = row.target.accountId;
@@ -670,16 +684,19 @@
     const request = ++threadRequest;
     const accountId = selectedAccount;
     const view = selectedView;
+    const containerId = selectedContainer?.remoteId ?? null;
     const requiredThreadId = !initial && selectAfterLoad ? selectedThreadId : null;
     const isCurrent = () => request === threadRequest
       && selectedAccount === accountId
-      && selectedView === view;
+      && selectedView === view
+      && (selectedContainer?.remoteId ?? null) === containerId;
     const input: ThreadPageInput = {
       accountId,
       view,
       cursor: append ? threadCursor : null,
       limit: 50,
-      hiddenAccountIds: hiddenAccounts
+      hiddenAccountIds: hiddenAccounts,
+      containerId
     };
     threadLoading = true;
     threadError = '';
@@ -821,6 +838,7 @@
     draftOpenRequest += 1;
     navigationOpen = false;
     mobileReaderOpen = false;
+    selectedContainer = null;
     selectedAccount = accountId;
     selectedSmartView = '';
     filter = '';
@@ -833,6 +851,7 @@
     draftOpenRequest += 1;
     navigationOpen = false;
     mobileReaderOpen = false;
+    selectedContainer = null;
     selectedView = view;
     selectedSmartView = '';
     filter = '';
@@ -845,12 +864,29 @@
     draftOpenRequest += 1;
     navigationOpen = false;
     mobileReaderOpen = false;
+    selectedContainer = null;
     selectedSmartView = view;
     selectedView = 'all';
     filter = query;
     resetSearch();
     clearThreadPage();
     void runSearch(false);
+  }
+
+  /// A folder is read within its own account, so opening one selects that
+  /// account too: it is the only place the folder exists.
+  function selectContainer(container: ContainerSummary) {
+    draftOpenRequest += 1;
+    navigationOpen = false;
+    mobileReaderOpen = false;
+    selectedContainer = container;
+    selectedAccount = container.accountId;
+    selectedView = 'all';
+    selectedSmartView = '';
+    filter = '';
+    resetSearch();
+    clearThreadPage();
+    void loadThreads(false, true);
   }
 
   function resetSearch() {
@@ -1675,16 +1711,18 @@
           statusError={threadError}
           liveUpdates={mailboxEventsAvailable}
           compose={() => openComposer()}
+          {selectedContainer}
           {selectView}
           {selectSmartView}
           {selectAccount}
+          {selectContainer}
           {toggleAccountVisibility}
           openSettings={() => openSettings()}
           {openActivity}
         />
 
         <section class="thread-pane" aria-label={viewTitle}>
-          <header class="pane-heading">
+          <header class="pane-heading" data-testid="thread-list-header">
             <div><small>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.email}</small><h1>{filter ? `Search ${viewTitle.toLocaleLowerCase()}` : viewTitle}</h1></div>
             <span>{searching ? 'Searching…' : `${isSearching && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
           </header>

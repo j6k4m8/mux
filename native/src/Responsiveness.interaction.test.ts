@@ -87,7 +87,8 @@ describe('native rendering responsiveness', () => {
       viewCounts: [
         { accountId: null, inbox: 50_000, archive: 0, starred: 0, sent: 0, all: 50_000, snoozed: 0, trash: 0 }
       ],
-      drafts: []
+      drafts: [],
+      containers: []
     };
     const listInputs: Array<{ cursor: string | null; limit: number }> = [];
     mockIPC((command, payload) => {
@@ -150,7 +151,8 @@ describe('native rendering responsiveness', () => {
       viewCounts: [
         { accountId: null, inbox: 1, archive: 0, starred: 0, sent: 0, all: 1, snoozed: 0, trash: 0 }
       ],
-      drafts: []
+      drafts: [],
+      containers: []
     };
     mockIPC((command) => {
       if (command === 'mailbox_bootstrap') return mailbox;

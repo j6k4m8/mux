@@ -43,3 +43,40 @@ test('scoping to nothing in particular scopes to every account together', () => 
   const rows = mailboxJumpRows({ accounts, selectedAccount: null, scoped: true, scopeAccountId: null });
   assert.ok(rows.every((row) => row.subtitle === 'All accounts'));
 });
+
+test('a folder is offered only under the account it belongs to', () => {
+  const containers = [
+    { accountId: 'acc_work', remoteId: 'Label_17', name: 'Zoomie Cycle', kind: 'label' as const, role: 'custom', unread: 1, total: 3 },
+    { accountId: 'acc_home', remoteId: 'INBOX/Bills', name: 'Bills', kind: 'folder' as const, role: 'custom', unread: 0, total: 9 }
+  ];
+  const rows = mailboxJumpRows({ accounts, containers, selectedAccount: 'acc_work' });
+  const folders = rows.filter((row) => row.target.kind === 'container');
+  assert.deepEqual(folders.map((row) => row.id), [
+    'folder:acc_work:Label_17',
+    'folder:acc_home:INBOX/Bills'
+  ]);
+  // Under All accounts there is no account to open it in, so it is not offered.
+  assert.ok(folders.every((row) => !row.id.startsWith('folder:all')));
+  assert.deepEqual(folders[0].target, { kind: 'container', accountId: 'acc_work', remoteId: 'Label_17' });
+  assert.equal(folders[0].subtitle, 'Work · jordan@acme.example');
+  assert.equal(folders[0].priority, true);
+  assert.equal(folders[1].priority, false);
+});
+
+test('the scoped list keeps that account folders and no others', () => {
+  const containers = [
+    { accountId: 'acc_work', remoteId: 'Label_17', name: 'Zoomie Cycle', kind: 'label' as const, role: 'custom', unread: 1, total: 3 },
+    { accountId: 'acc_home', remoteId: 'INBOX/Bills', name: 'Bills', kind: 'folder' as const, role: 'custom', unread: 0, total: 9 }
+  ];
+  const rows = mailboxJumpRows({
+    accounts,
+    containers,
+    selectedAccount: 'acc_work',
+    scoped: true,
+    scopeAccountId: 'acc_work'
+  });
+  assert.deepEqual(
+    rows.filter((row) => row.target.kind === 'container').map((row) => row.title),
+    ['Zoomie Cycle']
+  );
+});

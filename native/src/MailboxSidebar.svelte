@@ -3,6 +3,7 @@
   import { mailboxViews, smartViews } from './mailboxViews';
   import type {
     AccountSummary,
+    ContainerSummary,
     MailboxBootstrap,
     MailboxView,
     SmartView,
@@ -14,6 +15,7 @@
   export let selectedView: MailboxView;
   export let selectedSmartView: SmartView;
   export let selectedAccount: string | null;
+  export let selectedContainer: ContainerSummary | null = null;
   export let hiddenAccounts: string[] = [];
   export let filter = '';
   export let collapsed = false;
@@ -25,9 +27,18 @@
   export let selectView: (view: MailboxView) => void;
   export let selectSmartView: (view: Exclude<SmartView, ''>, query: string) => void;
   export let selectAccount: (accountId: string | null) => void;
+  export let selectContainer: (container: ContainerSummary) => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openActivity: () => void;
+
+  /// The account's own folders, for the account being read. Under All accounts
+  /// every account's folders are listed, each carrying its account's colour.
+  $: folders = mailbox.containers.filter((container) =>
+    !hiddenAccounts.includes(container.accountId)
+    && (selectedAccount === null || container.accountId === selectedAccount)
+  );
+  $: showFolderAccount = selectedAccount === null && mailbox.accounts.length > 1;
 
   $: draftCount = mailbox.drafts.filter(
     (draft) => selectedAccount === null || draft.accountId === selectedAccount
@@ -41,6 +52,10 @@
     if (view === 'snoozed') return !selectedSmartView;
     if (view === 'all') return !selectedSmartView && !filter;
     return true;
+  }
+
+  function accountFor(accountId: string): AccountSummary | undefined {
+    return mailbox.accounts.find((account) => account.id === accountId);
   }
 
   function accountLabel(account: AccountSummary, hidden: boolean): string {
@@ -87,6 +102,31 @@
       </button>
     {/each}
   </section>
+
+  {#if folders.length}
+    <p class="section-label">Folders</p>
+    <section class="nav-section folders">
+      {#each folders as folder (`${folder.accountId}:${folder.remoteId}`)}
+        <button
+          class:is-active={selectedContainer?.remoteId === folder.remoteId
+            && selectedContainer?.accountId === folder.accountId}
+          data-action="select-folder"
+          data-folder-id={folder.remoteId}
+          title={showFolderAccount
+            ? `${folder.name} — ${accountFor(folder.accountId)?.name ?? folder.accountId}`
+            : folder.name}
+          on:click={() => selectContainer(folder)}
+        >
+          <span class="nav-icon"><Icon name={folder.kind === 'label' ? 'star' : 'archive'} size={15} /></span>
+          <strong>{folder.name}</strong>
+          {#if showFolderAccount}
+            <span class="folder-account" style:background={accountFor(folder.accountId)?.color}></span>
+          {/if}
+          <em>{folder.unread || ''}</em>
+        </button>
+      {/each}
+    </section>
+  {/if}
 
   <p class="section-label">Accounts</p>
   <section class="accounts">

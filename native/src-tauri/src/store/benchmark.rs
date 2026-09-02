@@ -159,6 +159,7 @@ fn run_at_path(
         cursor: None,
         limit: Some(50),
         hidden_account_ids: Vec::new(),
+        container_id: None,
     })?;
     let inbox_elapsed = inbox_started.elapsed();
     enforce_limit("inbox", inbox_elapsed, INBOX_LIMIT)?;

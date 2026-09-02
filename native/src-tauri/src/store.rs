@@ -32,6 +32,14 @@ pub(crate) const DEFAULT_REFRESH_SECONDS: i64 = 60;
 pub(crate) const MIN_REFRESH_SECONDS: i64 = 15;
 pub(crate) const MAX_REFRESH_SECONDS: i64 = 24 * 60 * 60;
 const MAX_ACTIVITY_ROWS: i64 = 100;
+/// The bootstrap payload has a size budget, and an account can keep a great
+/// many labels. Past this the sidebar would be unreadable anyway.
+const MAX_CONTAINERS: i64 = 200;
+/// Roles the eight fixed views already stand for. A folder holding one of them
+/// is not a separate place to go, it is the place the sidebar already lists.
+const FIXED_VIEW_ROLES: [&str; 7] = [
+    "inbox", "archive", "all_mail", "drafts", "sent", "trash", "starred",
+];
 const MAX_SNOOZE_DISTANCE_MS: i64 = 10 * 366 * 86_400_000;
 const MAX_RECIPIENT_HEADER_CHARS: usize = 10_000;
 const MAX_RECIPIENT_MAILBOXES: usize = 500;
@@ -313,6 +321,26 @@ pub struct MailboxBootstrap {
     accounts: Vec<AccountSummary>,
     view_counts: Vec<ViewCountSummary>,
     drafts: Vec<DraftHeaderSummary>,
+    containers: Vec<ContainerSummary>,
+}
+
+/// One of the account's own folders or labels. The mailbox's eight fixed views
+/// cover the roles every provider has; this is everything else the account
+/// keeps, which until now was synced and then never shown.
+///
+/// The pair (accountId, remoteId) names it. The interface treats both as opaque
+/// strings it was handed and echoes back, so nothing about Gmail label ids or
+/// IMAP folder paths leaks into how the interface works.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSummary {
+    account_id: String,
+    remote_id: String,
+    name: String,
+    kind: String,
+    role: String,
+    unread: i64,
+    total: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -354,6 +382,11 @@ pub struct ThreadPageInput {
     /// Accounts the person has hidden from the list. They keep syncing.
     #[serde(default)]
     hidden_account_ids: Vec<String>,
+    /// One of the account's own folders or labels, named by the remote id the
+    /// interface was handed. Only meaningful alongside the account it belongs
+    /// to, so it is refused without one.
+    #[serde(default)]
+    container_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -572,15 +605,72 @@ impl MuxStore {
         }
 
         let drafts = self.list_draft_headers()?;
+        let containers = self.list_containers()?;
 
         let bootstrap = MailboxBootstrap {
             schema_version: SCHEMA_VERSION,
             accounts,
             view_counts,
             drafts,
+            containers,
         };
         ensure_serialized_budget(&bootstrap, IpcPayloadKind::Bootstrap)?;
         Ok(bootstrap)
+    }
+
+    /// Every folder or label the account keeps that the fixed views do not
+    /// already stand for, with the thread counts the sidebar shows.
+    ///
+    /// Counted the same way the views are: a thread belongs to a folder when
+    /// any of its live messages does, and trashed threads are left out so the
+    /// count matches what opening the folder shows.
+    pub fn list_containers(&self) -> Result<Vec<ContainerSummary>, StoreError> {
+        let excluded = FIXED_VIEW_ROLES
+            .iter()
+            .map(|role| format!("'{role}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT container.account_id, container.remote_id, container.name,
+                    container.kind, container.role,
+                    COUNT(DISTINCT CASE WHEN thread.unread = 1 THEN thread.id END) AS unread,
+                    COUNT(DISTINCT thread.id) AS total
+             FROM provider_containers container
+             LEFT JOIN provider_container_memberships membership
+               ON membership.account_id = container.account_id
+              AND membership.remote_container_id = container.remote_id
+             LEFT JOIN provider_message_refs reference
+               ON reference.account_id = membership.account_id
+              AND reference.remote_message_id = membership.remote_message_id
+             LEFT JOIN messages message
+               ON message.id = reference.message_id AND message.remote_deleted = 0
+             LEFT JOIN thread_effective thread
+               ON thread.id = message.thread_id
+              AND thread.remote_deleted = 0 AND thread.trashed = 0
+             WHERE container.is_deleted = 0
+               AND container.is_selectable = 1
+               AND container.kind IN ('folder', 'label')
+               AND container.role NOT IN ({excluded})
+             GROUP BY container.account_id, container.remote_id, container.name,
+                      container.kind, container.role, container.sort_order
+             ORDER BY container.account_id, container.sort_order, container.name
+             LIMIT ?1"
+        );
+        self.connection
+            .prepare(&sql)?
+            .query_map([MAX_CONTAINERS], |row| {
+                Ok(ContainerSummary {
+                    account_id: row.get(0)?,
+                    remote_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    role: row.get(4)?,
+                    unread: row.get(5)?,
+                    total: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Validates hidden account identifiers and returns them sorted and deduplicated
@@ -630,12 +720,30 @@ impl MuxStore {
         let account_id = exact_account_id(input.account_id.as_deref())?;
         let view = input.view.as_deref().unwrap_or("inbox");
         let hidden = Self::hidden_accounts(&input.hidden_account_ids)?;
+        let container_id = match input.container_id.as_deref() {
+            None => None,
+            Some(container_id) => {
+                if account_id.is_none() {
+                    return Err(StoreError::Validation(
+                        "A folder can only be listed within its own account".into(),
+                    ));
+                }
+                Some(bounded_text(container_id, "containerId", 2_048)?)
+            }
+        };
         // Visibility is part of the scope: a cursor cannot be replayed against a
-        // different set of hidden accounts.
+        // different set of hidden accounts, nor against a different folder.
         let hidden_scope = hidden.join(",");
+        let container_scope = container_id.as_deref().unwrap_or("");
         let scope = match account_id.as_deref() {
-            Some(account_id) => canonical_scope(&["account:some", account_id, view, &hidden_scope]),
-            None => canonical_scope(&["account:none", view, &hidden_scope]),
+            Some(account_id) => canonical_scope(&[
+                "account:some",
+                account_id,
+                view,
+                &hidden_scope,
+                container_scope,
+            ]),
+            None => canonical_scope(&["account:none", view, &hidden_scope, container_scope]),
         };
         let mut snapshot_at = now_ms();
         let cursor_position = input
@@ -662,6 +770,25 @@ impl MuxStore {
             values.extend(hidden.iter().map(|id| Value::Text(id.clone())));
         }
         append_mailbox_view(&mut conditions, &mut values, view, snapshot_at)?;
+        if let Some(container_id) = container_id {
+            // A thread is in a folder when any of its live messages is.
+            conditions.push(
+                "EXISTS (
+                   SELECT 1
+                   FROM messages message
+                   JOIN provider_message_refs reference
+                     ON reference.message_id = message.id
+                   JOIN provider_container_memberships membership
+                     ON membership.account_id = reference.account_id
+                    AND membership.remote_message_id = reference.remote_message_id
+                   WHERE message.thread_id = e.id AND message.remote_deleted = 0
+                     AND membership.account_id = e.account_id
+                     AND membership.remote_container_id = ?
+                 )"
+                .into(),
+            );
+            values.push(Value::Text(container_id));
+        }
         if let Some(position) = cursor_position {
             conditions.push("(e.latest_at < ? OR (e.latest_at = ? AND e.id < ?))".into());
             values.push(Value::Integer(position.sort_timestamp));
@@ -4619,6 +4746,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("thread page");
         assert_eq!(threads.threads.len(), 5);
@@ -7733,6 +7861,7 @@ mod tests {
                 cursor: None,
                 limit: Some(50),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("visible projection")
             .threads
@@ -8102,6 +8231,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("thread page");
         let counts = threads
@@ -8141,6 +8271,7 @@ mod tests {
                 cursor: None,
                 limit: Some(1),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("first tied page");
         let tied_second = store
@@ -8150,6 +8281,7 @@ mod tests {
                 cursor: tied_first.next_cursor.clone(),
                 limit: Some(1),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("second tied page");
         assert_eq!(tied_first.threads[0].id, 2);
@@ -8192,6 +8324,7 @@ mod tests {
                 cursor: None,
                 limit: Some(3),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("first thread page");
         assert_eq!(first.threads.len(), 3);
@@ -8203,6 +8336,7 @@ mod tests {
                 cursor: first.next_cursor,
                 limit: Some(3),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("second thread page");
         assert!(first
@@ -8395,6 +8529,7 @@ mod tests {
                 cursor: None,
                 limit: Some(500),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("bounded thread page");
         assert_eq!(first_threads.threads.len(), 100);
@@ -8406,6 +8541,7 @@ mod tests {
                 cursor: first_threads.next_cursor,
                 limit: Some(500),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("thread continuation");
         assert!(first_threads.threads.iter().all(|left| second_threads
@@ -8485,6 +8621,7 @@ mod tests {
                 cursor: Some("bad".into()),
                 limit: Some(50),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             }),
             Err(StoreError::Validation(_))
         ));
@@ -8504,6 +8641,7 @@ mod tests {
                     cursor: Some(cursor.into()),
                     limit: Some(50),
                     hidden_account_ids: Vec::new(),
+                    container_id: None,
                 }),
                 Err(StoreError::Validation(_))
             ));
@@ -8530,6 +8668,7 @@ mod tests {
                 cursor: None,
                 limit: Some(50),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("inbox page");
         assert_eq!(
@@ -8739,6 +8878,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("unfiltered listing");
         let hidden_account = all
@@ -8759,6 +8899,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: vec![hidden_account.clone()],
+                container_id: None,
             })
             .expect("filtered listing");
         assert_eq!(filtered.threads.len(), expected);
@@ -8804,6 +8945,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: vec![hidden_account.clone(), hidden_account.clone()],
+                container_id: None,
             })
             .expect("duplicate hidden ids");
         assert_eq!(repeated.threads.len(), expected);
@@ -8818,6 +8960,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: too_many,
+                container_id: None,
             }),
             Err(StoreError::Validation(_))
         ));
@@ -8835,6 +8978,7 @@ mod tests {
                 cursor: None,
                 limit: Some(2),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("first page");
         let cursor = first.next_cursor.expect("continuation cursor");
@@ -8847,6 +8991,7 @@ mod tests {
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             },
             ThreadPageInput {
                 account_id: Some("acc_work".into()),
@@ -8854,6 +8999,7 @@ mod tests {
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             },
             ThreadPageInput {
                 account_id: None,
@@ -8861,6 +9007,7 @@ mod tests {
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 hidden_account_ids: vec!["acc_personal".into()],
+                container_id: None,
             },
         ] {
             assert!(matches!(
@@ -8891,6 +9038,7 @@ mod tests {
                 cursor: Some(String::from_utf8(tampered).unwrap()),
                 limit: Some(2),
         hidden_account_ids: Vec::new(),
+        container_id: None,
             }),
             Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
         ));
@@ -8909,6 +9057,7 @@ mod tests {
                 cursor: Some(cursor),
                 limit: Some(2),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("persistently signed cursor continues");
         assert!(second
@@ -8992,6 +9141,7 @@ mod tests {
                     cursor: None,
                     limit: Some(1),
                     hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap()
         };
@@ -9017,6 +9167,7 @@ mod tests {
                         cursor,
                         limit: Some(1),
             hidden_account_ids: Vec::new(),
+            container_id: None,
                     }),
                     Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
                 ));
@@ -9074,6 +9225,7 @@ mod tests {
                 cursor: None,
                 limit: Some(1),
         hidden_account_ids: Vec::new(),
+        container_id: None,
             }),
             Err(StoreError::Validation(ref message))
                 if message == "accountId must not be empty when present"
@@ -9147,6 +9299,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .unwrap();
         let mut seen = first
@@ -9190,6 +9343,7 @@ mod tests {
                     cursor: Some(next),
                     limit: Some(100),
                     hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap();
             for thread in page.threads {
@@ -10449,6 +10603,7 @@ mod tests {
                 cursor: None,
                 limit: Some(10),
                 hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .unwrap()
             .threads
@@ -10461,6 +10616,7 @@ mod tests {
                     cursor: None,
                     limit: Some(10),
                     hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap()
                 .threads
@@ -10770,6 +10926,7 @@ mod tests {
                     cursor: None,
                     limit: Some(100),
                     hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap()
                 .threads
@@ -11317,5 +11474,226 @@ mod tests {
         let reopened = MuxStore::open(&path, false).unwrap();
         assert!(reopened.remote_images_for_message(&message_a).unwrap()[0].allowed_by_policy);
         assert!(reopened.remote_images_for_message(&message_b).unwrap()[0].allowed_by_policy);
+    }
+
+    #[test]
+    fn account_folders_are_listed_with_counts_and_can_be_opened_on_their_own() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("folders.db");
+        let mut store = configured_provider_store(&path, &["acc-folders"]);
+        let batch: ProviderBatch = serde_json::from_value(serde_json::json!({
+            "muxAccountId": "acc-folders",
+            "batchId": "folder-batch",
+            "expectedPriorCursor": null,
+            "cursor": {
+                "muxAccountId": "acc-folders",
+                "scope": { "kind": "account" },
+                "value": "folder-cursor"
+            },
+            "observedAt": 1000,
+            "threadUpserts": [{
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteThreadId": "thread-in-label"
+                },
+                "subject": "Filed away",
+                "participants": "sender@example.com",
+                "snippet": "Filed under a label",
+                "latestAt": 900,
+                "messageCount": 1,
+                "inInbox": true,
+                "unread": true,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": false,
+                "category": "primary",
+                "revision": "thread-r1"
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteThreadId": "thread-unfiled"
+                },
+                "subject": "Not filed",
+                "participants": "other@example.com",
+                "snippet": "No label at all",
+                "latestAt": 800,
+                "messageCount": 1,
+                "inInbox": true,
+                "unread": false,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": false,
+                "category": "primary",
+                "revision": "thread-r2"
+            }],
+            "messageUpserts": [{
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteMessageId": "message-in-label",
+                    "remoteThreadId": "thread-in-label"
+                },
+                "subject": "Filed away",
+                "senderName": "Sender",
+                "senderEmail": "sender@example.com",
+                "recipients": "recipient@example.com",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 900,
+                "bodyText": "Filed under a label.",
+                "bodyState": "complete",
+                "isFromMe": false,
+                "revision": "message-r1",
+                "keywords": ["unread"]
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteMessageId": "message-unfiled",
+                    "remoteThreadId": "thread-unfiled"
+                },
+                "subject": "Not filed",
+                "senderName": "Other",
+                "senderEmail": "other@example.com",
+                "recipients": "recipient@example.com",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 800,
+                "bodyText": "No label at all.",
+                "bodyState": "complete",
+                "isFromMe": false,
+                "revision": "message-r2",
+                "keywords": []
+            }],
+            "containerUpserts": [{
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteContainerId": "inbox"
+                },
+                "displayName": "Inbox",
+                "kind": "mailbox",
+                "role": "inbox",
+                "parentRemoteContainerId": null,
+                "selectable": true
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteContainerId": "Label_17"
+                },
+                "displayName": "Zoomie Cycle",
+                "kind": "label",
+                // No role at all is what a label of the account's own making
+                // looks like on the wire; the store records it as "custom".
+                "role": null,
+                "parentRemoteContainerId": null,
+                "selectable": true
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteContainerId": "Label_hidden"
+                },
+                "displayName": "Not selectable",
+                "kind": "label",
+                "role": null,
+                "parentRemoteContainerId": null,
+                "selectable": false
+            }],
+            "membershipChanges": [{
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "acc-folders",
+                        "remoteMessageId": "message-in-label",
+                        "remoteThreadId": "thread-in-label"
+                    },
+                    "container": {
+                        "muxAccountId": "acc-folders",
+                        "remoteContainerId": "Label_17"
+                    }
+                }
+            }, {
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "acc-folders",
+                        "remoteMessageId": "message-unfiled",
+                        "remoteThreadId": "thread-unfiled"
+                    },
+                    "container": {
+                        "muxAccountId": "acc-folders",
+                        "remoteContainerId": "inbox"
+                    }
+                }
+            }],
+            "tombstones": []
+        }))
+        .expect("valid provider batch");
+        assert!(
+            store
+                .apply_provider_batch(batch)
+                .expect("batch applies")
+                .applied
+        );
+
+        // Only the account's own folders: the roles the fixed views stand for
+        // are the sidebar's existing rows, and an unselectable label is not a
+        // place anyone can go.
+        let containers = store.list_containers().expect("containers list");
+        assert_eq!(
+            containers
+                .iter()
+                .map(|container| (container.remote_id.as_str(), container.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("Label_17", "Zoomie Cycle")]
+        );
+        assert_eq!((containers[0].total, containers[0].unread), (1, 1));
+        assert_eq!(containers[0].kind, "label");
+        assert_eq!(containers[0].role, "custom");
+
+        // Opening the folder lists exactly what is filed in it.
+        let filed = store
+            .list_threads(ThreadPageInput {
+                account_id: Some("acc-folders".into()),
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: Some("Label_17".into()),
+            })
+            .expect("folder page");
+        assert_eq!(
+            filed
+                .threads
+                .iter()
+                .map(|thread| thread.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["Filed away"]
+        );
+
+        // And a folder nothing is filed in is empty rather than everything.
+        let empty = store
+            .list_threads(ThreadPageInput {
+                account_id: Some("acc-folders".into()),
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: Some("Label_hidden".into()),
+            })
+            .expect("empty folder page");
+        assert!(empty.threads.is_empty());
+
+        // A folder belongs to one account, so it cannot be listed across all.
+        let unscoped = store.list_threads(ThreadPageInput {
+            account_id: None,
+            view: Some("all".into()),
+            cursor: None,
+            limit: Some(50),
+            hidden_account_ids: Vec::new(),
+            container_id: Some("Label_17".into()),
+        });
+        assert!(matches!(unscoped, Err(StoreError::Validation(_))));
     }
 }
