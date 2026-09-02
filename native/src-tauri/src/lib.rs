@@ -4,11 +4,11 @@ mod gmail;
 mod gmail_access;
 #[path = "google_authorization.rs"]
 mod gmail_oauth;
-mod keychain;
-// IMAP remains an unshipped work-in-progress. Keep it out of the product build
-// until its adapter compiles and passes the provider contract gate.
+mod imap;
+mod imap_access;
 mod internet_message;
 mod ipc_boundary;
+mod keychain;
 mod mime_ingest;
 mod navigation;
 mod outgoing;
@@ -62,18 +62,23 @@ struct AppState {
     refresh_stop: Arc<AtomicBool>,
 }
 
-struct NativeWorkerAdapter<G> {
+struct NativeWorkerAdapter<G, I> {
     gmail: G,
+    imap: I,
     database_path: PathBuf,
 }
 
-impl<G> WorkerAdapter for NativeWorkerAdapter<G>
+impl<G, I> WorkerAdapter for NativeWorkerAdapter<G, I>
 where
     G: WorkerAdapter + Sync,
+    I: WorkerAdapter + Sync,
 {
     fn execute(&self, work: &ClaimedWork, context: &WorkerExecutionContext) -> WorkerOutcome {
         if gmail::is_gmail_owned_work(work) {
             return self.gmail.execute(work, context);
+        }
+        if imap::is_imap_sync_work(work) {
+            return self.imap.execute(work, context);
         }
         let provider_kind =
             rusqlite::Connection::open(&self.database_path).and_then(|connection| {
@@ -213,8 +218,25 @@ struct AccountIdInput {
 /// Asks one account for new mail immediately rather than waiting for its cadence.
 #[tauri::command]
 fn sync_account_now(state: State<'_, AppState>, input: AccountIdInput) -> Result<usize, String> {
-    let scheduled = gmail::sync_account_now(&state.database_path, &input.account_id, now_ms())
+    let provider = rusqlite::Connection::open(&state.database_path)
+        .and_then(|connection| {
+            connection.query_row(
+                "SELECT provider_kind FROM provider_accounts WHERE account_id = ?1",
+                [input.account_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+        })
         .map_err(|error| error.to_string())?;
+    let scheduled = match provider.as_str() {
+        "gmail" => gmail::sync_account_now(&state.database_path, &input.account_id, now_ms()),
+        "imap" => imap::sync_account_now(&state.database_path, &input.account_id, now_ms()),
+        _ => {
+            return Err(format!(
+                "Manual synchronization is not implemented for {provider} accounts"
+            ))
+        }
+    }
+    .map_err(|error| error.to_string())?;
     wake_worker(&state);
     Ok(scheduled)
 }
@@ -561,9 +583,12 @@ pub fn run() {
             let worker = DurableWorker::new(&path, WorkerConfig::default())?;
             let credentials = keychain::CredentialStore::for_database(&path)?;
             gmail::schedule_initial_syncs(&path, now_ms())?;
+            imap::schedule_initial_syncs(&path, now_ms())?;
+            imap::schedule_resumable_syncs(&path, now_ms())?;
             // Accounts whose keychain record is missing or invalid are marked for
             // reauthorization once at launch rather than waiting for an unlock.
             let _ = gmail_access::reconcile_credential_records(&path, &credentials, now_ms());
+            let _ = imap_access::reconcile_credential_records(&path, &credentials, now_ms());
             let gmail_adapter = gmail::GmailAdapter::new(
                 gmail_access::GmailKeychainAccess::new(
                     &path,
@@ -574,12 +599,18 @@ pub fn run() {
                 now_ms as fn() -> i64,
             )
             .with_database_path(&path);
+            let imap_adapter = imap::ImapAdapter::new(
+                imap_access::ImapKeychainAccess::new(&path, credentials.clone()),
+                imap::NativeImapSessionFactory::new()?,
+                now_ms as fn() -> i64,
+            );
             let app_handle = app.handle().clone();
             let controller = WorkerController::start(
                 worker,
                 format!("mux-native-{}", std::process::id()),
                 NativeWorkerAdapter {
                     gmail: gmail_adapter,
+                    imap: imap_adapter,
                     database_path: path.clone(),
                 },
                 provider_conformance::apply_worker_projection,
@@ -616,7 +647,13 @@ pub fn run() {
                         }
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
-                    match gmail::schedule_due_syncs(&refresh_path, now_ms()) {
+                    let scheduled = (|| {
+                        let now = now_ms();
+                        let gmail = gmail::schedule_due_syncs(&refresh_path, now)?;
+                        let imap = imap::schedule_due_syncs(&refresh_path, now)?;
+                        Ok::<usize, worker::WorkerError>(gmail.saturating_add(imap))
+                    })();
+                    match scheduled {
                         Ok(scheduled) => {
                             backoff = 1;
                             if scheduled > 0 {
@@ -745,6 +782,9 @@ mod tests {
             .unwrap();
         let adapter = NativeWorkerAdapter {
             gmail: RecordingGmailAdapter {
+                calls: AtomicUsize::new(0),
+            },
+            imap: RecordingGmailAdapter {
                 calls: AtomicUsize::new(0),
             },
             database_path: path,

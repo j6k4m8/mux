@@ -123,10 +123,18 @@ fn apply_provider_sync_page(
             "Provider sync batch ID does not match the claimed ordering identity".into(),
         ));
     }
-    if page.reconciliation.is_some() && batch.cursor.scope != SyncCursorScope::Account {
-        return Err(WorkerError::Conflict(
-            "Provider reconciliation requires an account-scoped cursor".into(),
-        ));
+    if let Some(reconciliation) = &page.reconciliation {
+        let account_only = reconciliation.begin
+            || reconciliation.reset_seen_containers
+            || !reconciliation.complete_kinds.is_empty()
+            || !reconciliation.sweep_kinds.is_empty();
+        let inventory_only_container =
+            matches!(batch.cursor.scope, SyncCursorScope::Container { .. }) && !account_only;
+        if batch.cursor.scope != SyncCursorScope::Account && !inventory_only_container {
+            return Err(WorkerError::Conflict(
+                "Provider reconciliation lifecycle changes require an account-scoped cursor".into(),
+            ));
+        }
     }
     let inventory = page
         .reconciliation
