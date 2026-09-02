@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { createEventDispatcher, onDestroy, tick } from 'svelte';
-  import { shouldExpandInlineReply } from './replyRecipients.mjs';
+  import { shouldExpandInlineReply } from './replyRecipients';
   import RichEditor from './RichEditor.svelte';
   import { plainTextToRichHtml } from './richText';
   import type { AccountSummary, DraftSummary, OperationSummary, SaveDraftInput, ThreadSummary } from './types';

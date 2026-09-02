@@ -1,91 +1,43 @@
-# AGENTS.md — Mux Project Instructions
+# AGENTS.md — Mux project instructions
 
-## Mission
+Mux is a local-first mail client for people who live in their inbox. One product implementation: Tauri 2, Svelte, Rust, SQLite. macOS is the only platform exercised; another platform is future work until it compiles, packages, launches, and stores mail.
 
-Mux is a modern, local-first email client for power users. This repository contains one product implementation: Tauri 2 + Svelte + Rust + SQLite. macOS is the only platform currently exercised. Other platforms remain future work until each one compiles and runs.
+The seeded demo mailbox is a fixture, not a second application. Preserve observable local-first behavior while extending it.
 
-The deterministic fake-provider demo is a contract fixture, not a second application. Preserve observable local-first behavior while extending it.
+## Non-negotiable rules
 
-## Non-negotiable engineering rules
-
-1. Run the existing checks before modifying code.
-2. Never claim a feature, provider, platform, test, benchmark, or security property unless it was actually exercised.
-3. Prefer small, gated changes over broad speculative scaffolding.
-4. Keep the Svelte UI provider-agnostic. Provider calls belong behind Rust domain commands and adapters.
-5. Preserve the three-layer state model: confirmed provider projection, durable pending local intent, and Mux-owned metadata.
-6. Render the local projection immediately. Normal UI navigation must not wait on network requests.
-7. Sending is non-idempotent and retains its dedicated uncertain-outcome state machine.
-8. Keep equivalent store/search/operation and interaction contracts green when replacing an implementation.
-9. Do not introduce event sourcing, CQRS, microcrates, a backend service, or another product UI without evidence.
-10. Treat arbitrary email HTML, MIME, attachments, remote resources, extension content, MCP content, and email text supplied to AI as hostile.
-11. The AI model never receives ambient authority. Permissions and confirmations are enforced outside the model.
-12. Calendar permissions are separate and lazy. Initial support is mail-centric invitation/RSVP, not a full calendar.
-13. MCP, CLI, and rules precede a heavy plugin ecosystem.
-14. Keep credentials out of SQLite, logs, fixtures, screenshots, IPC, and release archives.
-15. Preserve accessibility, keyboard operation, responsive behavior, and large-mailbox performance.
-16. Do not add a real provider until its credential, sync, retry, pagination, and send semantics have explicit acceptance tests.
+1. Run the existing checks before changing code, and the full gate before calling something done.
+2. Never claim a feature, provider, platform, test, benchmark, or security property that was not actually exercised. This is the rule the rest of the repository is built on; documentation that overstates the code is worse than no documentation.
+3. Prefer small, gated changes to broad speculative scaffolding.
+4. Keep the Svelte interface provider-agnostic. Provider calls belong behind Rust domain commands and adapters, and no provider type or remote identifier may become meaningful to the frontend.
+5. Preserve the three layers: confirmed provider projection, durable pending local intent, and Mux-owned metadata. They are not interchangeable.
+6. Render the local projection immediately. Ordinary navigation must never wait on a network request.
+7. Sending is not idempotent. It keeps its own uncertain-outcome state machine, and an ambiguous submission is never retried automatically.
+8. When replacing an implementation, keep the equivalent store, search, operation, and interaction contracts green.
+9. Do not introduce event sourcing, CQRS, microcrates, a backend service, or a second product UI. `scripts/check.mjs` fails if the removed server and browser harness paths return.
+10. Treat email HTML, MIME, attachments, and remote resources as hostile. Everything crosses the bounded Rust parse and sanitization boundary; nothing bypasses it.
+11. Keep credentials out of SQLite, logs, fixtures, screenshots, IPC, and release archives. There is no command that reads, writes, or unlocks a credential, and none that accepts a password.
+12. Invitations and RSVP are mail-centric and local. A real calendar API is separate work with its own permissions.
+13. Preserve accessibility, keyboard operation, responsive behavior, and large-mailbox performance.
+14. Before wiring up another provider, specify and test its credential, sync, retry, pagination, mutation, and send semantics. Gmail and IMAP each arrived that way.
+15. Do not weaken a test or a defensive check to make a change pass.
 
 ## Required validation
 
-Before changing anything:
-
 ```bash
-npm run verify
+npm run verify          # always
+npm run e2e             # interface changes
+npm run benchmark       # search, storage, pagination, or operation changes
 ```
 
-For UI changes:
+Before a release archive, run `npm run manifest:write` and `npm run release:check`, then extract the archive into a fresh directory and run `npm run release:check` again.
 
-```bash
-npm run e2e
-```
+A macOS claim requires `npm run build`, launching the resulting `.app`, and looking at the real WebView. Component tests are not a platform claim.
 
-For search, storage, pagination, or operation changes:
+## Where the boundary currently sits
 
-```bash
-npm run benchmark
-```
-
-Before producing a release archive:
-
-```bash
-npm run manifest:write
-npm run release:check
-```
-
-Also extract the archive into a fresh directory and rerun `npm run release:check` there.
-
-For a macOS application claim, run `npm run build`, launch the resulting `.app`, and inspect the actual WebView. Component tests alone are not a platform claim.
-
-## Current implementation boundary
-
-The current deterministic native demo validates:
-
-- Rust SQLite schema/migrations, local projection, pending-intent semantics, work journal, undo, and stale-operation rejection;
-- bounded Rust search parsing/AST/FTS and native mailbox/message pagination;
-- drafts, rich compose/reply/reply-all/forward, delayed send, uncertain-send recovery, snooze, and synthetic invitation/RSVP;
-- a Rust-only passphrase vault boundary with lifecycle-only Tauri commands;
-- bounded standards-based MIME/charset ingestion and HTML5-tree sanitization;
-- typed external-link opening plus an exact bundled/development WebView-navigation allowlist;
-- replay/replacement/rethread/deletion-safe search indexing;
-- production-Svelte interactions through typed Tauri IPC mocks;
-- a native 100,000-message isolated performance gate;
-- responsive desktop layouts and a loopback-only internal Vite development URL.
-
-It does not implement real providers, S/MIME/PGP, remote-image consent, attachment quarantine/scanning, real calendar APIs, real AI, provider-facing MCP/plugins, background sync, or proven Windows/Linux/Android/iOS support.
-
-## Next implementation order
-
-1. Keep the native local vertical slice green.
-2. Keep the hostile MIME/HTML boundary and replay-safe search contracts green.
-3. Complete the native provider-core conformance/performance gate.
-4. Specify one provider adapter's authentication, delta sync, pagination, mutation, and send contracts.
-5. Implement and exercise that provider without leaking provider types into Svelte.
-6. Prove packaging and runtime behavior on each platform separately before adding its support claim.
+README.md describes what connects and sends today; `docs/KNOWN_LIMITATIONS.md` is the blunt version. Read both before writing anything that asserts a capability. If your change moves that boundary, move the prose with it in the same change — and only as far as the evidence reaches.
 
 ## Working style
 
-- Inspect relevant files before editing.
-- State exact acceptance criteria.
-- Run the narrowest relevant tests during iteration and the full required gate before completion.
-- Report commands, actual results, remaining risks, and untested assumptions.
-- Do not weaken tests or defensive checks to make a change pass.
+Inspect the relevant files before editing. State exact acceptance criteria. Run the narrowest useful test while iterating and the full gate at the end. Report the commands you ran, what actually happened, and what remains untested.

@@ -37,7 +37,6 @@
       parent.appendChild(document.createTextNode(node.text));
       return;
     }
-    if (node.type === 'remote-image') return;
     const element = document.createElement(node.tag);
     if (node.tag === 'a' && node.href) element.setAttribute('href', node.href);
     for (const child of node.children) appendNode(element, child);

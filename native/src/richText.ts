@@ -1,14 +1,91 @@
 export type RichNode =
   | { type: 'text'; text: string }
-  | { type: 'element'; tag: 'p' | 'div' | 'strong' | 'em' | 'u' | 'ul' | 'ol' | 'li' | 'blockquote' | 'br' | 'a'; href?: string; children: RichNode[] }
-  | { type: 'remote-image'; resourceId: number };
+  | { type: 'element'; tag: RichTag; href?: string; children: RichNode[] };
 
-const allowedTags = new Set(['p', 'div', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'blockquote', 'br', 'a']);
-const MAX_RENDER_HTML_UNITS = 8 * 1024 * 1024 + 1024;
+export type RichTag =
+  | 'p' | 'div' | 'strong' | 'em' | 'u' | 'ul' | 'ol' | 'li' | 'blockquote' | 'br' | 'a'
+  | 'table' | 'thead' | 'tbody' | 'tfoot' | 'tr' | 'td' | 'th' | 'caption'
+  | 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
+  | 'hr' | 'pre' | 'code' | 'dl' | 'dt' | 'dd' | 'del' | 'sub' | 'sup';
+
+/// Structural and inline markup that survives rendering. Attributes never do,
+/// apart from a revalidated href, so nothing here can carry behaviour.
+const allowedTags = new Set<string>([
+  'p', 'div', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'blockquote', 'br', 'a',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'hr', 'pre', 'code', 'dl', 'dt', 'dd', 'del', 's', 'strike', 'sub', 'sup'
+]);
+/// Void elements carry no children.
+const voidTags = new Set<string>(['br', 'hr']);
 const MAX_RENDER_TREE_DEPTH = 64;
 const MAX_RENDER_TREE_NODES = 50_000;
-const MAX_REMOTE_IMAGE_RESOURCE_ID = 64;
 const MAX_REMOTE_IMAGE_DATA_URL_UNITS = 8 * 1024 * 1024 + 128;
+
+/// Where a reply's quoted tail begins. Anything from here down is the previous
+/// message, a signature, or client postmatter, none of which is new content.
+const QUOTE_BOUNDARIES: RegExp[] = [
+  /^--\s*$/u,
+  /^-{2,}\s*original message\s*-{2,}/iu,
+  /^_{5,}\s*$/u,
+  /^-{5,}\s*$/u,
+  /^on\b.{0,300}\bwrote:\s*$/iu,
+  /^on\b.{0,300}\b(?:at|,)\s.{0,120}$/iu,
+  /^\s*(?:>\s*)*from:\s/iu,
+  /^sent from my\b/iu,
+  /^get outlook for\b/iu,
+  /^this email .{0,80}confidential/iu
+];
+
+function isQuotedLine(line: string): boolean {
+  return /^\s*>/u.test(line);
+}
+
+function startsQuotedTail(line: string, next: string | undefined): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (QUOTE_BOUNDARIES.some((pattern) => pattern.test(trimmed))) return true;
+  // A reply header wrapped onto a second line: "On <date>" then "<name> wrote:".
+  return /^on\b/iu.test(trimmed) && /\bwrote:\s*$/iu.test(next?.trim() ?? '');
+}
+
+/// The part of a message a person actually wrote, with the quoted reply chain,
+/// signature, and client footer removed. Returns the surviving paragraphs plus
+/// whether anything was dropped, so the interface can say so rather than hide
+/// content silently.
+export function newContentParagraphs(value: string): { paragraphs: string[][]; trimmed: boolean } {
+  const lines = value.replace(/\r\n?/gu, '\n').split('\n');
+  let cut = lines.length;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (startsQuotedTail(lines[index], lines[index + 1])) {
+      cut = index;
+      break;
+    }
+  }
+  const kept = lines.slice(0, cut).filter((line) => !isQuotedLine(line));
+  const trimmed = cut < lines.length || kept.length !== cut;
+  const paragraphs = plainTextParagraphs(kept.join('\n'));
+  // A message that is nothing but a quote should still show something.
+  if (!paragraphs.length) return { paragraphs: plainTextParagraphs(value), trimmed: false };
+  return { paragraphs, trimmed };
+}
+
+/// Plain-text bodies carry their own structure in newlines. Any run of blank
+/// lines is one paragraph break, so "a\n\n\n\nb" reads the same as "a\n\nb";
+/// single newlines stay as line breaks inside the paragraph.
+export function plainTextParagraphs(value: string): string[][] {
+  return value
+    .replace(/\r\n?/gu, '\n')
+    .split(/\n[ \t]*\n+/u)
+    .map((paragraph) => {
+      const lines = paragraph.split('\n').map((line) => line.trimEnd());
+      // A paragraph never opens or closes on a blank line.
+      while (lines.length && !lines[0].trim()) lines.shift();
+      while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+      return lines;
+    })
+    .filter((lines) => lines.length > 0);
+}
 
 export function safeRemoteImageDataUrl(value: string): string | null {
   return value.length <= MAX_REMOTE_IMAGE_DATA_URL_UNITS
@@ -29,45 +106,13 @@ export function safeHref(value: string): string | null {
   }
 }
 
-function hasPercentEncodedControl(value: string): boolean {
-  try {
-    return /[\u0000-\u001f\u007f-\u009f]/u.test(decodeURIComponent(value));
-  } catch {
-    return true;
-  }
-}
-
-/**
- * Message bodies use a stricter link contract than the composer. Incoming
- * content may name only an absolute HTTP(S) destination; it never gets the
- * editor's convenient scheme inference and never turns mailto into ambient
- * navigation authority.
- */
-export function safeMessageHref(value: string): string | null {
-  const trimmed = value.trim();
-  if (
-    !trimmed
-    || new TextEncoder().encode(trimmed).byteLength > 2_048
-    || /[\s\u0000-\u001f\u007f-\u009f]/u.test(trimmed)
-    || hasPercentEncodedControl(trimmed)
-  ) return null;
-  try {
-    const url = new URL(trimmed);
-    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) return null;
-    return url.href;
-  } catch {
-    return null;
-  }
-}
-
 type ParseBudget = { visited: number };
 
 function convertNode(
   node: Node,
   linkPolicy: (value: string) => string | null,
   budget: ParseBudget,
-  depth: number,
-  allowRemoteImageMarkers = false
+  depth: number
 ): RichNode[] {
   if (budget.visited >= MAX_RENDER_TREE_NODES || depth > MAX_RENDER_TREE_DEPTH) return [];
   budget.visited += 1;
@@ -76,21 +121,20 @@ function convertNode(
   }
   if (!(node instanceof HTMLElement)) return [];
   const rawTag = node.tagName.toLocaleLowerCase();
-  if (allowRemoteImageMarkers && rawTag === 'mux-remote-image') {
-    const rawId = node.getAttribute('data-id') ?? '';
-    const resourceId = /^(?:0|[1-9]\d*)$/u.test(rawId) ? Number(rawId) : Number.NaN;
-    return Number.isSafeInteger(resourceId) && resourceId >= 1 && resourceId <= MAX_REMOTE_IMAGE_RESOURCE_ID
-      ? [{ type: 'remote-image', resourceId }]
-      : [];
-  }
-  const children = Array.from(node.childNodes).flatMap((child) => convertNode(child, linkPolicy, budget, depth + 1, allowRemoteImageMarkers));
+  const children = Array.from(node.childNodes).flatMap((child) => convertNode(child, linkPolicy, budget, depth + 1));
   if (!allowedTags.has(rawTag)) return children;
-  const tag = rawTag === 'b' ? 'strong' : rawTag === 'i' ? 'em' : rawTag;
+  const tag = rawTag === 'b' ? 'strong' : rawTag === 'i' ? 'em' : rawTag === 's' || rawTag === 'strike' ? 'del' : rawTag;
   if (tag === 'a') {
     const href = linkPolicy(node.getAttribute('href') ?? '');
     return href ? [{ type: 'element', tag, href, children }] : children;
   }
-  return [{ type: 'element', tag: tag as RichNode & string, children } as RichNode];
+  return [
+    {
+      type: 'element',
+      tag: tag as RichTag,
+      children: voidTags.has(tag) ? [] : children
+    }
+  ];
 }
 
 export function parseRichText(value: string): RichNode[] {
@@ -98,13 +142,6 @@ export function parseRichText(value: string): RichNode[] {
   const document = new DOMParser().parseFromString(value, 'text/html');
   const budget: ParseBudget = { visited: 0 };
   return Array.from(document.body.childNodes).flatMap((node) => convertNode(node, safeHref, budget, 0));
-}
-
-export function parseMessageRichText(value: string): RichNode[] {
-  if (!value.trim() || typeof DOMParser === 'undefined') return [];
-  const document = new DOMParser().parseFromString(value.slice(0, MAX_RENDER_HTML_UNITS), 'text/html');
-  const budget: ParseBudget = { visited: 0 };
-  return Array.from(document.body.childNodes).flatMap((node) => convertNode(node, safeMessageHref, budget, 0, true));
 }
 
 function escapeText(value: string): string {
@@ -117,7 +154,6 @@ function escapeAttribute(value: string): string {
 
 function serializeNode(node: RichNode): string {
   if (node.type === 'text') return escapeText(node.text);
-  if (node.type === 'remote-image') return '';
   if (node.tag === 'br') return '<br>';
   const content = node.children.map(serializeNode).join('');
   if (node.tag === 'a' && node.href) {

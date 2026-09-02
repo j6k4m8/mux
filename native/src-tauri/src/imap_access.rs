@@ -1,18 +1,17 @@
-//! Typed IMAP connection records behind the encrypted Rust vault.
+//! Typed IMAP connection records held in the system keychain.
 //!
 //! SQLite retains only an opaque lookup marker and mailbox identity. Host,
 //! port, username, authentication material, and TLS policy are decoded only
 //! inside Rust immediately before a bounded IMAP session is created.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::imap::{ImapAccessError, ImapAccessGrant, ImapAccessSource};
-use crate::vault::{CredentialVault, VaultError, VaultStatus};
+use crate::keychain::{CredentialError, CredentialStore, CredentialStoreStatus};
 use crate::worker::WorkerError;
 
 const RECORD_VERSION: u8 = 1;
@@ -23,25 +22,25 @@ const MAX_SECRET_BYTES: usize = 16 * 1024;
 const TLS_MODE: &str = "implicit";
 const AUTH_MECHANISM: &str = "password";
 
-pub(crate) struct ImapVaultAccess {
+pub(crate) struct ImapKeychainAccess {
     database_path: PathBuf,
-    vault: Arc<Mutex<CredentialVault>>,
+    credentials: CredentialStore,
 }
 
-impl ImapVaultAccess {
-    pub(crate) fn new(database_path: &Path, vault: Arc<Mutex<CredentialVault>>) -> Self {
+impl ImapKeychainAccess {
+    pub(crate) fn new(database_path: &Path, credentials: CredentialStore) -> Self {
         Self {
             database_path: database_path.to_owned(),
-            vault,
+            credentials,
         }
     }
 }
 
-impl ImapAccessSource for ImapVaultAccess {
+impl ImapAccessSource for ImapKeychainAccess {
     fn access_for_account(&self, account_id: &str) -> Result<ImapAccessGrant, ImapAccessError> {
         let configured = read_configured_account(&self.database_path, account_id)?;
         match configured.auth_state.as_str() {
-            "credential_locked" => return Err(ImapAccessError::Locked),
+            "credential_locked" => return Err(ImapAccessError::CredentialUnavailable),
             "reauthorization_required" | "signed_out" => {
                 return Err(ImapAccessError::ReauthorizationRequired)
             }
@@ -51,16 +50,11 @@ impl ImapAccessSource for ImapVaultAccess {
         let reference = configured
             .record_ref
             .ok_or(ImapAccessError::ReauthorizationRequired)?;
-        let bytes = {
-            let vault = self.vault.lock().map_err(|_| ImapAccessError::Permanent)?;
-            if vault.status() != VaultStatus::Unlocked {
-                return Err(ImapAccessError::Locked);
-            }
-            vault
-                .get(&reference)
-                .map_err(map_vault_error)?
-                .ok_or(ImapAccessError::ReauthorizationRequired)?
-        };
+        let bytes = self
+            .credentials
+            .get(&reference)
+            .map_err(map_credential_error)?
+            .ok_or(ImapAccessError::ReauthorizationRequired)?;
         let record = ImapAuthorityRecord::decode(&bytes)?;
         record.validate_for_subject(&configured.remote_subject)?;
         Ok(ImapAccessGrant {
@@ -73,17 +67,17 @@ impl ImapAccessSource for ImapVaultAccess {
     }
 }
 
-/// Revalidates every configured IMAP marker before generic unlock handling is
-/// allowed to resume provider work. A missing or wrong-subject record is a
-/// typed reauthorization block; it can never fall through to network I/O.
-pub(crate) fn reconcile_unlocked_records(
+/// Revalidates every configured IMAP lookup marker against the keychain at
+/// startup. A missing or wrong-subject record is a typed reauthorization block;
+/// it can never fall through to network I/O.
+pub(crate) fn reconcile_credential_records(
     database_path: &Path,
-    vault: &CredentialVault,
+    credentials: &CredentialStore,
     now_ms: i64,
 ) -> Result<usize, WorkerError> {
-    if now_ms < 0 || vault.status() != VaultStatus::Unlocked {
+    if now_ms < 0 || credentials.status() != CredentialStoreStatus::Available {
         return Err(WorkerError::Conflict(
-            "IMAP authority cannot be reconciled while the vault is locked".into(),
+            "IMAP authority cannot be reconciled while the keychain is unavailable".into(),
         ));
     }
     let mut connection = Connection::open(database_path)?;
@@ -109,19 +103,14 @@ pub(crate) fn reconcile_unlocked_records(
     };
     let mut invalid = 0;
     for (account_id, remote_subject, reference) in accounts {
-        let valid = match vault.get(&reference) {
+        let valid = match credentials.get(&reference) {
             Ok(Some(bytes)) => ImapAuthorityRecord::decode(&bytes)
                 .and_then(|record| record.validate_for_subject(&remote_subject))
                 .is_ok(),
             Ok(None) => false,
-            Err(VaultError::Locked | VaultError::StaleUnlock) => {
+            Err(CredentialError::Unavailable) => {
                 return Err(WorkerError::Conflict(
-                    "IMAP authority reconciliation lost the vault unlock".into(),
-                ))
-            }
-            Err(VaultError::Io(_)) => {
-                return Err(WorkerError::Conflict(
-                    "IMAP authority reconciliation could not read the vault".into(),
+                    "IMAP authority reconciliation could not read the keychain".into(),
                 ))
             }
             Err(_) => false,
@@ -210,6 +199,7 @@ struct ImapAuthorityRecordWire {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(test), allow(dead_code))]
 struct ImapAuthorityRecordWrite<'a> {
     version: u8,
     tls_mode: &'static str,
@@ -274,7 +264,11 @@ impl ImapAuthorityRecord {
 }
 
 /// Internal provisioning boundary for a future typed account flow. The
-/// returned bytes are secret-bearing and may only be written to the vault.
+/// returned bytes are secret-bearing and may only be written to the keychain.
+/// Writes one IMAP authority record. Exercised by this module's tests; the
+/// command that adds an IMAP account from the interface does not exist yet, so
+/// there is no production caller.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_imap_authority(
     host: &str,
     port: u16,
@@ -299,10 +293,7 @@ pub(crate) fn encode_imap_authority(
 }
 
 fn normalize_hostname(value: &str) -> Result<String, ImapAccessError> {
-    if value.is_empty()
-        || value.len() > MAX_HOST_BYTES
-        || !value.is_ascii()
-        || value.ends_with('.')
+    if value.is_empty() || value.len() > MAX_HOST_BYTES || !value.is_ascii() || value.ends_with('.')
     {
         return Err(ImapAccessError::Permanent);
     }
@@ -328,10 +319,7 @@ fn normalize_hostname(value: &str) -> Result<String, ImapAccessError> {
 }
 
 fn validate_identity(value: &str) -> Result<(), ImapAccessError> {
-    if value.is_empty()
-        || value.len() > MAX_IDENTITY_BYTES
-        || value.chars().any(char::is_control)
-    {
+    if value.is_empty() || value.len() > MAX_IDENTITY_BYTES || value.chars().any(char::is_control) {
         return Err(ImapAccessError::Permanent);
     }
     Ok(())
@@ -344,37 +332,26 @@ fn validate_secret(value: &str) -> Result<(), ImapAccessError> {
     Ok(())
 }
 
-fn map_vault_error(error: VaultError) -> ImapAccessError {
+fn map_credential_error(error: CredentialError) -> ImapAccessError {
     match error {
-        VaultError::Locked | VaultError::StaleUnlock => ImapAccessError::Locked,
-        VaultError::Absent => ImapAccessError::ReauthorizationRequired,
-        VaultError::Io(_) => ImapAccessError::Retryable,
-        _ => ImapAccessError::Permanent,
+        CredentialError::Unavailable => ImapAccessError::CredentialUnavailable,
+        CredentialError::InvalidIdentifier | CredentialError::LimitExceeded(_) => {
+            ImapAccessError::Permanent
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::imap::ImapAccessSource as _;
     use crate::store::MuxStore;
     use tempfile::tempdir;
 
-    const VAULT_PASSPHRASE: &[u8] = b"imap vault fixture passphrase";
-
-    fn configured_fixture() -> (
-        tempfile::TempDir,
-        PathBuf,
-        Arc<Mutex<CredentialVault>>,
-        String,
-    ) {
+    fn configured_fixture() -> (tempfile::TempDir, PathBuf, CredentialStore, String) {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("imap-access.db");
         drop(MuxStore::open(&path, false).expect("native schema"));
-        let mut vault = CredentialVault::for_database(&path);
-        vault
-            .create(Zeroizing::new(VAULT_PASSPHRASE.to_vec()))
-            .expect("create fixture vault");
+        let credentials = CredentialStore::temporary(&directory.path().join("imap.keychain-db"));
         let reference = "imap:v1:fixture-account".to_string();
         let encoded = encode_imap_authority(
             "mail.example.test",
@@ -384,7 +361,9 @@ mod tests {
             "reader@example.test",
         )
         .expect("encode authority");
-        vault.put(&reference, encoded).expect("write authority");
+        credentials
+            .put(&reference, encoded)
+            .expect("write authority");
         let connection = Connection::open(&path).expect("fixture connection");
         connection
             .execute(
@@ -405,16 +384,11 @@ mod tests {
                 [&reference],
             )
             .expect("provider fixture");
-        (
-            directory,
-            path,
-            Arc::new(Mutex::new(vault)),
-            reference,
-        )
+        (directory, path, credentials, reference)
     }
 
     #[test]
-    fn imap_authority_is_strict_normalized_and_secret_bearing_only_in_vault() {
+    fn imap_authority_is_strict_normalized_and_secret_bearing_only_in_keychain() {
         let encoded = encode_imap_authority(
             "MAIL.Example.Test",
             993,
@@ -458,12 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn imap_vault_access_fails_closed_and_sqlite_contains_only_an_opaque_marker() {
-        let (_directory, path, vault, reference) = configured_fixture();
-        let access = ImapVaultAccess::new(&path, Arc::clone(&vault));
+    fn imap_keychain_access_fails_closed_and_sqlite_contains_only_an_opaque_marker() {
+        let (_directory, path, credentials, reference) = configured_fixture();
+        let access = ImapKeychainAccess::new(&path, credentials);
         let grant = access
             .access_for_account("imap-account")
-            .expect("unlocked grant");
+            .expect("available grant");
         assert_eq!(grant.host, "mail.example.test");
         assert_eq!(grant.port, 993);
         assert_eq!(grant.username, "reader@example.test");
@@ -476,11 +450,6 @@ mod tests {
         assert!(!sqlite_text.contains("mail.example.test"));
         assert!(sqlite_text.contains(&reference));
 
-        vault.lock().expect("vault mutex").lock();
-        assert!(matches!(
-            access.access_for_account("imap-account"),
-            Err(ImapAccessError::Locked)
-        ));
         let connection = Connection::open(&path).expect("fixture connection");
         connection
             .execute(
@@ -490,11 +459,6 @@ mod tests {
             )
             .expect("replace marker");
         drop(connection);
-        let mut locked = vault.lock().expect("vault mutex");
-        locked
-            .unlock(Zeroizing::new(VAULT_PASSPHRASE.to_vec()))
-            .expect("unlock vault");
-        drop(locked);
         assert!(matches!(
             access.access_for_account("imap-account"),
             Err(ImapAccessError::ReauthorizationRequired)
@@ -502,8 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn imap_unlock_reconciliation_blocks_wrong_subject_without_exposing_record() {
-        let (_directory, path, vault, _reference) = configured_fixture();
+    fn imap_startup_reconciliation_blocks_wrong_subject_without_exposing_record() {
+        let (_directory, path, credentials, _reference) = configured_fixture();
         let connection = Connection::open(&path).expect("fixture connection");
         connection
             .execute(
@@ -513,12 +477,10 @@ mod tests {
             )
             .expect("change subject");
         drop(connection);
-        let vault_guard = vault.lock().expect("vault mutex");
         assert_eq!(
-            reconcile_unlocked_records(&path, &vault_guard, 10).expect("reconcile"),
+            reconcile_credential_records(&path, &credentials, 10).expect("reconcile"),
             1
         );
-        drop(vault_guard);
         let connection = Connection::open(path).expect("verification connection");
         assert_eq!(
             connection

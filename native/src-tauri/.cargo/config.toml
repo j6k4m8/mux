@@ -1,0 +1,8 @@
+# `tauri dev` runs the app through `cargo run`, so this runner gets a chance to
+# give every dev build the same code signature. Without it each rebuild is a new
+# ad-hoc identity and the keychain prompts for a password again.
+[target.aarch64-apple-darwin]
+runner = "../../scripts/sign-dev-binary.sh"
+
+[target.x86_64-apple-darwin]
+runner = "../../scripts/sign-dev-binary.sh"

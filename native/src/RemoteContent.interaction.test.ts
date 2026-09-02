@@ -1,12 +1,19 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { describe, expect, test } from 'vitest';
-import RichText from './RichText.svelte';
 import ThreadConversation from './ThreadConversation.svelte';
-import { parseMessageRichText, parseRichText } from './richText';
+import { resolveRemoteImages } from './messageFrame';
 import type { MessageSummary, RemoteImageSummary } from './types';
 
 const pngData = 'data:image/png;base64,AA==';
+
+/// Images live inside the reader frame, so the frame's own document is what a
+/// message actually gets to show.
+function framedImages(container: HTMLElement): string[] {
+  const frame = container.querySelector('iframe.message-frame');
+  const source = frame?.getAttribute('srcdoc') ?? '';
+  return source.match(/<img class="mux-remote"[^>]*>/gu) ?? [];
+}
 
 function remoteImage(
   id: number,
@@ -36,32 +43,56 @@ function message(remoteImages: RemoteImageSummary[]): MessageSummary {
 }
 
 describe('remote image privacy controls', () => {
-  test('parses only inert integer markers and never carries a remote URL into render nodes', () => {
-    const nodes = parseMessageRichText(`
-      <mux-remote-image data-id="7" src="https://tracker.example/pixel"></mux-remote-image>
-      <mux-remote-image data-id="65"></mux-remote-image>
-      <mux-remote-image data-id="-1"></mux-remote-image>
-      <mux-remote-image data-id="7.5"></mux-remote-image>
-    `);
+  test('resolves only inert integer markers and never carries a remote URL into the frame', () => {
+    const markers = [
+      '<mux-remote-image data-id="7"></mux-remote-image>',
+      '<mux-remote-image data-id="8"></mux-remote-image>'
+    ].join(' ');
 
-    expect(nodes.filter((node) => node.type !== 'text' || node.text.trim())).toEqual([
-      { type: 'remote-image', resourceId: 7 }
-    ]);
-    expect(JSON.stringify(nodes)).not.toContain('tracker.example');
-    expect(parseRichText('<mux-remote-image data-id="7"></mux-remote-image>')).toEqual([]);
-
-    const { container } = render(RichText, {
-      nodes,
-      remoteImages: { 7: { dataUrl: null, altText: 'Company logo' } }
+    // Nothing is approved yet, so both become placeholders naming what is held.
+    const blocked = resolveRemoteImages(markers, {
+      7: { dataUrl: null, altText: 'Company logo' },
+      8: { dataUrl: null, altText: '' }
     });
-    expect(container.querySelector('img')).toBeNull();
-    expect(screen.getByRole('img', { name: 'Company logo' })).toBeTruthy();
+    expect(blocked).toContain('aria-label="Company logo"');
+    expect(blocked).not.toContain('<img');
 
-    const hostile = render(RichText, {
-      nodes,
-      remoteImages: { 7: { dataUrl: 'https://tracker.example/pixel', altText: 'Tracker' } }
+    // A response bearing a remote URL rather than approved bytes is refused.
+    const hostile = resolveRemoteImages(markers, {
+      7: { dataUrl: 'https://tracker.example/pixel', altText: 'Tracker' },
+      8: { dataUrl: 'data:text/html;base64,AA==', altText: 'Not an image' }
     });
-    expect(hostile.container.querySelector('img')).toBeNull();
+    expect(hostile).not.toContain('<img');
+    expect(hostile).not.toContain('tracker.example');
+
+    // A marker naming a resource this message never declared leaves nothing.
+    expect(resolveRemoteImages(markers, {})).toBe(' ');
+
+    const approved = resolveRemoteImages(markers, {
+      7: { dataUrl: pngData, altText: 'Logo "quoted"' },
+      8: { dataUrl: pngData, altText: '' }
+    });
+    expect(approved.match(/<img /gu)).toHaveLength(2);
+    expect(approved).toContain('alt="Logo &quot;quoted&quot;"');
+  });
+
+  test('a background refresh of the open thread does not rebuild the reader', async () => {
+    const fixture = message([]);
+    const { container, rerender } = render(ThreadConversation, {
+      messages: [fixture],
+      attachments: []
+    });
+    const before = container.querySelector('iframe.message-frame');
+    expect(before).toBeTruthy();
+    const rendered = before!.getAttribute('srcdoc');
+
+    // A sync commit hands the reader a fresh array of equal rows several times a
+    // minute. Rebuilding the element on each one reloads the document inside it,
+    // which the reader sees as the message flashing.
+    await rerender({ messages: [{ ...fixture }], attachments: [] });
+
+    expect(container.querySelector('iframe.message-frame')).toBe(before);
+    expect(before!.getAttribute('srcdoc')).toBe(rendered);
   });
 
   test('loads images for this view without changing persistent policy', async () => {
@@ -81,7 +112,7 @@ describe('remote image privacy controls', () => {
 
     expect(screen.getByText('2 remote items blocked')).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Load images' }));
-    await waitFor(() => expect(container.querySelectorAll('img.remote-message-image')).toHaveLength(2));
+    await waitFor(() => expect(framedImages(container)).toHaveLength(2));
     expect(calls).toEqual([
       { command: 'load_remote_image', payload: { input: { messageId: 11, resourceId: 7 } } },
       { command: 'load_remote_image', payload: { input: { messageId: 11, resourceId: 8 } } }
@@ -103,14 +134,14 @@ describe('remote image privacy controls', () => {
     ]);
     const { container } = render(ThreadConversation, { messages: [fixture], attachments: [] });
 
-    await waitFor(() => expect(container.querySelectorAll('img.remote-message-image')).toHaveLength(1));
+    await waitFor(() => expect(framedImages(container)).toHaveLength(1));
     expect(calls).toEqual([
       { command: 'load_remote_image', payload: { input: { messageId: 11, resourceId: 7 } } }
     ]);
 
     await fireEvent.click(screen.getByRole('button', { name: 'Load images' }));
     expect((await screen.findByRole('alert')).textContent).toBe('Some images could not be loaded.');
-    expect(container.querySelectorAll('img.remote-message-image')).toHaveLength(1);
+    expect(framedImages(container)).toHaveLength(1);
   });
 
   test('persists sender and exact-domain choices only through their typed commands', async () => {

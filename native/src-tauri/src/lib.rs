@@ -1,12 +1,14 @@
 pub mod content;
+mod css;
 mod gmail;
 mod gmail_access;
 #[path = "google_authorization.rs"]
 mod gmail_oauth;
-// IMAP remains an unshipped work-in-progress. Keep it out of the product build
-// until its adapter compiles and passes the provider contract gate.
+mod imap;
+mod imap_access;
 mod internet_message;
 mod ipc_boundary;
+mod keychain;
 mod mime_ingest;
 mod navigation;
 mod outgoing;
@@ -17,29 +19,34 @@ mod provider_schema;
 mod remote_content;
 mod search;
 pub mod store;
-mod vault;
 mod worker;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use store::{
-    AttachmentContent, DraftSummary, ListOperationsInput, MailboxBootstrap, MessagePage,
-    MessagePageInput, MuxStore, OperationActivitySummary, OperationSummary, SaveDraftInput,
-    SearchInput, SearchPage, ThreadLookupInput, ThreadPage, ThreadPageInput, ThreadSummary,
+    AttachmentContent, DraftSummary, ListOperationsInput, MailStats, MailStatsInput,
+    MailboxBootstrap, MessagePage, MessagePageInput, MuxStore, OperationActivitySummary,
+    OperationSummary, SaveDraftInput, SearchInput, SearchPage, ThreadLookupInput, ThreadPage,
+    ThreadPageInput, ThreadSummary,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
-use vault::{CredentialVault, VaultStatus};
 use worker::{
     ClaimedWork, DurableWorker, WorkerAdapter, WorkerConfig, WorkerController, WorkerCycleResult,
-    WorkerError, WorkerExecutionContext, WorkerOutcome, WorkerProjection,
+    WorkerExecutionContext, WorkerOutcome, WorkerProjection,
 };
 
 const MAILBOX_CHANGED_EVENT: &str = "mux://mailbox-changed";
+/// How often the refresh timer asks which accounts are due. Individual accounts
+/// keep their own cadence; this only bounds how precisely it is honoured.
+const REFRESH_TICK_SECONDS: u64 = 5;
+/// Multiplier ceiling for the refresh tick after repeated failures.
+const REFRESH_MAX_BACKOFF: u32 = 24;
 
 #[derive(Clone, Copy, Serialize)]
 struct MailboxChangedPayload {
@@ -49,24 +56,30 @@ struct MailboxChangedPayload {
 struct AppState {
     database_path: PathBuf,
     store: Mutex<MuxStore>,
-    vault: Arc<Mutex<CredentialVault>>,
-    provider_worker: DurableWorker,
+    credentials: keychain::CredentialStore,
     gmail_oauth: Arc<gmail_oauth::GmailOAuthCoordinator>,
     worker: Mutex<Option<WorkerController>>,
+    /// Set on exit so the refresh timer stops instead of outliving the window.
+    refresh_stop: Arc<AtomicBool>,
 }
 
-struct NativeWorkerAdapter<G> {
+struct NativeWorkerAdapter<G, I> {
     gmail: G,
+    imap: I,
     database_path: PathBuf,
 }
 
-impl<G> WorkerAdapter for NativeWorkerAdapter<G>
+impl<G, I> WorkerAdapter for NativeWorkerAdapter<G, I>
 where
     G: WorkerAdapter + Sync,
+    I: WorkerAdapter + Sync,
 {
     fn execute(&self, work: &ClaimedWork, context: &WorkerExecutionContext) -> WorkerOutcome {
         if gmail::is_gmail_owned_work(work) {
             return self.gmail.execute(work, context);
+        }
+        if imap::is_imap_sync_work(work) {
+            return self.imap.execute(work, context);
         }
         let provider_kind =
             rusqlite::Connection::open(&self.database_path).and_then(|connection| {
@@ -97,24 +110,6 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-struct VaultStatusPayload {
-    state: &'static str,
-}
-
-impl From<VaultStatus> for VaultStatusPayload {
-    fn from(status: VaultStatus) -> Self {
-        Self {
-            state: match status {
-                VaultStatus::Absent => "absent",
-                VaultStatus::Locked => "locked",
-                VaultStatus::Unlocked => "unlocked",
-                VaultStatus::Unavailable => "unavailable",
-            },
-        }
-    }
-}
-
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -124,62 +119,7 @@ fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-fn vault_unavailable() -> String {
-    "Credential protection is unavailable".to_string()
-}
-
-/// Finishes the SQLite side of an interrupted destructive reset. An absent
-/// vault can never satisfy an existing credential reference, so those markers
-/// must be cleared before a new empty vault can be created or provider work can
-/// start. Unknown/corrupt vaults are deliberately left for explicit reset.
-fn reconcile_absent_vault(
-    vault: &CredentialVault,
-    provider_worker: &DurableWorker,
-    now: i64,
-) -> Result<(), WorkerError> {
-    if vault.status() == VaultStatus::Absent {
-        provider_worker.reset_credentials_after_vault_deletion(now)?;
-    }
-    Ok(())
-}
-
-fn create_vault_and_resume(
-    vault: &mut CredentialVault,
-    provider_worker: &DurableWorker,
-    passphrase: zeroize::Zeroizing<Vec<u8>>,
-    now: i64,
-) -> Result<(), String> {
-    reconcile_absent_vault(vault, provider_worker, now).map_err(|_| vault_unavailable())?;
-    vault
-        .create(passphrase)
-        .map_err(|error| error.to_string())?;
-    if provider_worker
-        .resume_all_after_credential_unlock(now)
-        .is_err()
-    {
-        vault.lock();
-        return Err(vault_unavailable());
-    }
-    Ok(())
-}
-
-async fn run_vault_lifecycle<F>(
-    vault: Arc<Mutex<CredentialVault>>,
-    action: F,
-) -> Result<VaultStatusPayload, String>
-where
-    F: FnOnce(&mut CredentialVault) -> Result<(), String> + Send + 'static,
-{
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut vault = vault.lock().map_err(|_| vault_unavailable())?;
-        action(&mut vault)?;
-        Ok(vault.status().into())
-    })
-    .await
-    .map_err(|_| vault_unavailable())?
-}
-
-fn wake_worker(state: &State<'_, AppState>) {
+fn wake_worker_state(state: &AppState) {
     if let Ok(worker) = state.worker.lock() {
         if let Some(worker) = worker.as_ref() {
             let _ = worker.wake();
@@ -187,110 +127,8 @@ fn wake_worker(state: &State<'_, AppState>) {
     }
 }
 
-#[tauri::command]
-async fn vault_status(state: State<'_, AppState>) -> Result<VaultStatusPayload, String> {
-    run_vault_lifecycle(Arc::clone(&state.vault), |_| Ok(())).await
-}
-
-#[tauri::command]
-async fn vault_create(
-    state: State<'_, AppState>,
-    passphrase: String,
-) -> Result<VaultStatusPayload, String> {
-    let provider_worker = state.provider_worker.clone();
-    run_vault_lifecycle(Arc::clone(&state.vault), move |vault| {
-        create_vault_and_resume(
-            vault,
-            &provider_worker,
-            zeroize::Zeroizing::new(passphrase.into_bytes()),
-            now_ms(),
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-async fn vault_unlock(
-    state: State<'_, AppState>,
-    passphrase: String,
-) -> Result<VaultStatusPayload, String> {
-    let provider_worker = state.provider_worker.clone();
-    let database_path = state.database_path.clone();
-    let status = run_vault_lifecycle(Arc::clone(&state.vault), move |vault| {
-        vault
-            .unlock(zeroize::Zeroizing::new(passphrase.into_bytes()))
-            .map_err(|error| error.to_string())?;
-        if gmail_access::reconcile_unlocked_records(&database_path, vault, now_ms()).is_err() {
-            vault.lock();
-            return Err(vault_unavailable());
-        }
-        let resumed_at = now_ms();
-        if provider_worker
-            .resume_all_after_credential_unlock(resumed_at)
-            .is_err()
-            || gmail::schedule_resumable_syncs(&database_path, resumed_at).is_err()
-        {
-            let _ = provider_worker.mark_configured_credentials_locked_for_startup(now_ms());
-            vault.lock();
-            return Err(vault_unavailable());
-        }
-        Ok(())
-    })
-    .await?;
-    wake_worker(&state);
-    Ok(status)
-}
-
-#[tauri::command]
-async fn vault_lock(state: State<'_, AppState>) -> Result<VaultStatusPayload, String> {
-    let provider_worker = state.provider_worker.clone();
-    run_vault_lifecycle(Arc::clone(&state.vault), move |vault| {
-        provider_worker
-            .mark_configured_credentials_locked_for_startup(now_ms())
-            .map_err(|_| vault_unavailable())?;
-        vault.lock();
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn vault_change_passphrase(
-    state: State<'_, AppState>,
-    current_passphrase: String,
-    new_passphrase: String,
-) -> Result<VaultStatusPayload, String> {
-    run_vault_lifecycle(Arc::clone(&state.vault), move |vault| {
-        vault
-            .change_passphrase(
-                zeroize::Zeroizing::new(current_passphrase.into_bytes()),
-                zeroize::Zeroizing::new(new_passphrase.into_bytes()),
-            )
-            .map_err(|error| error.to_string())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn vault_reset(
-    state: State<'_, AppState>,
-    confirmation: String,
-) -> Result<VaultStatusPayload, String> {
-    if confirmation != "RESET" {
-        return Err("Type RESET to confirm credential reset".to_string());
-    }
-    let provider_worker = state.provider_worker.clone();
-    run_vault_lifecycle(Arc::clone(&state.vault), move |vault| {
-        provider_worker
-            .mark_configured_credentials_locked_for_startup(now_ms())
-            .map_err(|_| vault_unavailable())?;
-        vault.reset().map_err(|error| error.to_string())?;
-        provider_worker
-            .reset_credentials_after_vault_deletion(now_ms())
-            .map_err(|_| vault_unavailable())?;
-        Ok(())
-    })
-    .await
+fn wake_worker(state: &State<'_, AppState>) {
+    wake_worker_state(state);
 }
 
 #[tauri::command]
@@ -298,19 +136,10 @@ async fn gmail_oauth_begin(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<gmail_oauth::GmailOAuthResult, gmail_oauth::GmailOAuthCommandError> {
-    {
-        let vault = state
-            .vault
-            .lock()
-            .map_err(|_| gmail_oauth::GmailOAuthCommandError::vault_locked())?;
-        if vault.status() != VaultStatus::Unlocked {
-            return Err(gmail_oauth::GmailOAuthCommandError::vault_locked());
-        }
-    }
     let reservation = state.gmail_oauth.reserve()?;
     let cancellation = Arc::clone(&reservation.cancellation);
     let database_path = state.database_path.clone();
-    let vault = Arc::clone(&state.vault);
+    let credentials = state.credentials.clone();
     let browser = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let authorized = gmail_oauth::authorize(
@@ -324,16 +153,7 @@ async fn gmail_oauth_begin(
                 message: "Google authorization was cancelled.",
             });
         }
-        let vault = vault
-            .lock()
-            .map_err(|_| gmail_oauth::GmailOAuthCommandError::vault_locked())?;
-        if cancellation.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(gmail_oauth::GmailOAuthCommandError {
-                code: "oauth_cancelled",
-                message: "Google authorization was cancelled.",
-            });
-        }
-        gmail_oauth::persist_authorized_mailbox(&database_path, &vault, authorized, now_ms())
+        gmail_oauth::persist_authorized_mailbox(&database_path, &credentials, authorized, now_ms())
     })
     .await
     .map_err(|_| gmail_oauth::GmailOAuthCommandError {
@@ -360,6 +180,81 @@ fn gmail_oauth_cancel(
     state: State<'_, AppState>,
 ) -> Result<gmail_oauth::GmailOAuthCancellation, gmail_oauth::GmailOAuthCommandError> {
     state.gmail_oauth.cancel()
+}
+
+/// Rewinds provider sync bookmarks and wakes the worker. This re-downloads and
+/// re-projects every message onto the rows that already exist; it removes nothing.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountRefreshInput {
+    account_id: String,
+    refresh_seconds: i64,
+}
+
+#[tauri::command]
+fn set_account_refresh(
+    state: State<'_, AppState>,
+    input: AccountRefreshInput,
+) -> Result<(), String> {
+    {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "Native mailbox state is unavailable".to_string())?;
+        store
+            .set_account_refresh_seconds(&input.account_id, input.refresh_seconds)
+            .map_err(|error| error.to_string())?;
+    }
+    // A shorter cadence should take effect now, not after the old one elapses.
+    wake_worker(&state);
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountIdInput {
+    account_id: String,
+}
+
+/// Asks one account for new mail immediately rather than waiting for its cadence.
+#[tauri::command]
+fn sync_account_now(state: State<'_, AppState>, input: AccountIdInput) -> Result<usize, String> {
+    let provider = rusqlite::Connection::open(&state.database_path)
+        .and_then(|connection| {
+            connection.query_row(
+                "SELECT provider_kind FROM provider_accounts WHERE account_id = ?1",
+                [input.account_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    let scheduled = match provider.as_str() {
+        "gmail" => gmail::sync_account_now(&state.database_path, &input.account_id, now_ms()),
+        "imap" => imap::sync_account_now(&state.database_path, &input.account_id, now_ms()),
+        _ => {
+            return Err(format!(
+                "Manual synchronization is not implemented for {provider} accounts"
+            ))
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    wake_worker(&state);
+    Ok(scheduled)
+}
+
+#[tauri::command]
+fn resync_all_mail(state: State<'_, AppState>) -> Result<store::FullResyncRequest, String> {
+    let requested = {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| "Native mailbox state is unavailable".to_string())?;
+        store
+            .request_full_resync()
+            .map_err(|error| error.to_string())?
+    };
+    wake_worker(&state);
+    Ok(requested)
 }
 
 fn worker_changed_mailbox(result: &WorkerCycleResult) -> bool {
@@ -421,6 +316,15 @@ fn search_threads(state: State<'_, AppState>, input: SearchInput) -> Result<Sear
     store
         .search_threads(input)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn mailbox_stats(state: State<'_, AppState>, input: MailStatsInput) -> Result<MailStats, String> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "Native mailbox state is unavailable".to_string())?;
+    store.mail_stats(input).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -660,7 +564,22 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(
             tauri::plugin::Builder::<tauri::Wry>::new("mux-navigation-policy")
-                .on_navigation(|_webview, url| navigation::allows_webview_navigation(url))
+                .on_navigation(|webview, url| {
+                    if navigation::allows_webview_navigation(url) {
+                        return true;
+                    }
+                    // The reader frame runs no script of its own, so a link
+                    // inside a message reaches Mux only as an attempt to
+                    // navigate. Refuse the navigation and hand the destination
+                    // to the same guarded opener the interface uses.
+                    let app = webview.app_handle().clone();
+                    let _ = navigation::open_external_destination(url.as_str(), |normalized| {
+                        app.opener()
+                            .open_url(normalized, None::<&str>)
+                            .map_err(|_| ())
+                    });
+                    false
+                })
                 .build(),
         )
         .plugin(
@@ -672,28 +591,36 @@ pub fn run() {
             let path = database_path(app)?;
             let store = MuxStore::open(&path, true)?;
             let worker = DurableWorker::new(&path, WorkerConfig::default())?;
-            let vault_handle = CredentialVault::for_database(&path);
-            reconcile_absent_vault(&vault_handle, &worker, now_ms())?;
+            let credentials = keychain::CredentialStore::for_database(&path)?;
             gmail::schedule_initial_syncs(&path, now_ms())?;
-            worker.mark_configured_credentials_locked_for_startup(now_ms())?;
-            let provider_worker = worker.clone();
-            let vault = Arc::new(Mutex::new(vault_handle));
+            imap::schedule_initial_syncs(&path, now_ms())?;
+            imap::schedule_resumable_syncs(&path, now_ms())?;
+            // Accounts whose keychain record is missing or invalid are marked for
+            // reauthorization once at launch rather than waiting for an unlock.
+            let _ = gmail_access::reconcile_credential_records(&path, &credentials, now_ms());
+            let _ = imap_access::reconcile_credential_records(&path, &credentials, now_ms());
             let gmail_adapter = gmail::GmailAdapter::new(
-                gmail_access::GmailVaultAccess::new(
+                gmail_access::GmailKeychainAccess::new(
                     &path,
-                    Arc::clone(&vault),
+                    credentials.clone(),
                     gmail_access::GoogleGrantRefresher::new()?,
                 ),
                 gmail::GoogleGmailApi::new()?,
                 now_ms as fn() -> i64,
             )
             .with_database_path(&path);
+            let imap_adapter = imap::ImapAdapter::new(
+                imap_access::ImapKeychainAccess::new(&path, credentials.clone()),
+                imap::NativeImapSessionFactory::new()?,
+                now_ms as fn() -> i64,
+            );
             let app_handle = app.handle().clone();
             let controller = WorkerController::start(
                 worker,
                 format!("mux-native-{}", std::process::id()),
                 NativeWorkerAdapter {
                     gmail: gmail_adapter,
+                    imap: imap_adapter,
                     database_path: path.clone(),
                 },
                 provider_conformance::apply_worker_projection,
@@ -713,13 +640,54 @@ pub fn run() {
                     }
                 },
             )?;
+            // Refresh timer: each account is asked for new mail on its own cadence.
+            // The scheduler decides what is actually due, so this tick stays cheap.
+            let refresh_path = path.clone();
+            let refresh_handle = app.handle().clone();
+            let refresh_stop = Arc::new(AtomicBool::new(false));
+            let refresh_stop_thread = Arc::clone(&refresh_stop);
+            std::thread::spawn(move || {
+                let mut backoff = 1_u32;
+                while !refresh_stop_thread.load(Ordering::SeqCst) {
+                    // Sleep in slices so quitting does not wait out a whole tick.
+                    let target = REFRESH_TICK_SECONDS * u64::from(backoff);
+                    for _ in 0..target {
+                        if refresh_stop_thread.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                    let scheduled = (|| {
+                        let now = now_ms();
+                        let gmail = gmail::schedule_due_syncs(&refresh_path, now)?;
+                        let imap = imap::schedule_due_syncs(&refresh_path, now)?;
+                        Ok::<usize, worker::WorkerError>(gmail.saturating_add(imap))
+                    })();
+                    match scheduled {
+                        Ok(scheduled) => {
+                            backoff = 1;
+                            if scheduled > 0 {
+                                wake_worker_state(&refresh_handle.state::<AppState>());
+                            }
+                        }
+                        Err(error) => {
+                            // A failing database should not be retried every few
+                            // seconds forever; back off to a couple of minutes.
+                            backoff = (backoff * 2).min(REFRESH_MAX_BACKOFF);
+                            if std::env::var_os("MUX_LOG_WORKER_ERRORS").is_some() {
+                                eprintln!("Mux refresh: {error}");
+                            }
+                        }
+                    }
+                }
+            });
             app.manage(AppState {
                 database_path: path,
                 store: Mutex::new(store),
-                vault,
-                provider_worker,
+                credentials,
                 gmail_oauth: Arc::new(gmail_oauth::GmailOAuthCoordinator::new()),
                 worker: Mutex::new(Some(controller)),
+                refresh_stop,
             });
             Ok(())
         })
@@ -729,6 +697,7 @@ pub fn run() {
             get_thread_summary,
             get_thread_messages,
             search_threads,
+            mailbox_stats,
             read_attachment,
             get_draft,
             open_message_link,
@@ -744,19 +713,20 @@ pub fn run() {
             rsvp_thread,
             list_operations,
             resolve_outcome_unknown_send,
-            vault_status,
-            vault_create,
-            vault_unlock,
-            vault_lock,
-            vault_change_passphrase,
-            vault_reset,
             gmail_oauth_begin,
-            gmail_oauth_cancel
+            gmail_oauth_cancel,
+            resync_all_mail,
+            set_account_refresh,
+            sync_account_now
         ])
         .build(tauri::generate_context!())
         .expect("error while building Mux");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            app_handle
+                .state::<AppState>()
+                .refresh_stop
+                .store(true, Ordering::SeqCst);
             let _ = app_handle.state::<AppState>().gmail_oauth.cancel();
             if let Ok(mut worker) = app_handle.state::<AppState>().worker.lock() {
                 if let Some(controller) = worker.take() {
@@ -825,6 +795,9 @@ mod tests {
             gmail: RecordingGmailAdapter {
                 calls: AtomicUsize::new(0),
             },
+            imap: RecordingGmailAdapter {
+                calls: AtomicUsize::new(0),
+            },
             database_path: path,
         };
         assert!(matches!(
@@ -877,49 +850,31 @@ mod tests {
     }
 
     #[test]
-    fn vault_status_payload_exposes_only_the_bounded_lifecycle_state() {
-        for (status, expected) in [
-            (VaultStatus::Absent, "absent"),
-            (VaultStatus::Locked, "locked"),
-            (VaultStatus::Unlocked, "unlocked"),
-            (VaultStatus::Unavailable, "unavailable"),
-        ] {
-            let payload = VaultStatusPayload::from(status);
-            assert_eq!(payload.state, expected);
-            assert_eq!(
-                serde_json::to_value(payload).unwrap(),
-                serde_json::json!({
-                    "state": expected
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn tauri_exposes_vault_lifecycle_but_not_generic_secret_access() {
+    fn tauri_exposes_no_credential_access_of_any_kind() {
         let source = include_str!("lib.rs");
         let handler = source
             .split(".invoke_handler(tauri::generate_handler![")
             .nth(1)
             .and_then(|tail| tail.split("])").next())
             .expect("invoke handler source");
-        for lifecycle in [
-            "vault_status",
-            "vault_create",
-            "vault_unlock",
-            "vault_lock",
-            "vault_change_passphrase",
-            "vault_reset",
+        // Credentials live in the keychain and are read only inside Rust. No
+        // command may read, write, or unlock them, and none may ask for a password.
+        for forbidden in [
+            "vault",
+            "credential_value",
+            "passphrase",
+            "password",
+            "keychain_get",
+            "keychain_put",
+            "secret",
+            "token",
         ] {
-            assert!(handler.contains(lifecycle), "missing {lifecycle}");
-        }
-        for forbidden in ["vault_get", "vault_put", "vault_remove", "credential_value"] {
             assert!(!handler.contains(forbidden), "exposed {forbidden}");
         }
     }
 
     #[test]
-    fn tauri_handler_is_an_exact_typed_mailbox_and_vault_allowlist() {
+    fn tauri_handler_is_an_exact_typed_mailbox_allowlist() {
         let source = include_str!("lib.rs");
         let handler = source
             .split(".invoke_handler(tauri::generate_handler![")
@@ -939,6 +894,7 @@ mod tests {
                 "get_thread_summary",
                 "get_thread_messages",
                 "search_threads",
+                "mailbox_stats",
                 "read_attachment",
                 "get_draft",
                 "open_message_link",
@@ -954,14 +910,11 @@ mod tests {
                 "rsvp_thread",
                 "list_operations",
                 "resolve_outcome_unknown_send",
-                "vault_status",
-                "vault_create",
-                "vault_unlock",
-                "vault_lock",
-                "vault_change_passphrase",
-                "vault_reset",
                 "gmail_oauth_begin",
                 "gmail_oauth_cancel",
+                "resync_all_mail",
+                "set_account_refresh",
+                "sync_account_now",
             ]
         );
     }
@@ -976,108 +929,5 @@ mod tests {
         let capability = include_str!("../capabilities/default.json");
         assert!(!capability.contains("opener:"));
         assert!(!capability.contains("shell:"));
-    }
-
-    #[test]
-    fn absent_vault_reconciles_a_crash_between_file_deletion_and_sqlite_reset() {
-        use crate::worker::{NewWorkItem, WorkKind, WorkState};
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("mux.db");
-        drop(MuxStore::open(&path, false).unwrap());
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO accounts(id, name, email, color, provider)
-                 VALUES('configured', 'Configured', 'configured@example.com', '#000', 'jmap')",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO provider_accounts(
-                   account_id, provider_kind, remote_account_id, auth_state,
-                   credential_ref, auth_block_reason, sync_state, created_at, updated_at
-                 ) VALUES(
-                   'configured', 'jmap', 'remote-configured', 'credential_locked',
-                   'vault/configured', 'credential_locked', 'authentication_blocked', 0, 0
-                 )",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        let worker = DurableWorker::new(&path, WorkerConfig::default()).unwrap();
-        worker
-            .enqueue(
-                NewWorkItem {
-                    id: "stale-provider-work".into(),
-                    account_id: "configured".into(),
-                    operation_id: None,
-                    kind: WorkKind::Sync,
-                    scope: "sync:v1:configured".into(),
-                    ordering_key: "sync-order:v1:configured".into(),
-                    payload_json: "{}".into(),
-                    priority: 0,
-                    available_at: 0,
-                    max_attempts: 4,
-                },
-                0,
-            )
-            .unwrap();
-        let vault = CredentialVault::for_database(&path);
-        assert_eq!(vault.status(), VaultStatus::Absent);
-        reconcile_absent_vault(&vault, &worker, 1).unwrap();
-        assert_eq!(
-            worker
-                .snapshot("stale-provider-work")
-                .unwrap()
-                .unwrap()
-                .state,
-            WorkState::Cancelled
-        );
-
-        let connection = rusqlite::Connection::open(path).unwrap();
-        let reconciled = connection
-            .query_row(
-                "SELECT auth_state, credential_ref, auth_block_reason, sync_state
-                 FROM provider_accounts WHERE account_id = 'configured'",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            reconciled,
-            ("signed_out".into(), None, None, "offline".into())
-        );
-    }
-
-    #[test]
-    fn failed_absent_vault_reconciliation_cannot_create_or_resume() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("mux.db");
-        let mut vault = CredentialVault::for_database(&database_path);
-        let unavailable_worker = DurableWorker::new(
-            directory.path().join("missing-parent").join("mux.db"),
-            WorkerConfig::default(),
-        )
-        .unwrap();
-
-        assert!(create_vault_and_resume(
-            &mut vault,
-            &unavailable_worker,
-            zeroize::Zeroizing::new(b"synthetic-test-passphrase".to_vec()),
-            1,
-        )
-        .is_err());
-        assert_eq!(vault.status(), VaultStatus::Absent);
-        assert!(!directory.path().join("mux.vault").exists());
     }
 }

@@ -2,19 +2,39 @@
   import { invoke } from '@tauri-apps/api/core';
   import { tick } from 'svelte';
   import AttachmentList from './AttachmentList.svelte';
-  import RichText from './RichText.svelte';
-  import { parseMessageRichText, safeRemoteImageDataUrl } from './richText';
+  import MessageFrame from './MessageFrame.svelte';
+  import { newContentParagraphs, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
   import type { AttachmentSummary, MessageSummary, RemoteImageContent, RemoteImageSummary } from './types';
 
   export let messages: MessageSummary[] = [];
   export let attachments: AttachmentSummary[] = [];
   export let accountColor = '#7180ff';
   export let threadUnread = false;
+  export let railPreview = true;
 
-  let expandedIds = new Set(messages.slice(-2).map((message) => message.id));
+  /// The two newest messages open with the thread. The component now outlives
+  /// each background refresh, so a message that arrives later opens on arrival,
+  /// while one the reader collapsed stays collapsed.
+  const seen = { ids: new Set<number>(), primed: false };
+  let expandedIds = new Set<number>();
+
+  $: {
+    if (!seen.primed && messages.length) {
+      seen.primed = true;
+      seen.ids = new Set(messages.map((message) => message.id));
+      expandedIds = new Set(messages.slice(-2).map((message) => message.id));
+    } else if (seen.primed) {
+      const arrived = messages.filter((message) => !seen.ids.has(message.id));
+      if (arrived.length) {
+        seen.ids = new Set(messages.map((message) => message.id));
+        expandedIds = new Set([...expandedIds, ...arrived.map((message) => message.id)]);
+      }
+    }
+  }
   let bottomAnchor: HTMLDivElement;
   let loadedImageData = new Map<string, string>();
   let loadingMessageIds = new Set<number>();
+  let focusedId: number | null = null;
   let remoteImageErrors = new Map<number, string>();
   let allowedDomains = new Map<number, Set<string>>();
   let remoteImageViews: Record<number, Record<number, { dataUrl: string | null; altText: string }>> = {};
@@ -53,7 +73,10 @@
     return [...new Set(message.remoteImages.map((image) => image.domain).filter(Boolean))].sort();
   }
 
-  async function fetchRemoteImage(message: MessageSummary, image: RemoteImageSummary): Promise<boolean> {
+  async function fetchRemoteImage(
+    message: MessageSummary,
+    image: RemoteImageSummary
+  ): Promise<[string, string] | null> {
     try {
       const loaded = await invoke<RemoteImageContent>('load_remote_image', {
         input: { messageId: message.id, resourceId: image.id }
@@ -63,10 +86,9 @@
         || loaded.resourceId !== image.id
         || !safeRemoteImageDataUrl(loaded.dataUrl)
       ) throw new Error('invalid remote image response');
-      loadedImageData = new Map(loadedImageData).set(imageKey(message.id, image.id), loaded.dataUrl);
-      return true;
+      return [imageKey(message.id, image.id), loaded.dataUrl];
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -79,8 +101,19 @@
     loadingMessageIds = new Set(loadingMessageIds).add(message.id);
     remoteImageErrors = new Map(remoteImageErrors).set(message.id, '');
     let failed = 0;
+    // Every approved image is applied in one assignment. Applying them one at a
+    // time rebuilds the reader frame's document once per image, which reloads
+    // the message the reader is looking at as many times as it has pictures.
+    const fetched: Array<[string, string]> = [];
     for (const image of images) {
-      if (!await fetchRemoteImage(message, image)) failed += 1;
+      const loaded = await fetchRemoteImage(message, image);
+      if (loaded) fetched.push(loaded);
+      else failed += 1;
+    }
+    if (fetched.length) {
+      const next = new Map(loadedImageData);
+      for (const [key, dataUrl] of fetched) next.set(key, dataUrl);
+      loadedImageData = next;
     }
     const nextLoading = new Set(loadingMessageIds);
     nextLoading.delete(message.id);
@@ -150,11 +183,61 @@
     }).format(timestamp);
   }
 
+  /// Sender, when, and the opening of the message, for the rail's hover card.
+  function railTooltip(message: MessageSummary): string {
+    const preview = message.bodyText.replace(/\s+/gu, ' ').trim().slice(0, 140);
+    const head = `${message.senderName} · ${fullTime(message.sentAt)}`;
+    return preview ? `${head}\n${preview}` : head;
+  }
+
   function toggle(messageId: number) {
     const next = new Set(expandedIds);
     if (next.has(messageId)) next.delete(messageId);
     else next.add(messageId);
     expandedIds = next;
+  }
+
+  /// Message-level focus, driven by j/k once the reader is entered from the list.
+  export function focusedMessageId(): number | null {
+    return focusedId;
+  }
+
+  export async function focusFirstMessage() {
+    const target = unreadMessageId ?? messages.at(-1)?.id ?? null;
+    await revealMessage(target);
+  }
+
+  export async function moveMessageFocus(delta: number) {
+    if (!messages.length) return;
+    const current = messages.findIndex((message) => message.id === focusedId);
+    const start = current === -1 ? (delta > 0 ? -1 : messages.length) : current;
+    const next = Math.min(messages.length - 1, Math.max(0, start + delta));
+    await revealMessage(messages[next]?.id ?? null);
+  }
+
+  /// Which messages are showing their full address list. Kept apart from
+  /// expandedIds so opening the addresses is not a kind of expanding.
+  let addressIds = new Set<number>();
+
+  function toggleAddresses(messageId: number) {
+    const next = new Set(addressIds);
+    if (next.has(messageId)) next.delete(messageId);
+    else next.add(messageId);
+    addressIds = next;
+  }
+
+  export function clearMessageFocus() {
+    focusedId = null;
+  }
+
+  async function revealMessage(messageId: number | null) {
+    focusedId = messageId;
+    if (messageId === null) return;
+    expandedIds = new Set(expandedIds).add(messageId);
+    await tick();
+    document
+      .getElementById(`native-message-${messageId}`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
   export async function jumpToNewest() {
@@ -172,31 +255,93 @@
 
 <svelte:window on:keydown={handleWindowKeydown} />
 
+{#if messages.length > 1}
+  <nav class="message-rail" aria-label="Jump to a message" data-testid="message-rail">
+    {#each messages as message, index (message.id)}
+      <button
+        class:is-focused={focusedId === message.id}
+        class:is-unread={message.id === unreadMessageId}
+        class:is-mine={message.isFromMe}
+        type="button"
+        data-message-id={message.id}
+        aria-label={`Message ${index + 1} of ${messages.length} from ${message.senderName}`}
+        title={railPreview ? railTooltip(message) : undefined}
+        on:click={() => revealMessage(message.id)}
+      ></button>
+    {/each}
+  </nav>
+{/if}
 <div class="message-stack">
   {#each messages as message (message.id)}
     {#if message.id === unreadMessageId}
       <div class="unread-boundary" id="native-unread-boundary"><span>Unread from here</span></div>
     {/if}
-    <section class="message-card" class:is-collapsed={!expandedIds.has(message.id)} id={`native-message-${message.id}`}>
-      <button
-        class="message-card-toggle"
-        type="button"
-        aria-expanded={expandedIds.has(message.id)}
-        aria-controls={`native-message-body-${message.id}`}
-        on:click={() => toggle(message.id)}
-      >
-        <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
-        {#if expandedIds.has(message.id)}
-          <span class="message-meta"><strong>{message.senderName}</strong><small>{message.senderEmail} → {message.recipients}{message.ccRecipients ? ` · Cc ${message.ccRecipients}` : ''}</small></span>
-          <time>{fullTime(message.sentAt)}</time>
+    {@const expanded = expandedIds.has(message.id)}
+    <section
+      class="message-card"
+      class:is-collapsed={!expanded}
+      class:is-focused={focusedId === message.id}
+      class:is-mine={message.isFromMe}
+      id={`native-message-${message.id}`}
+    >
+      <div class="message-card-toggle">
+        {#if expanded}
+          <!-- Expanded, the header is two controls: the sender shows who else
+               was on the message, and the caret is the only thing that closes
+               it. Reading the addresses used to cost you the message. -->
+          <button
+            class="message-sender"
+            type="button"
+            aria-expanded={addressIds.has(message.id)}
+            aria-controls={`native-message-addresses-${message.id}`}
+            title={addressIds.has(message.id) ? 'Hide addresses' : 'Show who this went to'}
+            on:click={() => toggleAddresses(message.id)}
+          >
+            <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
+            <span class="message-meta"><strong>{message.senderName}</strong><small>{message.senderEmail} → {message.recipients}{message.ccRecipients ? ` · Cc ${message.ccRecipients}` : ''}</small></span>
+            <time>{fullTime(message.sentAt)}</time>
+          </button>
         {:else}
-          <span class="collapsed-summary">
-            <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
-            <span class="collapsed-preview">{message.bodyText}</span>
-          </span>
+          {@const collapsed = newContentParagraphs(message.bodyText)}
+          <button
+            class="message-open"
+            type="button"
+            aria-expanded="false"
+            aria-controls={`native-message-body-${message.id}`}
+            on:click={() => toggle(message.id)}
+          >
+            <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
+            <span class="collapsed-summary">
+              <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
+              <span class="collapsed-preview">
+                {#each collapsed.paragraphs as lines}
+                  <span class="collapsed-paragraph">{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</span>
+                {/each}
+                {#if collapsed.trimmed}<span class="collapsed-trimmed">quoted text and signature hidden</span>{/if}
+              </span>
+            </span>
+          </button>
         {/if}
-        <span class="collapse-glyph" aria-hidden="true">{expandedIds.has(message.id) ? '⌃' : '⌄'}</span>
-      </button>
+        <button
+          class="collapse-glyph"
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={`native-message-body-${message.id}`}
+          aria-label={expanded ? `Collapse message from ${message.senderName}` : `Expand message from ${message.senderName}`}
+          title={expanded ? 'Collapse' : 'Expand'}
+          data-action="toggle-message"
+          on:click={() => toggle(message.id)}
+        >{expanded ? '⌃' : '⌄'}</button>
+      </div>
+      {#if expanded && addressIds.has(message.id)}
+        <dl class="message-addresses" id={`native-message-addresses-${message.id}`}>
+          <dt>From</dt><dd>{message.senderName ? `${message.senderName} · ` : ''}{message.senderEmail}</dd>
+          {#if message.recipients}<dt>To</dt><dd>{message.recipients}</dd>{/if}
+          {#if message.ccRecipients}<dt>Cc</dt><dd>{message.ccRecipients}</dd>{/if}
+          {#if message.bccRecipients}<dt>Bcc</dt><dd>{message.bccRecipients}</dd>{/if}
+          <dt>Sent</dt><dd>{fullTime(message.sentAt)}</dd>
+        </dl>
+      {/if}
       {#if expandedIds.has(message.id)}
         <div class="message-body" id={`native-message-body-${message.id}`}>
           {#if blockedCounts[message.id] > 0}
@@ -218,9 +363,11 @@
             <small class="remote-resource-error" role="alert">{remoteImageErrors.get(message.id)}</small>
           {/if}
           {#if message.bodyHtml}
-            <RichText nodes={parseMessageRichText(message.bodyHtml)} remoteImages={remoteImageViews[message.id] ?? {}} />
+            <MessageFrame bodyHtml={message.bodyHtml} remoteImages={remoteImageViews[message.id] ?? {}} label={`Message from ${message.senderName || message.senderEmail}`} />
           {:else}
-            <p>{message.bodyText}</p>
+            {#each plainTextParagraphs(message.bodyText) as lines}
+              <p>{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</p>
+            {/each}
           {/if}
           <AttachmentList attachments={attachments.filter((attachment) => attachment.messageId === message.id)} />
         </div>

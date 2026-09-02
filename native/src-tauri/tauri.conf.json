@@ -27,7 +27,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "category": "Productivity",
     "shortDescription": "A fast, local-first email client",
     "longDescription": "Mux brings multiple mail accounts into one focused, keyboard-friendly workspace.",

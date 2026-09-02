@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
-  import { appendRecipientToken, recipientTokens, serializeRecipientTokens } from './recipientTokens.mjs';
+  import { appendRecipientToken, recipientTokens, serializeRecipientTokens } from './recipientTokens';
 
   export let label = 'To';
   export let value = '';

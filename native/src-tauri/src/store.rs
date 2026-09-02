@@ -23,8 +23,23 @@ use crate::worker::{
 
 pub mod benchmark;
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
+/// A person cannot hide more accounts than they can configure.
+const MAX_HIDDEN_ACCOUNTS: usize = 64;
+/// Default provider refresh cadence: once a minute.
+pub(crate) const DEFAULT_REFRESH_SECONDS: i64 = 60;
+/// Bounds keep a mistyped cadence from hammering a provider or stalling mail.
+pub(crate) const MIN_REFRESH_SECONDS: i64 = 15;
+pub(crate) const MAX_REFRESH_SECONDS: i64 = 24 * 60 * 60;
 const MAX_ACTIVITY_ROWS: i64 = 100;
+/// The bootstrap payload has a size budget, and an account can keep a great
+/// many labels. Past this the sidebar would be unreadable anyway.
+const MAX_CONTAINERS: i64 = 200;
+/// Roles the eight fixed views already stand for. A folder holding one of them
+/// is not a separate place to go, it is the place the sidebar already lists.
+const FIXED_VIEW_ROLES: [&str; 7] = [
+    "inbox", "archive", "all_mail", "drafts", "sent", "trash", "starred",
+];
 const MAX_SNOOZE_DISTANCE_MS: i64 = 10 * 366 * 86_400_000;
 const MAX_RECIPIENT_HEADER_CHARS: usize = 10_000;
 const MAX_RECIPIENT_MAILBOXES: usize = 500;
@@ -59,6 +74,14 @@ pub struct AccountSummary {
     signature: String,
     unread: i64,
     total: i64,
+    /// How often Mux asks the provider for new mail, in seconds.
+    refresh_seconds: i64,
+    /// When a sync last finished, and how it went. Null throughout for an
+    /// account with no provider attached, which is every account in a local-only
+    /// mailbox.
+    last_sync_at: Option<i64>,
+    sync_state: Option<String>,
+    last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +133,12 @@ pub(crate) struct StoredRemoteImage {
     pub message_id: i64,
     pub resource_id: i64,
     pub url: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullResyncRequest {
+    pub accounts_reset: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,6 +327,26 @@ pub struct MailboxBootstrap {
     accounts: Vec<AccountSummary>,
     view_counts: Vec<ViewCountSummary>,
     drafts: Vec<DraftHeaderSummary>,
+    containers: Vec<ContainerSummary>,
+}
+
+/// One of the account's own folders or labels. The mailbox's eight fixed views
+/// cover the roles every provider has; this is everything else the account
+/// keeps, which until now was synced and then never shown.
+///
+/// The pair (accountId, remoteId) names it. The interface treats both as opaque
+/// strings it was handed and echoes back, so nothing about Gmail label ids or
+/// IMAP folder paths leaks into how the interface works.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSummary {
+    account_id: String,
+    remote_id: String,
+    name: String,
+    kind: String,
+    role: String,
+    unread: i64,
+    total: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,6 +385,14 @@ pub struct ThreadPageInput {
     view: Option<String>,
     cursor: Option<String>,
     limit: Option<i64>,
+    /// Accounts the person has hidden from the list. They keep syncing.
+    #[serde(default)]
+    hidden_account_ids: Vec<String>,
+    /// One of the account's own folders or labels, named by the remote id the
+    /// interface was handed. Only meaningful alongside the account it belongs
+    /// to, so it is refused without one.
+    #[serde(default)]
+    container_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -385,6 +442,9 @@ pub struct SearchInput {
     limit: Option<i64>,
     #[serde(default)]
     timezone_offset_minutes: i32,
+    /// Accounts the person has hidden from the list. They keep syncing.
+    #[serde(default)]
+    hidden_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,14 +518,22 @@ impl MuxStore {
                             SELECT 1 FROM snoozes s
                             WHERE s.thread_id = e.id AND s.wake_at > ?1
                           ) THEN 1 ELSE 0 END), 0) AS unread,
-                        COUNT(e.id) AS total
+                        COUNT(e.id) AS total,
+                        COALESCE(MAX(p.refresh_seconds), ?2) AS refresh_seconds,
+                        -- An account has at most one provider row, so these
+                        -- aggregates are the row itself; they are aggregates
+                        -- only to satisfy the grouping the counts need.
+                        MAX(p.last_sync_at) AS last_sync_at,
+                        MAX(p.sync_state) AS sync_state,
+                        MAX(p.last_error_code) AS last_error_code
                  FROM accounts a
                  LEFT JOIN thread_effective e
                    ON e.account_id = a.id AND e.remote_deleted = 0 AND e.trashed = 0
+                 LEFT JOIN provider_accounts p ON p.account_id = a.id
                  GROUP BY a.id, a.name, a.email, a.color, a.signature
                  ORDER BY a.name",
             )?
-            .query_map([now], |row| {
+            .query_map(params![now, DEFAULT_REFRESH_SECONDS], |row| {
                 Ok(AccountSummary {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -474,6 +542,10 @@ impl MuxStore {
                     signature: row.get(4)?,
                     unread: row.get(5)?,
                     total: row.get(6)?,
+                    refresh_seconds: row.get(7)?,
+                    last_sync_at: row.get(8)?,
+                    sync_state: row.get(9)?,
+                    last_error_code: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -548,24 +620,145 @@ impl MuxStore {
         }
 
         let drafts = self.list_draft_headers()?;
+        let containers = self.list_containers()?;
 
         let bootstrap = MailboxBootstrap {
             schema_version: SCHEMA_VERSION,
             accounts,
             view_counts,
             drafts,
+            containers,
         };
         ensure_serialized_budget(&bootstrap, IpcPayloadKind::Bootstrap)?;
         Ok(bootstrap)
+    }
+
+    /// Every folder or label the account keeps that the fixed views do not
+    /// already stand for, with the thread counts the sidebar shows.
+    ///
+    /// Counted the same way the views are: a thread belongs to a folder when
+    /// any of its live messages does, and trashed threads are left out so the
+    /// count matches what opening the folder shows.
+    pub fn list_containers(&self) -> Result<Vec<ContainerSummary>, StoreError> {
+        let excluded = FIXED_VIEW_ROLES
+            .iter()
+            .map(|role| format!("'{role}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT container.account_id, container.remote_id, container.name,
+                    container.kind, container.role,
+                    COUNT(DISTINCT CASE WHEN thread.unread = 1 THEN thread.id END) AS unread,
+                    COUNT(DISTINCT thread.id) AS total
+             FROM provider_containers container
+             LEFT JOIN provider_container_memberships membership
+               ON membership.account_id = container.account_id
+              AND membership.remote_container_id = container.remote_id
+             LEFT JOIN provider_message_refs reference
+               ON reference.account_id = membership.account_id
+              AND reference.remote_message_id = membership.remote_message_id
+             LEFT JOIN messages message
+               ON message.id = reference.message_id AND message.remote_deleted = 0
+             LEFT JOIN thread_effective thread
+               ON thread.id = message.thread_id
+              AND thread.remote_deleted = 0 AND thread.trashed = 0
+             WHERE container.is_deleted = 0
+               AND container.is_selectable = 1
+               AND container.kind IN ('folder', 'label')
+               AND container.role NOT IN ({excluded})
+             GROUP BY container.account_id, container.remote_id, container.name,
+                      container.kind, container.role, container.sort_order
+             ORDER BY container.account_id, container.sort_order, container.name
+             LIMIT ?1"
+        );
+        self.connection
+            .prepare(&sql)?
+            .query_map([MAX_CONTAINERS], |row| {
+                Ok(ContainerSummary {
+                    account_id: row.get(0)?,
+                    remote_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    role: row.get(4)?,
+                    unread: row.get(5)?,
+                    total: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Validates hidden account identifiers and returns them sorted and deduplicated
+    /// so the same visibility always produces the same cursor scope.
+    fn hidden_accounts(ids: &[String]) -> Result<Vec<String>, StoreError> {
+        if ids.len() > MAX_HIDDEN_ACCOUNTS {
+            return Err(StoreError::Validation(
+                "Too many hidden accounts requested".into(),
+            ));
+        }
+        let mut hidden = ids
+            .iter()
+            .map(|id| bounded_text(id, "hiddenAccountId", 200))
+            .collect::<Result<Vec<_>, _>>()?;
+        hidden.sort();
+        hidden.dedup();
+        Ok(hidden)
+    }
+
+    /// Sets how often one account asks its provider for new mail.
+    pub(crate) fn set_account_refresh_seconds(
+        &mut self,
+        account_id: &str,
+        seconds: i64,
+    ) -> Result<(), StoreError> {
+        let account_id = bounded_text(account_id, "accountId", 200)?;
+        if !(MIN_REFRESH_SECONDS..=MAX_REFRESH_SECONDS).contains(&seconds) {
+            return Err(StoreError::Validation(format!(
+                "Refresh interval must be between {MIN_REFRESH_SECONDS} and {MAX_REFRESH_SECONDS} seconds"
+            )));
+        }
+        let changed = self.connection.execute(
+            "UPDATE provider_accounts SET refresh_seconds = ?2, updated_at = ?3
+             WHERE account_id = ?1",
+            params![account_id, seconds, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(
+                "Provider account was not found".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn list_threads(&self, input: ThreadPageInput) -> Result<ThreadPage, StoreError> {
         let limit = input.limit.unwrap_or(50).clamp(1, 100);
         let account_id = exact_account_id(input.account_id.as_deref())?;
         let view = input.view.as_deref().unwrap_or("inbox");
+        let hidden = Self::hidden_accounts(&input.hidden_account_ids)?;
+        let container_id = match input.container_id.as_deref() {
+            None => None,
+            Some(container_id) => {
+                if account_id.is_none() {
+                    return Err(StoreError::Validation(
+                        "A folder can only be listed within its own account".into(),
+                    ));
+                }
+                Some(bounded_text(container_id, "containerId", 2_048)?)
+            }
+        };
+        // Visibility is part of the scope: a cursor cannot be replayed against a
+        // different set of hidden accounts, nor against a different folder.
+        let hidden_scope = hidden.join(",");
+        let container_scope = container_id.as_deref().unwrap_or("");
         let scope = match account_id.as_deref() {
-            Some(account_id) => canonical_scope(&["account:some", account_id, view]),
-            None => canonical_scope(&["account:none", view]),
+            Some(account_id) => canonical_scope(&[
+                "account:some",
+                account_id,
+                view,
+                &hidden_scope,
+                container_scope,
+            ]),
+            None => canonical_scope(&["account:none", view, &hidden_scope, container_scope]),
         };
         let mut snapshot_at = now_ms();
         let cursor_position = input
@@ -584,7 +777,33 @@ impl MuxStore {
             conditions.push("e.account_id = ?".to_string());
             values.push(Value::Text(bounded_text(account_id, "accountId", 200)?));
         }
+        if !hidden.is_empty() {
+            let placeholders = std::iter::repeat_n("?", hidden.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("e.account_id NOT IN ({placeholders})"));
+            values.extend(hidden.iter().map(|id| Value::Text(id.clone())));
+        }
         append_mailbox_view(&mut conditions, &mut values, view, snapshot_at)?;
+        if let Some(container_id) = container_id {
+            // A thread is in a folder when any of its live messages is.
+            conditions.push(
+                "EXISTS (
+                   SELECT 1
+                   FROM messages message
+                   JOIN provider_message_refs reference
+                     ON reference.message_id = message.id
+                   JOIN provider_container_memberships membership
+                     ON membership.account_id = reference.account_id
+                    AND membership.remote_message_id = reference.remote_message_id
+                   WHERE message.thread_id = e.id AND message.remote_deleted = 0
+                     AND membership.account_id = e.account_id
+                     AND membership.remote_container_id = ?
+                 )"
+                .into(),
+            );
+            values.push(Value::Text(container_id));
+        }
         if let Some(position) = cursor_position {
             conditions.push("(e.latest_at < ? OR (e.latest_at = ? AND e.id < ?))".into());
             values.push(Value::Integer(position.sort_timestamp));
@@ -997,6 +1216,19 @@ impl MuxStore {
         Ok(())
     }
 
+    /// Rewind every provider sync cursor so the next cycle re-enumerates the whole
+    /// mailbox and re-ingests each message in place. Nothing is deleted: re-ingest
+    /// upserts onto the existing thread and message rows, so pending local intent,
+    /// Mux-owned metadata, drafts, and thread identity all survive untouched.
+    pub(crate) fn request_full_resync(&mut self) -> Result<FullResyncRequest, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let accounts_reset = transaction.execute("DELETE FROM provider_sync_cursors", [])? as i64;
+        transaction.commit()?;
+        Ok(FullResyncRequest { accounts_reset })
+    }
+
     fn attachment_metadata_for_messages(
         &self,
         messages: &[MessageSummary],
@@ -1123,11 +1355,20 @@ impl MuxStore {
         let account_id = exact_account_id(input.account_id.as_deref())?;
         let view = input.view.as_deref().unwrap_or("all");
         let timezone = input.timezone_offset_minutes.to_string();
+        let hidden = Self::hidden_accounts(&input.hidden_account_ids)?;
+        let hidden_scope = hidden.join(",");
         let scope = match account_id.as_deref() {
-            Some(account_id) => {
-                canonical_scope(&["account:some", account_id, &input.query, view, &timezone])
+            Some(account_id) => canonical_scope(&[
+                "account:some",
+                account_id,
+                &input.query,
+                view,
+                &timezone,
+                &hidden_scope,
+            ]),
+            None => {
+                canonical_scope(&["account:none", &input.query, view, &timezone, &hidden_scope])
             }
-            None => canonical_scope(&["account:none", &input.query, view, &timezone]),
         };
         let mut snapshot_at = now_ms();
         let cursor_position = input
@@ -1146,6 +1387,13 @@ impl MuxStore {
         let mut conditions = vec![compiled.clause, "e.remote_deleted = 0".into()];
         let mut values = compiled.parameters;
 
+        if !hidden.is_empty() {
+            let placeholders = std::iter::repeat_n("?", hidden.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("e.account_id NOT IN ({placeholders})"));
+            values.extend(hidden.iter().map(|id| Value::Text(id.clone())));
+        }
         if let Some(account_id) = account_id {
             conditions.push("e.account_id = ?".into());
             values.push(Value::Text(account_id));
@@ -3758,2090 +4006,23 @@ fn cancel_waiting_work(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn send_content_fingerprint(
-    submission_message_id: &str,
-    account_id: &str,
-    sender_email: &str,
-    recipients: &str,
-    cc_recipients: &str,
-    bcc_recipients: &str,
-    subject: &str,
-    body: &str,
-    body_html: &str,
-    reply_to_thread_id: Option<i64>,
-    draft_revision: i64,
-) -> String {
-    let mut fingerprint = Sha256::new();
-    fingerprint.update(b"mux-send-snapshot-v1\0");
-    for field in [
-        submission_message_id,
-        account_id,
-        sender_email,
-        recipients,
-        cc_recipients,
-        bcc_recipients,
-        subject,
-        body,
-        body_html,
-    ] {
-        fingerprint.update((field.len() as u64).to_be_bytes());
-        fingerprint.update(field.as_bytes());
-    }
-    fingerprint.update(reply_to_thread_id.unwrap_or_default().to_be_bytes());
-    fingerprint.update(draft_revision.to_be_bytes());
-    fingerprint
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn send_content_fingerprint_v2(
-    submission_message_id: &str,
-    account_id: &str,
-    sender_email: &str,
-    recipients: &str,
-    cc_recipients: &str,
-    bcc_recipients: &str,
-    subject: &str,
-    body: &str,
-    body_html: &str,
-    reply_to_thread_id: Option<i64>,
-    draft_revision: i64,
-    queued_at_ms: i64,
-    in_reply_to: Option<&str>,
-    references: &[String],
-) -> String {
-    let mut fingerprint = Sha256::new();
-    fingerprint.update(b"mux-send-snapshot-v2\0");
-    for field in [
-        submission_message_id,
-        account_id,
-        sender_email,
-        recipients,
-        cc_recipients,
-        bcc_recipients,
-        subject,
-        body,
-        body_html,
-    ] {
-        fingerprint.update((field.len() as u64).to_be_bytes());
-        fingerprint.update(field.as_bytes());
-    }
-    fingerprint.update(reply_to_thread_id.unwrap_or_default().to_be_bytes());
-    fingerprint.update(draft_revision.to_be_bytes());
-    fingerprint.update(queued_at_ms.to_be_bytes());
-    let in_reply_to = in_reply_to.unwrap_or_default();
-    fingerprint.update((in_reply_to.len() as u64).to_be_bytes());
-    fingerprint.update(in_reply_to.as_bytes());
-    fingerprint.update((references.len() as u64).to_be_bytes());
-    for reference in references {
-        fingerprint.update((reference.len() as u64).to_be_bytes());
-        fingerprint.update(reference.as_bytes());
-    }
-    fingerprint
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn send_content_fingerprint_v3(
-    submission_message_id: &str,
-    account_id: &str,
-    sender_email: &str,
-    recipients: &str,
-    cc_recipients: &str,
-    bcc_recipients: &str,
-    subject: &str,
-    body: &str,
-    body_html: &str,
-    reply_to_thread_id: Option<i64>,
-    draft_revision: i64,
-    queued_at_ms: i64,
-    in_reply_to: Option<&str>,
-    references: &[String],
-    client_correlation_id: &str,
-    provider_kind: &str,
-    remote_thread_id: Option<&str>,
-) -> String {
-    let mut fingerprint = Sha256::new();
-    fingerprint.update(b"mux-send-snapshot-v3\0");
-    for field in [
-        submission_message_id,
-        account_id,
-        sender_email,
-        recipients,
-        cc_recipients,
-        bcc_recipients,
-        subject,
-        body,
-        body_html,
-    ] {
-        fingerprint.update((field.len() as u64).to_be_bytes());
-        fingerprint.update(field.as_bytes());
-    }
-    fingerprint.update(reply_to_thread_id.unwrap_or_default().to_be_bytes());
-    fingerprint.update(draft_revision.to_be_bytes());
-    fingerprint.update(queued_at_ms.to_be_bytes());
-    let in_reply_to = in_reply_to.unwrap_or_default();
-    fingerprint.update((in_reply_to.len() as u64).to_be_bytes());
-    fingerprint.update(in_reply_to.as_bytes());
-    fingerprint.update((references.len() as u64).to_be_bytes());
-    for reference in references {
-        fingerprint.update((reference.len() as u64).to_be_bytes());
-        fingerprint.update(reference.as_bytes());
-    }
-    for field in [
-        client_correlation_id,
-        provider_kind,
-        remote_thread_id.unwrap_or_default(),
-    ] {
-        fingerprint.update((field.len() as u64).to_be_bytes());
-        fingerprint.update(field.as_bytes());
-    }
-    fingerprint
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn send_payload_for_draft(
-    draft: &DraftSummary,
-    message_id: String,
-    submission_message_id: String,
-    queued_at_ms: i64,
-    in_reply_to: Option<String>,
-    references: Vec<String>,
-    client_correlation_id: String,
-    provider_kind: String,
-    remote_thread_id: Option<String>,
-) -> SendPayload {
-    let content_fingerprint_hex = send_content_fingerprint_v3(
-        &submission_message_id,
-        &draft.account_id,
-        &draft.account_email,
-        &draft.recipients,
-        &draft.cc_recipients,
-        &draft.bcc_recipients,
-        &draft.subject,
-        &draft.body,
-        &draft.body_html,
-        draft.reply_to_thread_id,
-        draft.revision,
-        queued_at_ms,
-        in_reply_to.as_deref(),
-        &references,
-        &client_correlation_id,
-        &provider_kind,
-        remote_thread_id.as_deref(),
-    );
-    SendPayload {
-        draft_id: draft.id.clone(),
-        message_id,
-        snapshot_version: Some(3),
-        submission_message_id: Some(submission_message_id),
-        account_id: Some(draft.account_id.clone()),
-        sender_email: Some(draft.account_email.clone()),
-        recipients: Some(draft.recipients.clone()),
-        cc_recipients: Some(draft.cc_recipients.clone()),
-        bcc_recipients: Some(draft.bcc_recipients.clone()),
-        subject: Some(draft.subject.clone()),
-        body: Some(draft.body.clone()),
-        body_html: Some(draft.body_html.clone()),
-        reply_to_thread_id: draft.reply_to_thread_id,
-        draft_revision: Some(draft.revision),
-        content_fingerprint_hex: Some(content_fingerprint_hex),
-        queued_at_ms: Some(queued_at_ms),
-        in_reply_to,
-        references,
-        client_correlation_id: Some(client_correlation_id),
-        provider_kind: Some(provider_kind),
-        remote_thread_id,
-    }
-}
-
-fn send_payload_has_complete_snapshot(payload: &SendPayload) -> bool {
-    payload.submission_message_id.is_some()
-        && payload.account_id.is_some()
-        && payload.sender_email.is_some()
-        && payload.recipients.is_some()
-        && payload.cc_recipients.is_some()
-        && payload.bcc_recipients.is_some()
-        && payload.subject.is_some()
-        && payload.body.is_some()
-        && payload.body_html.is_some()
-        && payload.draft_revision.is_some()
-        && payload.content_fingerprint_hex.is_some()
-        && match payload.snapshot_version {
-            None | Some(1) => true,
-            Some(2) => payload.queued_at_ms.is_some(),
-            Some(3) => {
-                payload.queued_at_ms.is_some()
-                    && payload.client_correlation_id.is_some()
-                    && payload.provider_kind.is_some()
-            }
-            Some(_) => false,
-        }
-}
-
-fn reply_threading_headers(
-    transaction: &Transaction<'_>,
-    reply_to_thread_id: Option<i64>,
-) -> Result<(Option<String>, Vec<String>), StoreError> {
-    let Some(thread_id) = reply_to_thread_id else {
-        return Ok((None, Vec::new()));
-    };
-    let persisted_parent = transaction
-        .query_row(
-            "SELECT internet_message_id, references_json FROM messages
-             WHERE thread_id = ?1 AND remote_deleted = 0 AND internet_message_id <> ''
-             ORDER BY sent_at DESC, id DESC LIMIT 1",
-            [thread_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    if let Some((parent_message_id, references_json)) = persisted_parent {
-        crate::internet_message::validate_message_id(&parent_message_id)
-            .map_err(|()| StoreError::Validation("Stored parent Message-ID is invalid".into()))?;
-        let references: Vec<String> = serde_json::from_str(&references_json)?;
-        crate::internet_message::validate_references(&references)
-            .map_err(|()| StoreError::Validation("Stored parent References are invalid".into()))?;
-        return Ok(threading_headers_for_parent(parent_message_id, references));
-    }
-    let parent_json = transaction
-        .query_row(
-            "SELECT payload_json FROM operations
-             WHERE thread_id = ?1 AND field = 'send' AND state = 'confirmed'
-             ORDER BY confirmed_at DESC, rowid DESC LIMIT 1",
-            [thread_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    let Some(parent_json) = parent_json else {
-        return Ok((None, Vec::new()));
-    };
-    let parent: SendPayload = serde_json::from_str(&parent_json)?;
-    send_projection_fields(transaction, &parent)?;
-    let parent_message_id = parent.submission_message_id.ok_or_else(|| {
-        StoreError::Validation("Confirmed parent send has no submission identity".into())
-    })?;
-    Ok(threading_headers_for_parent(
-        parent_message_id,
-        parent.references,
-    ))
-}
-
-fn threading_headers_for_parent(
-    parent_message_id: String,
-    mut references: Vec<String>,
-) -> (Option<String>, Vec<String>) {
-    if references.last() != Some(&parent_message_id) {
-        references.push(parent_message_id.clone());
-    }
-    if references.len() > crate::internet_message::MAX_REFERENCES {
-        references.drain(..references.len() - crate::internet_message::MAX_REFERENCES);
-    }
-    while references.iter().map(String::len).sum::<usize>()
-        > crate::internet_message::MAX_REFERENCE_BYTES
-        && references.len() > 1
-    {
-        references.remove(0);
-    }
-    (Some(parent_message_id), references)
-}
-
-fn validate_invitation_summary(invitation: &InvitationSummary) -> Result<(), StoreError> {
-    bounded_text(&invitation.uid, "invitation uid", 2_000)?;
-    bounded_text(&invitation.title, "invitation title", 2_000)?;
-    bounded_text(&invitation.timezone, "invitation timezone", 200)?;
-    bounded_text(&invitation.location, "invitation location", 10_000)?;
-    bounded_text(&invitation.organizer, "invitation organizer", 10_000)?;
-    bounded_text(&invitation.attendees, "invitation attendees", 50_000)?;
-    if let Some(conflict) = &invitation.conflict_text {
-        bounded_text(conflict, "invitation conflict", 50_000)?;
-    }
-    if invitation.start_at < 0 || invitation.end_at < invitation.start_at {
-        return Err(StoreError::Validation(
-            "Invitation timestamps are invalid".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_operation_activity(operation: &OperationActivitySummary) -> Result<(), StoreError> {
-    bounded_text(&operation.id, "operation id", 256)?;
-    bounded_text(&operation.field, "operation field", 200)?;
-    bounded_text(&operation.kind, "operation kind", 200)?;
-    bounded_text(&operation.state, "operation state", 32)?;
-    if let Some(undo_of) = &operation.undo_of {
-        bounded_text(undo_of, "operation undo id", 256)?;
-    }
-    if operation.created_at < 0
-        || operation.not_before < 0
-        || operation.confirmed_at.is_some_and(|value| value < 0)
-        || operation.attempts < 0
-    {
-        return Err(StoreError::Validation(
-            "Operation activity contains an invalid numeric value".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn json_array_growth(serialized_items: usize, item_count: usize) -> usize {
-    serialized_items.saturating_add(item_count.saturating_sub(1))
-}
-
-fn message_detail_budget_error() -> StoreError {
-    StoreError::Validation(format!(
-        "Message detail exceeds the {}-byte IPC limit",
-        crate::ipc_boundary::MESSAGE_DETAIL_BYTES
-    ))
-}
-
-fn bounded_text(value: &str, field: &str, maximum: usize) -> Result<String, StoreError> {
-    if value.chars().count() > maximum {
-        return Err(StoreError::Validation(format!(
-            "{field} exceeds the {maximum} character limit"
-        )));
-    }
-    Ok(value.to_string())
-}
-
-fn bounded_header(value: &str, field: &str, maximum: usize) -> Result<String, StoreError> {
-    if value
-        .chars()
-        .any(|character| character.is_control() && character != '\t')
-    {
-        return Err(StoreError::Validation(format!(
-            "{field} contains invalid control characters"
-        )));
-    }
-    bounded_text(value, field, maximum)
-}
-
-fn exact_account_id(value: Option<&str>) -> Result<Option<String>, StoreError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Err(StoreError::Validation(
-            "accountId must not be empty when present".into(),
-        ));
-    }
-    if value.len() > 200 {
-        return Err(StoreError::Validation(
-            "accountId exceeds the 200-byte limit".into(),
-        ));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(StoreError::Validation(
-            "accountId contains invalid control characters".into(),
-        ));
-    }
-    Ok(Some(value.to_string()))
-}
-
-fn load_or_create_cursor_signing_key(connection: &Connection) -> Result<[u8; 32], StoreError> {
-    let existing = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'ipc_cursor_signing_key_v1'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(encoded) = existing {
-        return decode_cursor_signing_key(&encoded).ok_or_else(|| {
-            StoreError::InvalidSchemaVersion("cursor signing metadata is malformed".into())
-        });
-    }
-
-    let mut key = [0_u8; 32];
-    OsRng.fill_bytes(&mut key);
-    let encoded = encode_cursor_signing_key(&key);
-    connection.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES('ipc_cursor_signing_key_v1', ?1)",
-        [encoded],
-    )?;
-    let durable = connection.query_row(
-        "SELECT value FROM meta WHERE key = 'ipc_cursor_signing_key_v1'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
-    decode_cursor_signing_key(&durable).ok_or_else(|| {
-        StoreError::InvalidSchemaVersion("cursor signing metadata is malformed".into())
-    })
-}
-
-fn encode_cursor_signing_key(key: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in key {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn decode_cursor_signing_key(encoded: &str) -> Option<[u8; 32]> {
-    if encoded.len() != 64 || !encoded.is_ascii() {
-        return None;
-    }
-    let mut key = [0_u8; 32];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        let high = decode_hex_nibble(pair[0])?;
-        let low = decode_hex_nibble(pair[1])?;
-        key[index] = (high << 4) | low;
-    }
-    Some(key)
-}
-
-fn decode_hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
-}
-
-fn validate_recipient_list(recipients: &str) -> Result<(), StoreError> {
-    let mailboxes = split_recipient_list(recipients)?;
-    if mailboxes.is_empty()
-        || mailboxes
-            .iter()
-            .any(|entry| !is_conservative_mailbox(entry))
-    {
-        return Err(StoreError::Validation(
-            "Enter one or more valid email mailboxes".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Splits the subset of RFC mailbox lists Mux can safely submit. This deliberately
-/// handles quoted display names and angle addresses without claiming to parse MIME
-/// groups, comments, encoded words, or every RFC 5322 address form.
-fn split_recipient_list(recipients: &str) -> Result<Vec<&str>, StoreError> {
-    let source = recipients.trim();
-    bounded_header(source, "recipients", MAX_RECIPIENT_HEADER_CHARS)?;
-    if source.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut mailboxes = Vec::new();
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut inside_angle = false;
-
-    for (index, character) in source.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quoted {
-            match character {
-                '\\' => escaped = true,
-                '"' => quoted = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match character {
-            '"' => quoted = true,
-            '<' if inside_angle => return Err(invalid_recipient_syntax()),
-            '<' => inside_angle = true,
-            '>' if !inside_angle => return Err(invalid_recipient_syntax()),
-            '>' => inside_angle = false,
-            ',' | ';' if !inside_angle => {
-                push_recipient_mailbox(&mut mailboxes, source[start..index].trim())?;
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    if quoted || escaped || inside_angle {
-        return Err(invalid_recipient_syntax());
-    }
-    push_recipient_mailbox(&mut mailboxes, source[start..].trim())?;
-    Ok(mailboxes)
-}
-
-fn push_recipient_mailbox<'a>(
-    mailboxes: &mut Vec<&'a str>,
-    mailbox: &'a str,
-) -> Result<(), StoreError> {
-    if mailbox.is_empty() || mailboxes.len() >= MAX_RECIPIENT_MAILBOXES {
-        return Err(invalid_recipient_syntax());
-    }
-    mailboxes.push(mailbox);
-    Ok(())
-}
-
-fn invalid_recipient_syntax() -> StoreError {
-    StoreError::Validation("Recipients contain a malformed mailbox list".into())
-}
-
-fn is_conservative_mailbox(mailbox: &str) -> bool {
-    let opening_angles = mailbox.match_indices('<').collect::<Vec<_>>();
-    let closing_angles = mailbox.match_indices('>').collect::<Vec<_>>();
-    let address = match (opening_angles.as_slice(), closing_angles.as_slice()) {
-        ([], []) => mailbox.trim(),
-        ([(opening, _)], [(closing, _)]) if opening < closing => {
-            if !mailbox[closing + 1..].trim().is_empty() {
-                return false;
-            }
-            mailbox[opening + 1..*closing].trim()
-        }
-        _ => return false,
-    };
-    is_conservative_address(address)
-}
-
-fn is_conservative_address(address: &str) -> bool {
-    if address.is_empty() || address.len() > 320 || !address.is_ascii() {
-        return false;
-    }
-    let Some((local, domain)) = address.split_once('@') else {
-        return false;
-    };
-    if local.is_empty()
-        || local.len() > 64
-        || local.starts_with('.')
-        || local.ends_with('.')
-        || local.contains("..")
-        || domain.is_empty()
-        || domain.len() > 255
-        || domain.contains('@')
-        || !local.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'.' | b'!'
-                        | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'/'
-                        | b'='
-                        | b'?'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'{'
-                        | b'|'
-                        | b'}'
-                        | b'~'
-                )
-        })
-    {
-        return false;
-    }
-
-    let labels = domain.split('.').collect::<Vec<_>>();
-    labels.len() >= 2
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
-fn snippet(body: &str) -> String {
-    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.chars().take(180).collect()
-}
-
-fn join_visible_recipients(to: &str, cc: &str) -> String {
-    match (to.trim().is_empty(), cc.trim().is_empty()) {
-        (false, false) => format!("{}, {}", to.trim(), cc.trim()),
-        (false, true) => to.trim().to_string(),
-        (true, false) => cc.trim().to_string(),
-        (true, true) => String::new(),
-    }
-}
-
-fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
-    connection.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA temp_store = MEMORY;
-         PRAGMA busy_timeout = 5000;
-
-         CREATE TABLE IF NOT EXISTS meta (
-           key TEXT PRIMARY KEY,
-           value TEXT NOT NULL
-         );",
-    )?;
-
-    let stored_value: Option<String> = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let stored_version = match stored_value.as_deref() {
-        None => 0,
-        Some(value) => value
-            .parse::<i64>()
-            .ok()
-            .filter(|version| *version >= 0)
-            .ok_or_else(|| StoreError::InvalidSchemaVersion(value.to_string()))?,
-    };
-    if stored_version > SCHEMA_VERSION {
-        return Err(StoreError::FutureSchema {
-            found: stored_version,
-            supported: SCHEMA_VERSION,
-        });
-    }
-
-    let rebuild_provider_accounts =
-        crate::provider_schema::provider_accounts_need_rebuild(connection, stored_version)?;
-    let rebuild_provider_containers =
-        crate::provider_schema::provider_containers_need_rebuild(connection, stored_version)?;
-    if rebuild_provider_accounts || rebuild_provider_containers {
-        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    }
-
-    let migration_result = (|| -> Result<(), StoreError> {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS accounts (
-           id TEXT PRIMARY KEY,
-           name TEXT NOT NULL,
-           email TEXT NOT NULL,
-           color TEXT NOT NULL,
-           provider TEXT NOT NULL,
-           signature TEXT NOT NULL DEFAULT ''
-         );
-
-         CREATE TABLE IF NOT EXISTS threads (
-           id INTEGER PRIMARY KEY,
-           account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-           subject TEXT NOT NULL,
-           participants TEXT NOT NULL,
-           snippet TEXT NOT NULL,
-           latest_at INTEGER NOT NULL,
-           message_count INTEGER NOT NULL,
-           remote_in_inbox INTEGER NOT NULL CHECK (remote_in_inbox IN (0, 1)),
-           remote_unread INTEGER NOT NULL CHECK (remote_unread IN (0, 1)),
-           remote_starred INTEGER NOT NULL CHECK (remote_starred IN (0, 1)),
-           has_attachment INTEGER NOT NULL CHECK (has_attachment IN (0, 1)),
-           has_invite INTEGER NOT NULL CHECK (has_invite IN (0, 1)),
-           has_link INTEGER NOT NULL CHECK (has_link IN (0, 1)),
-           has_from_me INTEGER NOT NULL CHECK (has_from_me IN (0, 1)),
-           category TEXT NOT NULL DEFAULT '',
-           attachment_names TEXT NOT NULL DEFAULT '',
-           remote_deleted INTEGER NOT NULL DEFAULT 0 CHECK(remote_deleted IN (0, 1))
-         );
-
-         CREATE TABLE IF NOT EXISTS messages (
-           id INTEGER PRIMARY KEY,
-           thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-           sender_name TEXT NOT NULL,
-           sender_email TEXT NOT NULL,
-           recipients TEXT NOT NULL,
-           cc_recipients TEXT NOT NULL DEFAULT '',
-           bcc_recipients TEXT NOT NULL DEFAULT '',
-           sent_at INTEGER NOT NULL,
-           body_text TEXT NOT NULL,
-           body_html TEXT NOT NULL DEFAULT '',
-           blocked_remote_resources INTEGER NOT NULL DEFAULT 0 CHECK (blocked_remote_resources >= 0),
-           is_from_me INTEGER NOT NULL CHECK (is_from_me IN (0, 1)),
-           remote_deleted INTEGER NOT NULL DEFAULT 0 CHECK(remote_deleted IN (0, 1)),
-           internet_message_id TEXT NOT NULL DEFAULT '',
-           in_reply_to TEXT NOT NULL DEFAULT '',
-           references_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(references_json)),
-           provider_subject TEXT NOT NULL DEFAULT ''
-         );
-
-         CREATE TABLE IF NOT EXISTS attachments (
-           id TEXT PRIMARY KEY,
-           message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-           filename TEXT NOT NULL,
-           media_type TEXT NOT NULL,
-           byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
-           content BLOB NOT NULL,
-           content_id TEXT NOT NULL DEFAULT '',
-           disposition TEXT NOT NULL CHECK (disposition IN ('inline', 'attachment'))
-         );
-
-         CREATE TABLE IF NOT EXISTS message_remote_images (
-           message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-           resource_id INTEGER NOT NULL CHECK(resource_id > 0 AND resource_id <= 64),
-           url TEXT NOT NULL CHECK(length(url) <= 2048),
-           domain TEXT NOT NULL CHECK(length(domain) BETWEEN 1 AND 253),
-           alt_text TEXT NOT NULL,
-           PRIMARY KEY(message_id, resource_id)
-         );
-
-         CREATE TABLE IF NOT EXISTS remote_content_sender_allowlist (
-           account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-           sender_email TEXT NOT NULL,
-           PRIMARY KEY(account_id, sender_email)
-         );
-
-         CREATE TABLE IF NOT EXISTS remote_content_domain_allowlist (
-           account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-           domain TEXT NOT NULL,
-           PRIMARY KEY(account_id, domain)
-         );
-
-         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-           thread_id UNINDEXED,
-           subject,
-           participants,
-           body,
-           attachment_names,
-           tokenize = 'unicode61 remove_diacritics 2'
-         );
-
-         CREATE TABLE IF NOT EXISTS operations (
-           id TEXT PRIMARY KEY,
-           thread_id INTEGER REFERENCES threads(id) ON DELETE SET NULL,
-           field TEXT NOT NULL,
-           kind TEXT NOT NULL,
-           old_value TEXT,
-           new_value TEXT,
-           payload_json TEXT,
-           state TEXT NOT NULL CHECK (state IN (
-             'pending', 'executing', 'confirmed', 'retrying', 'conflicted',
-             'failed', 'cancelled', 'outcome_unknown'
-           )),
-           created_at INTEGER NOT NULL,
-           not_before INTEGER NOT NULL,
-           confirmed_at INTEGER,
-           undo_of TEXT REFERENCES operations(id),
-           error TEXT,
-           attempts INTEGER NOT NULL DEFAULT 0
-         );
-
-         CREATE TABLE IF NOT EXISTS snoozes (
-           thread_id INTEGER PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
-           wake_at INTEGER NOT NULL,
-           created_at INTEGER NOT NULL,
-           previous_location TEXT NOT NULL DEFAULT 'inbox'
-         );
-
-         CREATE TABLE IF NOT EXISTS invitations (
-           thread_id INTEGER PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
-           uid TEXT NOT NULL,
-           title TEXT NOT NULL,
-           start_at INTEGER NOT NULL,
-           end_at INTEGER NOT NULL,
-           timezone TEXT NOT NULL,
-           location TEXT NOT NULL,
-           organizer TEXT NOT NULL,
-           attendees TEXT NOT NULL,
-           response TEXT NOT NULL CHECK (response IN ('needsAction', 'accepted', 'tentative', 'declined')),
-           conflict_text TEXT
-         );
-
-         CREATE TABLE IF NOT EXISTS drafts (
-           id TEXT PRIMARY KEY,
-           account_id TEXT NOT NULL REFERENCES accounts(id),
-           recipients TEXT NOT NULL,
-           cc_recipients TEXT NOT NULL DEFAULT '',
-           bcc_recipients TEXT NOT NULL DEFAULT '',
-           subject TEXT NOT NULL,
-           body TEXT NOT NULL,
-           body_html TEXT NOT NULL DEFAULT '',
-           reply_to_thread_id INTEGER REFERENCES threads(id) ON DELETE SET NULL,
-           updated_at INTEGER NOT NULL,
-           revision INTEGER NOT NULL DEFAULT 1
-         );
-
-         CREATE INDEX IF NOT EXISTS threads_latest_idx ON threads(latest_at DESC, id DESC);
-         CREATE INDEX IF NOT EXISTS threads_account_latest_idx ON threads(account_id, latest_at DESC, id DESC);
-         CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(thread_id, sent_at, id);
-         CREATE INDEX IF NOT EXISTS attachments_message_idx ON attachments(message_id, id);
-         CREATE INDEX IF NOT EXISTS message_remote_images_domain_idx
-           ON message_remote_images(message_id, domain);
-         CREATE INDEX IF NOT EXISTS operations_due_idx ON operations(state, not_before, created_at);
-         CREATE INDEX IF NOT EXISTS operations_overlay_idx ON operations(thread_id, field, state, created_at DESC);
-         CREATE INDEX IF NOT EXISTS snoozes_wake_idx ON snoozes(wake_at);
-
-         DROP VIEW IF EXISTS thread_effective;
-         CREATE VIEW thread_effective AS
-         SELECT
-           t.*,
-           COALESCE((
-             SELECT CAST(o.new_value AS INTEGER)
-             FROM operations o
-             WHERE o.thread_id = t.id
-               AND o.field = 'in_inbox'
-               AND o.state IN ('pending', 'executing', 'retrying')
-             ORDER BY o.created_at DESC, o.rowid DESC
-             LIMIT 1
-           ), t.remote_in_inbox) AS in_inbox,
-           COALESCE((
-             SELECT CAST(o.new_value AS INTEGER)
-             FROM operations o
-             WHERE o.thread_id = t.id
-               AND o.field = 'unread'
-               AND o.state IN ('pending', 'executing', 'retrying')
-             ORDER BY o.created_at DESC, o.rowid DESC
-             LIMIT 1
-           ), t.remote_unread) AS unread,
-           COALESCE((
-             SELECT CAST(o.new_value AS INTEGER)
-             FROM operations o
-             WHERE o.thread_id = t.id
-               AND o.field = 'starred'
-               AND o.state IN ('pending', 'executing', 'retrying')
-             ORDER BY o.created_at DESC, o.rowid DESC
-             LIMIT 1
-           ), t.remote_starred) AS starred
-         FROM threads t;",
-        )?;
-
-        if !column_exists(&transaction, "operations", "attempts")? {
-            transaction.execute_batch(
-                "ALTER TABLE operations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;",
-            )?;
-        }
-        if !column_exists(&transaction, "drafts", "revision")? {
-            transaction.execute_batch(
-                "ALTER TABLE drafts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;",
-            )?;
-        }
-        if !column_exists(&transaction, "drafts", "body_html")? {
-            transaction.execute_batch(
-                "ALTER TABLE drafts ADD COLUMN body_html TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "body_html")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN body_html TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "accounts", "signature")? {
-            transaction.execute_batch(
-                "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "drafts", "cc_recipients")? {
-            transaction.execute_batch(
-                "ALTER TABLE drafts ADD COLUMN cc_recipients TEXT NOT NULL DEFAULT '';
-             ALTER TABLE drafts ADD COLUMN bcc_recipients TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "cc_recipients")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN cc_recipients TEXT NOT NULL DEFAULT '';
-             ALTER TABLE messages ADD COLUMN bcc_recipients TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "blocked_remote_resources")? {
-            transaction.execute_batch(
-            "ALTER TABLE messages ADD COLUMN blocked_remote_resources INTEGER NOT NULL DEFAULT 0 CHECK (blocked_remote_resources >= 0);",
-        )?;
-        }
-        if !column_exists(&transaction, "threads", "remote_deleted")? {
-            transaction.execute_batch(
-                "ALTER TABLE threads ADD COLUMN remote_deleted INTEGER NOT NULL DEFAULT 0
-               CHECK(remote_deleted IN (0, 1));",
-            )?;
-        }
-        if !column_exists(&transaction, "threads", "remote_trashed")? {
-            transaction.execute_batch(
-                "ALTER TABLE threads ADD COLUMN remote_trashed INTEGER NOT NULL DEFAULT 0
-               CHECK(remote_trashed IN (0, 1));",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "remote_deleted")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN remote_deleted INTEGER NOT NULL DEFAULT 0
-               CHECK(remote_deleted IN (0, 1));",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "internet_message_id")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN internet_message_id TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "in_reply_to")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN in_reply_to TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "references_json")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN references_json TEXT NOT NULL DEFAULT '[]'
-                   CHECK(json_valid(references_json));",
-            )?;
-        }
-        if !column_exists(&transaction, "messages", "provider_subject")? {
-            transaction.execute_batch(
-                "ALTER TABLE messages ADD COLUMN provider_subject TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-
-        transaction.execute_batch(
-            "DROP VIEW IF EXISTS thread_effective;
-             CREATE VIEW thread_effective AS
-             SELECT
-               t.*,
-               COALESCE((
-                 SELECT CAST(o.new_value AS INTEGER)
-                 FROM operations o
-                 WHERE o.thread_id = t.id
-                   AND o.field = 'in_inbox'
-                   AND o.state IN ('pending', 'executing', 'retrying')
-                 ORDER BY o.created_at DESC, o.rowid DESC
-                 LIMIT 1
-               ), t.remote_in_inbox) AS in_inbox,
-               COALESCE((
-                 SELECT CAST(o.new_value AS INTEGER)
-                 FROM operations o
-                 WHERE o.thread_id = t.id
-                   AND o.field = 'unread'
-                   AND o.state IN ('pending', 'executing', 'retrying')
-                 ORDER BY o.created_at DESC, o.rowid DESC
-                 LIMIT 1
-               ), t.remote_unread) AS unread,
-               COALESCE((
-                 SELECT CAST(o.new_value AS INTEGER)
-                 FROM operations o
-                 WHERE o.thread_id = t.id
-                   AND o.field = 'starred'
-                   AND o.state IN ('pending', 'executing', 'retrying')
-                 ORDER BY o.created_at DESC, o.rowid DESC
-                 LIMIT 1
-               ), t.remote_starred) AS starred,
-               COALESCE((
-                 SELECT CAST(o.new_value AS INTEGER)
-                 FROM operations o
-                 WHERE o.thread_id = t.id
-                   AND o.field = 'trashed'
-                   AND o.state IN ('pending', 'executing', 'retrying')
-                 ORDER BY o.created_at DESC, o.rowid DESC
-                 LIMIT 1
-               ), t.remote_trashed) AS trashed
-             FROM threads t;",
-        )?;
-
-        crate::provider_schema::migrate(
-            &transaction,
-            stored_version,
-            rebuild_provider_accounts,
-            rebuild_provider_containers,
-        )?;
-        install_provider_effective_views(&transaction)?;
-
-        if stored_version < 13 {
-            crate::provider_ingest::rebuild_all_search_indexes(&transaction)?;
-        }
-
-        if rebuild_provider_accounts || rebuild_provider_containers {
-            let violations = transaction
-                .prepare("PRAGMA foreign_key_check")?
-                .query_map([], |_| Ok(()))?
-                .count();
-            if violations != 0 {
-                return Err(StoreError::Validation(format!(
-                    "Provider account migration left {violations} foreign key violation(s)"
-                )));
-            }
-        }
-
-        transaction.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [SCHEMA_VERSION.to_string()],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    })();
-
-    if rebuild_provider_accounts || rebuild_provider_containers {
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-    }
-    migration_result
-}
-
-fn install_provider_effective_views(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    transaction.execute_batch(
-        "DROP VIEW IF EXISTS provider_thread_label_effective;
-         CREATE VIEW provider_thread_label_effective AS
-         WITH confirmed AS (
-           SELECT thread_ref.account_id,
-                  thread_ref.thread_id,
-                  thread_ref.remote_thread_id,
-                  container.remote_id AS remote_container_id,
-                  COUNT(message_ref.remote_message_id) AS remote_message_count,
-                  COUNT(membership.remote_message_id) AS labelled_message_count
-           FROM provider_thread_refs thread_ref
-           JOIN provider_containers container
-             ON container.account_id = thread_ref.account_id
-            AND container.role = 'custom'
-            AND container.is_selectable = 1
-            AND container.is_deleted = 0
-           LEFT JOIN provider_message_refs message_ref
-             ON message_ref.account_id = thread_ref.account_id
-            AND message_ref.remote_thread_id = thread_ref.remote_thread_id
-           LEFT JOIN provider_container_memberships membership
-             ON membership.account_id = message_ref.account_id
-            AND membership.remote_message_id = message_ref.remote_message_id
-            AND membership.remote_container_id = container.remote_id
-           GROUP BY thread_ref.account_id, thread_ref.thread_id,
-                    thread_ref.remote_thread_id, container.remote_id
-         )
-         SELECT confirmed.account_id,
-                confirmed.thread_id,
-                confirmed.remote_thread_id,
-                confirmed.remote_container_id,
-                COALESCE((
-                  SELECT CAST(operation.new_value AS INTEGER)
-                  FROM operations operation
-                  WHERE operation.thread_id = confirmed.thread_id
-                    AND operation.field = 'provider_label'
-                    AND operation.state IN ('pending', 'executing', 'retrying')
-                    AND json_valid(operation.payload_json)
-                    AND json_extract(operation.payload_json, '$.accountId') = confirmed.account_id
-                    AND json_extract(operation.payload_json, '$.remoteContainerId') = confirmed.remote_container_id
-                  ORDER BY operation.created_at DESC, operation.rowid DESC
-                  LIMIT 1
-                ), CASE
-                  WHEN confirmed.remote_message_count > 0
-                   AND confirmed.labelled_message_count = confirmed.remote_message_count THEN 1
-                  WHEN confirmed.labelled_message_count = 0 THEN 0
-                  ELSE 2
-                END) AS label_state
-         FROM confirmed;",
-    )?;
-    Ok(())
-}
-
-fn column_exists(
-    transaction: &Transaction<'_>,
-    table: &str,
-    column: &str,
-) -> Result<bool, rusqlite::Error> {
-    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(columns.iter().any(|name| name == column))
-}
-
-fn recover_interrupted_operations(connection: &Connection) -> Result<(), StoreError> {
-    let interrupted_at = now_ms();
-    connection.execute(
-        "UPDATE operations
-         SET state = 'outcome_unknown',
-             error = COALESCE(error, 'Mux restarted while send outcome was unresolved')
-         WHERE state = 'executing' AND field = 'send'
-           AND (
-             NOT EXISTS (
-               SELECT 1 FROM provider_work_items work
-               WHERE work.operation_id = operations.id AND work.kind = 'send'
-             ) OR EXISTS (
-               SELECT 1 FROM provider_work_items work
-               WHERE work.operation_id = operations.id AND work.kind = 'send'
-                 AND work.last_error_code = 'send_submission_started'
-             )
-           )",
-        [],
-    )?;
-    connection.execute(
-        "UPDATE operations
-         SET state = 'retrying', not_before = ?1,
-             error = COALESCE(error, 'Mux restarted before provider submission began')
-         WHERE state = 'executing' AND field = 'send'
-           AND EXISTS (
-             SELECT 1 FROM provider_work_items work
-             WHERE work.operation_id = operations.id AND work.kind = 'send'
-               AND work.last_error_code IS NOT 'send_submission_started'
-           )",
-        [interrupted_at],
-    )?;
-    connection.execute(
-        "UPDATE operations
-         SET state = 'retrying', not_before = ?1,
-             error = COALESCE(error, 'Mux restarted while provider acknowledgement was pending')
-         WHERE state = 'executing' AND field <> 'send'",
-        [interrupted_at],
-    )?;
-    Ok(())
-}
-
-fn ensure_durable_work_for_pending_operations(
-    connection: &mut Connection,
-) -> Result<(), StoreError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    upgrade_legacy_send_work(&transaction)?;
-    let operations = {
-        let mut statement = transaction.prepare(
-            "SELECT operation.rowid, operation.id, operation.thread_id, operation.field,
-                    operation.kind, operation.old_value, operation.new_value,
-                    operation.payload_json, operation.state, operation.not_before,
-                    operation.created_at
-             FROM operations operation
-             WHERE operation.state IN ('pending', 'retrying')
-               AND NOT EXISTS (
-                 SELECT 1 FROM provider_work_items work
-                 WHERE work.operation_id = operation.id
-               )
-             ORDER BY operation.created_at, operation.rowid",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((operation_from_row(row)?, row.get::<_, i64>(10)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows
-    };
-
-    for (operation, created_at) in operations {
-        let work_id = format!("work_migrated_{:020}", operation.row_id);
-        if operation.field == "send" {
-            let old_payload: SendPayload = serde_json::from_str(
-                operation
-                    .payload_json
-                    .as_deref()
-                    .ok_or_else(|| StoreError::Validation("Send payload is missing".into()))?,
-            )?;
-            let draft = transaction
-                .query_row(
-                    "SELECT d.id, d.account_id, a.name, a.email, a.color,
-                            d.recipients, d.cc_recipients, d.bcc_recipients,
-                            d.subject, d.body, d.body_html, d.reply_to_thread_id,
-                            d.updated_at, d.revision
-                     FROM drafts d JOIN accounts a ON a.id = d.account_id
-                     WHERE d.id = ?1",
-                    [&old_payload.draft_id],
-                    |row| {
-                        Ok(DraftSummary {
-                            id: row.get(0)?,
-                            account_id: row.get(1)?,
-                            account_name: row.get(2)?,
-                            account_email: row.get(3)?,
-                            account_color: row.get(4)?,
-                            recipients: row.get(5)?,
-                            cc_recipients: row.get(6)?,
-                            bcc_recipients: row.get(7)?,
-                            subject: row.get(8)?,
-                            body: row.get(9)?,
-                            body_html: row.get(10)?,
-                            reply_to_thread_id: row.get(11)?,
-                            updated_at: row.get(12)?,
-                            revision: row.get(13)?,
-                            locked: true,
-                        })
-                    },
-                )
-                .optional()?;
-            let Some(draft) = draft else {
-                transaction.execute(
-                    "UPDATE operations
-                     SET state = 'failed', error = 'Draft was unavailable during worker migration'
-                     WHERE id = ?1 AND state IN ('pending', 'retrying')",
-                    [&operation.id],
-                )?;
-                continue;
-            };
-            let (resolved_provider_kind, resolved_remote_thread_id) =
-                resolve_send_provider_target(&transaction, &draft)?;
-            let payload = if send_payload_has_complete_snapshot(&old_payload) {
-                old_payload
-            } else {
-                let message_id = if old_payload.message_id.is_empty() {
-                    new_id(&transaction, "message")?
-                } else {
-                    old_payload.message_id
-                };
-                send_payload_for_draft(
-                    &draft,
-                    message_id,
-                    format!("<{}@mux.invalid>", operation.id.replace('_', "-")),
-                    created_at,
-                    None,
-                    Vec::new(),
-                    format!("mux-{}", operation.id.replace('_', "-")),
-                    resolved_provider_kind.clone(),
-                    resolved_remote_thread_id,
-                )
-            };
-            let payload_json = serde_json::to_string(&payload)?;
-            transaction.execute(
-                "UPDATE operations SET payload_json = ?2 WHERE id = ?1",
-                params![operation.id, payload_json],
-            )?;
-            let send_scope = if payload.provider_kind.as_deref() == Some("gmail") {
-                crate::gmail::gmail_send_scope(&operation.id)
-            } else {
-                "outgoing:v1".into()
-            };
-            enqueue_in_transaction(
-                &transaction,
-                NewWorkItem {
-                    id: work_id.clone(),
-                    account_id: draft.account_id.clone(),
-                    operation_id: Some(operation.id.clone()),
-                    kind: WorkKind::Send,
-                    scope: send_scope.clone(),
-                    ordering_key: payload.submission_message_id.clone().ok_or_else(|| {
-                        StoreError::Validation("Migrated send has no submission identity".into())
-                    })?,
-                    payload_json: payload_json.clone(),
-                    priority: 100,
-                    available_at: operation.not_before,
-                    max_attempts: 8,
-                },
-                created_at,
-            )
-            .map_err(durable_work_error)?;
-            if payload.provider_kind.as_deref() == Some("gmail") {
-                enqueue_in_transaction(
-                    &transaction,
-                    crate::gmail::gmail_send_reconciliation_work(
-                        &draft.account_id,
-                        &operation.id,
-                        &work_id,
-                        &send_scope,
-                        &payload_json,
-                        operation.not_before.saturating_add(1_000),
-                    )
-                    .map_err(StoreError::Validation)?,
-                    created_at.saturating_add(1),
-                )
-                .map_err(durable_work_error)?;
-            }
-        } else {
-            let Some(thread_id) = operation.thread_id else {
-                transaction.execute(
-                    "UPDATE operations
-                     SET state = 'failed', error = 'Thread was unavailable during worker migration'
-                     WHERE id = ?1 AND state IN ('pending', 'retrying')",
-                    [&operation.id],
-                )?;
-                continue;
-            };
-            let account_id = transaction
-                .query_row(
-                    "SELECT account_id FROM threads WHERE id = ?1",
-                    [thread_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let Some(account_id) = account_id else {
-                transaction.execute(
-                    "UPDATE operations
-                     SET state = 'failed', error = 'Thread was unavailable during worker migration'
-                     WHERE id = ?1 AND state IN ('pending', 'retrying')",
-                    [&operation.id],
-                )?;
-                continue;
-            };
-            let payload_json = serde_json::to_string(&serde_json::json!({
-                "operationId": operation.id.clone(),
-                "threadId": thread_id,
-                "field": operation.field.clone(),
-                "value": operation.new_value.clone(),
-            }))?;
-            enqueue_in_transaction(
-                &transaction,
-                NewWorkItem {
-                    id: work_id,
-                    account_id,
-                    operation_id: Some(operation.id.clone()),
-                    kind: WorkKind::Mutation,
-                    scope: format!("thread:v1:{thread_id}"),
-                    ordering_key: operation.id,
-                    payload_json,
-                    priority: 50,
-                    available_at: operation.not_before,
-                    max_attempts: 8,
-                },
-                created_at,
-            )
-            .map_err(durable_work_error)?;
-        }
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
-fn upgrade_legacy_send_work(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    let rows = {
-        let mut statement = transaction.prepare(
-            "SELECT work.id, work.account_id, work.operation_id, work.scope,
-                    work.ordering_key, work.payload_json, work.state, work.priority,
-                    work.created_at, work.available_at, work.attempt_count,
-                    work.max_attempts, work.cancel_requested, work.last_error_code,
-                    work.auth_block_reason, work.retry_after_at,
-                    operation.payload_json, operation.created_at
-             FROM provider_work_items work
-             JOIN operations operation ON operation.id = work.operation_id
-             WHERE work.kind = 'send'
-               AND work.state IN (
-                 'queued', 'retry_wait', 'rate_limited', 'authentication_blocked'
-               )
-               AND operation.state IN ('pending', 'retrying')
-             ORDER BY operation.created_at, work.id",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(LegacySendWork {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    operation_id: row.get(2)?,
-                    scope: row.get(3)?,
-                    ordering_key: row.get(4)?,
-                    payload_json: row.get(5)?,
-                    state: row.get(6)?,
-                    priority: row.get(7)?,
-                    created_at: row.get(8)?,
-                    available_at: row.get(9)?,
-                    attempt_count: row.get(10)?,
-                    max_attempts: row.get(11)?,
-                    cancel_requested: row.get(12)?,
-                    last_error_code: row.get(13)?,
-                    auth_block_reason: row.get(14)?,
-                    retry_after_at: row.get(15)?,
-                    operation_payload_json: row.get(16)?,
-                    operation_created_at: row.get(17)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows
-    };
-    for work in rows {
-        let operation_payload_json = work.operation_payload_json.ok_or_else(|| {
-            StoreError::Validation("Queued send operation payload is missing".into())
-        })?;
-        if work.payload_json != operation_payload_json {
-            return Err(StoreError::Validation(
-                "Queued send operation and work snapshots diverged".into(),
-            ));
-        }
-        let mut payload: SendPayload = serde_json::from_str(&work.payload_json)?;
-        if payload.snapshot_version == Some(2) {
-            continue;
-        }
-        if !send_payload_has_complete_snapshot(&payload) {
-            return Err(StoreError::Validation(
-                "Queued legacy send snapshot is incomplete".into(),
-            ));
-        }
-        send_projection_fields(transaction, &payload)?;
-        payload.snapshot_version = Some(2);
-        payload.queued_at_ms = Some(work.operation_created_at);
-        let submission_message_id = payload.submission_message_id.as_deref().ok_or_else(|| {
-            StoreError::Validation("Queued legacy send identity is missing".into())
-        })?;
-        let fingerprint = send_content_fingerprint_v2(
-            submission_message_id,
-            payload.account_id.as_deref().expect("complete snapshot"),
-            payload.sender_email.as_deref().expect("complete snapshot"),
-            payload.recipients.as_deref().expect("complete snapshot"),
-            payload.cc_recipients.as_deref().expect("complete snapshot"),
-            payload
-                .bcc_recipients
-                .as_deref()
-                .expect("complete snapshot"),
-            payload.subject.as_deref().expect("complete snapshot"),
-            payload.body.as_deref().expect("complete snapshot"),
-            payload.body_html.as_deref().expect("complete snapshot"),
-            payload.reply_to_thread_id,
-            payload.draft_revision.expect("complete snapshot"),
-            work.operation_created_at,
-            payload.in_reply_to.as_deref(),
-            &payload.references,
-        );
-        payload.content_fingerprint_hex = Some(fingerprint);
-        let upgraded_json = serde_json::to_string(&payload)?;
-        if upgraded_json.len() > 1024 * 1024 {
-            return Err(StoreError::Validation(
-                "Upgraded send snapshot exceeds the durable work limit".into(),
-            ));
-        }
-        let payload_fingerprint = Sha256::digest(upgraded_json.as_bytes());
-        let operation_changed = transaction.execute(
-            "UPDATE operations SET payload_json = ?2
-             WHERE id = ?1 AND payload_json = ?3 AND state IN ('pending', 'retrying')",
-            params![work.operation_id, upgraded_json, operation_payload_json],
-        )?;
-        if operation_changed != 1 {
-            return Err(StoreError::Conflict(
-                "Queued legacy send operation changed during upgrade".into(),
-            ));
-        }
-        let deleted = transaction.execute(
-            "DELETE FROM provider_work_items
-             WHERE id = ?1 AND payload_json = ?2 AND state = ?3
-               AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL",
-            params![work.id, work.payload_json, work.state],
-        )?;
-        if deleted != 1 {
-            return Err(StoreError::Conflict(
-                "Queued legacy send changed during upgrade".into(),
-            ));
-        }
-        transaction.execute(
-            "INSERT INTO provider_work_items(
-               id, account_id, operation_id, kind, scope, ordering_key, retry_safety,
-               payload_json, payload_fingerprint, state, priority, created_at,
-               available_at, attempt_count, max_attempts, cancel_requested,
-               last_error_code, auth_block_reason, retry_after_at
-             ) VALUES(
-               ?1, ?2, ?3, 'send', ?4, ?5, 'non_idempotent_send', ?6, ?7, ?8,
-               ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
-             )",
-            params![
-                work.id,
-                work.account_id,
-                work.operation_id,
-                work.scope,
-                work.ordering_key,
-                upgraded_json,
-                payload_fingerprint.as_slice(),
-                work.state,
-                work.priority,
-                work.created_at,
-                work.available_at,
-                work.attempt_count,
-                work.max_attempts,
-                work.cancel_requested,
-                work.last_error_code,
-                work.auth_block_reason,
-                work.retry_after_at,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-struct LegacySendWork {
-    id: String,
-    account_id: String,
-    operation_id: String,
-    scope: String,
-    ordering_key: String,
-    payload_json: String,
-    state: String,
-    priority: i64,
-    created_at: i64,
-    available_at: i64,
-    attempt_count: i64,
-    max_attempts: i64,
-    cancel_requested: i64,
-    last_error_code: Option<String>,
-    auth_block_reason: Option<String>,
-    retry_after_at: Option<i64>,
-    operation_payload_json: Option<String>,
-    operation_created_at: i64,
-}
-
-#[derive(Clone, Copy)]
-struct DemoThread {
-    account_id: &'static str,
-    subject: &'static str,
-    participant: &'static str,
-    email: &'static str,
-    snippet: &'static str,
-    category: &'static str,
-    unread: i64,
-    starred: i64,
-}
-
-#[derive(Clone, Copy)]
-struct LongDemoThread {
-    thread_id: i64,
-    account_email: &'static str,
-    primary_name: &'static str,
-    primary_email: &'static str,
-    secondary_name: &'static str,
-    secondary_email: &'static str,
-    topic: &'static str,
-    extra_messages: i64,
-}
-
-fn seed_demo_mailbox(connection: &mut Connection) -> Result<(), StoreError> {
-    let thread_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
-    if thread_count > 0 {
-        return Ok(());
-    }
-
-    let now = now_ms();
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let accounts = [
-        (
-            "acc_personal",
-            "Personal",
-            "jordan@example.com",
-            "#8b68ff",
-            "Jordan",
-        ),
-        (
-            "acc_research",
-            "Research",
-            "jordan@research.example",
-            "#21b89a",
-            "Jordan Matelsky\nResearch",
-        ),
-        (
-            "acc_work",
-            "Work",
-            "jordan@acme.example",
-            "#3b82f6",
-            "Jordan Matelsky\nMux",
-        ),
-    ];
-    for (id, name, email, color, signature) in accounts {
-        transaction.execute(
-            "INSERT INTO accounts(id, name, email, color, provider, signature)
-             VALUES(?1, ?2, ?3, ?4, 'fake', ?5)",
-            params![id, name, email, color, signature],
-        )?;
-    }
-
-    let threads = [
-        DemoThread {
-            account_id: "acc_work",
-            subject: "Project update — next milestone",
-            participant: "Jane Cooper",
-            email: "jane@acme.example",
-            snippet: "The project brief is ready for review.",
-            category: "Work",
-            unread: 1,
-            starred: 1,
-        },
-        DemoThread {
-            account_id: "acc_personal",
-            subject: "Re: Design feedback",
-            participant: "Alan Shaw",
-            email: "alan@northstar.example",
-            snippet: "I attached the latest draft for your review.",
-            category: "Personal",
-            unread: 0,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_research",
-            subject: "Lunch next week?",
-            participant: "Tiana Dorwart",
-            email: "tiana@cobalt.example",
-            snippet: "Would Wednesday afternoon work for you?",
-            category: "Research",
-            unread: 1,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_work",
-            subject: "Mux architecture review",
-            participant: "Sarah Johnson",
-            email: "sarah@studio.example",
-            snippet: "Here are the notes and action items from today.",
-            category: "Work",
-            unread: 1,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_personal",
-            subject: "Statement for August",
-            participant: "Michael Wilson",
-            email: "michael@ledger.example",
-            snippet: "The statement is ready for review.",
-            category: "Finance",
-            unread: 0,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_research",
-            subject: "Travel plans",
-            participant: "Brian Chen",
-            email: "brian@design.example",
-            snippet: "The itinerary has been updated with the new times.",
-            category: "Travel",
-            unread: 1,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_work",
-            subject: "Q4 report",
-            participant: "Kevin Chang",
-            email: "kevin@orbit.example",
-            snippet: "The report includes the updated metrics and assumptions.",
-            category: "Work",
-            unread: 0,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_research",
-            subject: "Re: Onboarding",
-            participant: "Alex Garcia",
-            email: "alex@atlas.example",
-            snippet: "Everything is ready for the next onboarding step.",
-            category: "Research",
-            unread: 1,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_personal",
-            subject: "Invoice and receipt",
-            participant: "Priya Raman",
-            email: "priya@research.example",
-            snippet: "Please confirm that the totals match your records.",
-            category: "Finance",
-            unread: 0,
-            starred: 1,
-        },
-        DemoThread {
-            account_id: "acc_work",
-            subject: "Product roadmap",
-            participant: "Anna Lee",
-            email: "anna@finance.example",
-            snippet: "I incorporated the main changes from our review.",
-            category: "Work",
-            unread: 1,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_research",
-            subject: "Research review",
-            participant: "Noah Williams",
-            email: "noah@travel.example",
-            snippet: "The references and open questions are in the document.",
-            category: "Research",
-            unread: 0,
-            starred: 0,
-        },
-        DemoThread {
-            account_id: "acc_personal",
-            subject: "Launch checklist",
-            participant: "Maya Patel",
-            email: "maya@product.example",
-            snippet: "Everything is lined up for the next milestone.",
-            category: "Personal",
-            unread: 1,
-            starred: 0,
-        },
-    ];
-
-    for (index, thread) in threads.iter().enumerate() {
-        let id = index as i64 + 1;
-        let latest_at = now - index as i64 * 7_200_000;
-        let has_invite = i64::from(id == 4);
-        let has_attachment = i64::from(id == 2 || id == 9);
-        let attachment_names = if has_attachment == 1 {
-            "review.pdf"
-        } else {
-            ""
-        };
-        transaction.execute(
-            "INSERT INTO threads(
-               id, account_id, subject, participants, snippet, latest_at, message_count,
-               remote_in_inbox, remote_unread, remote_starred, has_attachment, has_invite,
-               has_link, has_from_me, category, attachment_names
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 2, 1, ?7, ?8, ?9, ?10, 0, 1, ?11, ?12)",
-            params![
-                id,
-                thread.account_id,
-                thread.subject,
-                thread.participant,
-                thread.snippet,
-                latest_at,
-                thread.unread,
-                thread.starred,
-                has_attachment,
-                has_invite,
-                thread.category,
-                attachment_names,
-            ],
-        )?;
-
-        let incoming_body = format!(
-            "{}\n\nLet me know what you think when you have a chance.",
-            thread.snippet
-        );
-        let reply_body = format!(
-            "Thanks, {}. I took a look and added my notes.\n\nI'll follow up if anything else changes.",
-            thread.participant.split_whitespace().next().unwrap_or(thread.participant)
-        );
-        let incoming_id = id * 2 - 1;
-        let outgoing_id = id * 2;
-        transaction.execute(
-            "INSERT INTO messages(id, thread_id, sender_name, sender_email, recipients, sent_at, body_text, is_from_me)
-             VALUES(?1, ?2, ?3, ?4, 'Jordan <jordan@mux.example>', ?5, ?6, 0)",
-            params![incoming_id, id, thread.participant, thread.email, latest_at - 3_600_000, incoming_body],
-        )?;
-        transaction.execute(
-            "INSERT INTO messages(id, thread_id, sender_name, sender_email, recipients, sent_at, body_text, is_from_me)
-             VALUES(?1, ?2, 'Jordan Matelsky', 'jordan@mux.example', ?3, ?4, ?5, 1)",
-            params![outgoing_id, id, thread.email, latest_at, reply_body],
-        )?;
-        transaction.execute(
-            "INSERT INTO messages_fts(thread_id, subject, participants, body, attachment_names)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![
-                id,
-                thread.subject,
-                thread.participant,
-                format!("{incoming_body}\n{reply_body}"),
-                attachment_names
-            ],
-        )?;
-    }
-
-    transaction.execute(
-        "INSERT INTO invitations(
-           thread_id, uid, title, start_at, end_at, timezone, location,
-           organizer, attendees, response, conflict_text
-         ) VALUES(4, 'mux-native-demo-invite', 'Mux architecture review', ?1, ?2,
-                  'America/New_York', 'Conference Room A', 'Sarah Johnson',
-                  'Jordan Matelsky', 'needsAction', NULL)",
-        params![now + 86_400_000, now + 90_000_000],
-    )?;
-    transaction.execute(
-        "INSERT INTO meta(key, value) VALUES('seed_complete', '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn seed_demo_account_signatures(connection: &Connection) -> Result<(), StoreError> {
-    let is_demo = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'seed_complete'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if is_demo.as_deref() != Some("1") {
-        return Ok(());
-    }
-    for (account_id, signature) in [
-        ("acc_personal", "Jordan"),
-        ("acc_research", "Jordan Matelsky\nResearch"),
-        ("acc_work", "Jordan Matelsky\nMux"),
-    ] {
-        connection.execute(
-            "UPDATE accounts SET signature = ?1 WHERE id = ?2 AND signature = ''",
-            params![signature, account_id],
-        )?;
-    }
-    Ok(())
-}
-
-fn seed_long_demo_threads(connection: &mut Connection) -> Result<(), StoreError> {
-    let is_demo = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'seed_complete'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let already_seeded = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'long_demo_threads_v1'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if is_demo.as_deref() != Some("1") || already_seeded.as_deref() == Some("1") {
-        return Ok(());
-    }
-
-    let scenarios = [
-        LongDemoThread {
-            thread_id: 1,
-            account_email: "jordan@acme.example",
-            primary_name: "Jane Cooper",
-            primary_email: "jane@acme.example",
-            secondary_name: "Priya Raman",
-            secondary_email: "priya@acme.example",
-            topic: "the milestone review",
-            extra_messages: 30,
-        },
-        LongDemoThread {
-            thread_id: 4,
-            account_email: "jordan@acme.example",
-            primary_name: "Sarah Johnson",
-            primary_email: "sarah@studio.example",
-            secondary_name: "Kevin Chang",
-            secondary_email: "kevin@studio.example",
-            topic: "the architecture review",
-            extra_messages: 34,
-        },
-        LongDemoThread {
-            thread_id: 11,
-            account_email: "jordan@research.example",
-            primary_name: "Noah Williams",
-            primary_email: "noah@travel.example",
-            secondary_name: "Mira Okafor",
-            secondary_email: "mira@fieldnotes.example",
-            topic: "the research synthesis",
-            extra_messages: 26,
-        },
-    ];
-    let scenario_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM threads WHERE id IN (1, 4, 11)",
-        [],
-        |row| row.get(0),
-    )?;
-    if scenario_count != scenarios.len() as i64 {
-        return Ok(());
-    }
-
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for scenario in scenarios {
-        let latest_at: i64 = transaction.query_row(
-            "SELECT latest_at FROM threads WHERE id = ?1",
-            [scenario.thread_id],
-            |row| row.get(0),
-        )?;
-        let participants = format!("{}, {}", scenario.primary_name, scenario.secondary_name);
-        let outgoing_recipients = format!(
-            "{} <{}>, {} <{}>",
-            scenario.primary_name,
-            scenario.primary_email,
-            scenario.secondary_name,
-            scenario.secondary_email
-        );
-        for index in 0..scenario.extra_messages {
-            let is_from_me = index % 3 == 1;
-            let secondary_speaking = index % 4 == 2;
-            let (sender_name, sender_email) = if is_from_me {
-                ("Jordan Matelsky", "jordan@mux.example")
-            } else if secondary_speaking {
-                (scenario.secondary_name, scenario.secondary_email)
-            } else {
-                (scenario.primary_name, scenario.primary_email)
-            };
-            let other_recipient = if sender_email == scenario.primary_email {
-                format!("{} <{}>", scenario.secondary_name, scenario.secondary_email)
-            } else {
-                format!("{} <{}>", scenario.primary_name, scenario.primary_email)
-            };
-            let recipients = if is_from_me {
-                outgoing_recipients.clone()
-            } else {
-                format!("Jordan <{}>, {}", scenario.account_email, other_recipient)
-            };
-            let body = long_demo_message(scenario.topic, index, is_from_me);
-            let body_html = if index % 9 == 4 {
-                format!(
-                    "<p><strong>Checkpoint {}</strong> for {}:</p><ul><li>Confirm the owner</li><li>Resolve the open note</li><li>Post the final update</li></ul>",
-                    index + 1,
-                    scenario.topic
-                )
-            } else {
-                String::new()
-            };
-            let sent_at = latest_at - (scenario.extra_messages - index + 1) * 7_200_000;
-            transaction.execute(
-                "INSERT INTO messages(
-                   thread_id, sender_name, sender_email, recipients, sent_at, body_text, body_html, is_from_me
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    scenario.thread_id,
-                    sender_name,
-                    sender_email,
-                    recipients,
-                    sent_at,
-                    body,
-                    body_html,
-                    i64::from(is_from_me),
-                ],
-            )?;
-        }
-
-        transaction.execute(
-            "UPDATE messages
-             SET recipients = ?1
-             WHERE id = (
-               SELECT id FROM messages
-               WHERE thread_id = ?2 AND is_from_me = 1
-               ORDER BY sent_at DESC, id DESC LIMIT 1
-             )",
-            params![outgoing_recipients, scenario.thread_id],
-        )?;
-        transaction.execute(
-            "UPDATE threads
-             SET participants = ?1,
-                 message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?2)
-             WHERE id = ?2",
-            params![participants, scenario.thread_id],
-        )?;
-        crate::provider_ingest::rebuild_search_index_for_thread(&transaction, scenario.thread_id)?;
-    }
-    transaction.execute(
-        "INSERT INTO meta(key, value) VALUES('long_demo_threads_v1', '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn long_demo_message(topic: &str, index: i64, is_from_me: bool) -> String {
-    let sequence = index + 1;
-    let text = match (is_from_me, index % 6) {
-        (true, 0) => "I folded those notes into the working draft. The remaining question is small enough to settle in the next pass.",
-        (true, 1) => "That works for me. I will keep the current owner and add a concrete decision date so the handoff is unambiguous.",
-        (true, 2) => "I checked the latest version against our earlier assumptions. Nothing else needs to move before we share it.",
-        (true, 3) => "Good catch. I rewrote that section and left one comment where I still want a second set of eyes.",
-        (true, 4) => "I can take the follow-up. I will post a short summary here once the review is complete.",
-        (true, _) => "The update is in. I kept the scope narrow and preserved the earlier decision so we do not reopen finished work.",
-        (false, 0) => "I reviewed the new draft this morning. The structure is clearer, and I only have one question about the handoff.",
-        (false, 1) => "The numbers now line up with the source sheet. I marked the two places where the wording still implies the old plan.",
-        (false, 2) => "One small concern: the owner is clear, but the decision date is not. Could we make that explicit before circulation?",
-        (false, 3) => "This version reads well. I tested the example against the edge case from yesterday and the outcome is consistent.",
-        (false, 4) => "I added comments inline and resolved the ones that were purely editorial. The remaining note needs a product call.",
-        (false, _) => "No blocker from me. Once the final wording lands, this is ready to move to the next person.",
-    };
-    format!("Update {sequence} on {topic}:\n\n{text}")
-}
-
-fn seed_safe_content_demo(connection: &mut Connection) -> Result<(), StoreError> {
-    let is_demo = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'seed_complete'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let already_seeded = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'safe_content_demo_v1'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if is_demo.as_deref() != Some("1") || already_seeded.as_deref() == Some("1") {
-        return Ok(());
-    }
-
-    let raw = concat!(
-        "MIME-Version: 1.0\r\n",
-        "Content-Type: multipart/related; boundary=mux-demo\r\n\r\n",
-        "--mux-demo\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
-        "<p><strong>Latest design review</strong></p>",
-        "<p>The annotated diagram is included below. A remote tracking image in the original message was blocked.</p>",
-        "<p><a href=\"https://example.com/review\">Open the review notes</a></p>",
-        "<script>window.location='https://tracker.invalid'</script>",
-        "<img src=\"https://tracker.invalid/pixel\"><img src=\"cid:mux-chart\">\r\n",
-        "--mux-demo\r\nContent-Type: image/png; name=\"architecture-preview.png\"\r\n",
-        "Content-Disposition: inline; filename=\"architecture-preview.png\"\r\n",
-        "Content-ID: <mux-chart>\r\nContent-Transfer-Encoding: base64\r\n\r\n",
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\r\n",
-        "--mux-demo\r\nContent-Type: text/plain; name=\"review-notes.txt\"\r\n",
-        "Content-Disposition: attachment; filename=\"review-notes.txt\"\r\n\r\n",
-        "Design review notes\n\n- Keep the interaction model direct.\n- Preserve the local projection.\r\n",
-        "--mux-demo--\r\n"
-    );
-    let parsed = crate::content::parse_mime(raw.as_bytes()).map_err(StoreError::Validation)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let message_id: i64 = transaction.query_row(
-        "SELECT id FROM messages WHERE thread_id = 2 AND is_from_me = 0 ORDER BY sent_at, id LIMIT 1",
-        [],
-        |row| row.get(0),
-    )?;
-    transaction.execute(
-        "UPDATE messages
-         SET body_text = ?1, body_html = ?2, blocked_remote_resources = ?3
-         WHERE id = ?4",
-        params![
-            parsed.body_text,
-            parsed.body_html,
-            parsed.blocked_remote_resources,
-            message_id
-        ],
-    )?;
-    let mut attachment_names = Vec::new();
-    for (index, attachment) in parsed.attachments.into_iter().enumerate() {
-        let attachment_id = format!("demo_safe_{message_id}_{index}");
-        let byte_length = attachment.bytes.len() as i64;
-        attachment_names.push(attachment.filename.clone());
-        transaction.execute(
-            "INSERT INTO attachments(
-               id, message_id, filename, media_type, byte_length, content, content_id, disposition
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                attachment_id,
-                message_id,
-                attachment.filename,
-                attachment.media_type,
-                byte_length,
-                attachment.bytes,
-                attachment.content_id,
-                attachment.disposition
-            ],
-        )?;
-    }
-    let attachment_names = attachment_names.join(" ");
-    transaction.execute(
-        "UPDATE threads
-         SET has_attachment = 1, has_link = 1, attachment_names = ?1,
-             snippet = 'The annotated design review is ready; one remote image was blocked.'
-         WHERE id = 2",
-        [&attachment_names],
-    )?;
-    crate::provider_ingest::rebuild_search_index_for_thread(&transaction, 2)?;
-    transaction.execute(
-        "INSERT INTO meta(key, value) VALUES('safe_content_demo_v1', '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn seed_demo_threading_headers(connection: &Connection) -> Result<(), StoreError> {
-    let is_demo = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'seed_complete'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let already_seeded = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'demo_threading_headers_v1'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if is_demo.as_deref() != Some("1") || already_seeded.as_deref() == Some("1") {
-        return Ok(());
-    }
-    connection.execute(
-        "UPDATE messages
-         SET internet_message_id = '<demo-message-' || id || '@mux.invalid>'
-         WHERE internet_message_id = ''",
-        [],
-    )?;
-    connection.execute(
-        "INSERT INTO meta(key, value) VALUES('demo_threading_headers_v1', '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )?;
-    Ok(())
-}
+mod demo;
+mod stats;
+mod validation;
+
+pub use stats::{AddressCount, DayVolume, MailStats, MailStatsInput};
+
+use validation::*;
+// Reached from the Gmail adapter when it recomputes a send fingerprint.
+pub(crate) use validation::send_content_fingerprint_v3;
+mod schema;
+
+use schema::{ensure_durable_work_for_pending_operations, migrate, recover_interrupted_operations};
+
+use demo::{
+    seed_demo_account_signatures, seed_demo_mailbox, seed_demo_threading_headers,
+    seed_long_demo_threads, seed_safe_content_demo,
+};
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -5942,6 +4123,7 @@ fn append_mailbox_view(
 
 #[cfg(test)]
 mod tests {
+    use super::demo::DEMO_FIXTURE_THREAD_ID;
     use super::*;
     use crate::provider::{OpaqueSyncCursor, ProviderBatch};
     use crate::provider_ingest::{
@@ -6088,7 +4270,7 @@ mod tests {
         let normalized = schema.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains(
             "auth_state TEXT NOT NULL DEFAULT 'signed_out' CHECK(auth_state IN ( \
-             'signed_out', 'credential_locked', 'ready', 'reauthorization_required', 'unavailable' ))"
+             'signed_out', 'ready', 'reauthorization_required', 'unavailable' ))"
         ));
         assert!(normalized.contains(
             "sync_state TEXT NOT NULL DEFAULT 'never_synced' CHECK(sync_state IN ( \
@@ -6100,14 +4282,16 @@ mod tests {
              length(CAST(credential_ref AS BLOB)) BETWEEN 1 AND 256 )"
         ));
         assert!(normalized.contains(
-            "auth_block_reason TEXT CHECK( auth_block_reason IS NULL OR auth_block_reason IN ( \
-             'credential_locked', 'provider_reauthorization' ) )"
+            "auth_block_reason TEXT CHECK( auth_block_reason IS NULL OR auth_block_reason = \
+             'provider_reauthorization' )"
         ));
         assert!(normalized.contains(
-            "CHECK( auth_state NOT IN ('ready', 'credential_locked', \
+            "CHECK( auth_state NOT IN ('ready', \
              'reauthorization_required') OR credential_ref IS NOT NULL )"
         ));
         assert!(!normalized.contains("DEFAULT 'locked'"));
+        // The locked-credential state was removed in schema 22.
+        assert!(!normalized.contains("'credential_locked'"));
         assert!(!normalized.contains("'expired'"));
         assert!(!normalized.contains("'requires_action'"));
         assert_eq!(
@@ -6129,9 +4313,8 @@ mod tests {
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM provider_accounts
-                     WHERE auth_state IN (
-                       'ready', 'credential_locked', 'reauthorization_required'
-                     ) AND credential_ref IS NULL",
+                     WHERE auth_state IN ('ready', 'reauthorization_required')
+                       AND credential_ref IS NULL",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -6388,6 +4571,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("search succeeds")
             .rows
@@ -6498,7 +4682,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version");
-        assert_eq!(version, "21");
+        assert_eq!(version, "22");
         assert_eq!(
             store
                 .connection
@@ -6513,7 +4697,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            12
+            5
         );
         assert_eq!(
             store
@@ -6521,7 +4705,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            12
+            5
         );
         assert_eq!(
             store
@@ -6540,7 +4724,7 @@ mod tests {
         assert_eq!(foreign_key_violations, 0);
 
         let bootstrap = store.bootstrap().expect("bootstrap query");
-        assert_eq!(bootstrap.schema_version, 21);
+        assert_eq!(bootstrap.schema_version, 22);
         assert_eq!(bootstrap.accounts.len(), 3);
         assert_eq!(bootstrap.view_counts.len(), 4);
         assert!(bootstrap.drafts.is_empty());
@@ -6579,13 +4763,15 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(100),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("thread page");
-        assert_eq!(threads.threads.len(), 12);
+        assert_eq!(threads.threads.len(), 5);
         assert!(!threads.has_more);
         let messages = store
             .get_thread_messages(MessagePageInput {
-                thread_id: 2,
+                thread_id: DEMO_FIXTURE_THREAD_ID,
                 cursor: None,
                 limit: Some(100),
             })
@@ -6738,7 +4924,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -6897,7 +5083,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -6948,8 +5134,8 @@ mod tests {
                  ) VALUES
                    ('acc_work', 'gmail', 'shared-account', 'ready', 'idle',
                     'provider/acc_work', NULL, 1, 1),
-                   ('acc_personal', 'jmap', 'shared-account', 'credential_locked', 'offline',
-                    'provider/acc_personal', 'credential_locked', 1, 1);
+                   ('acc_personal', 'jmap', 'shared-account', 'reauthorization_required',
+                    'offline', 'provider/acc_personal', 'provider_reauthorization', 1, 1);
                  INSERT INTO provider_capabilities(account_id, capability, enabled)
                    VALUES('acc_work', 'delta_sync', 1);
                  INSERT INTO provider_containers(
@@ -7283,7 +5469,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         for table in [
             "provider_accounts",
@@ -7373,7 +5559,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -7436,7 +5622,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -7489,7 +5675,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert_eq!(
             migrated
@@ -7584,13 +5770,13 @@ mod tests {
                  ) VALUES
                    ('locked-account', 'jmap', 'remote-locked-account', 'locked', 'offline', 1, 1),
                    ('reauth-account', 'jmap', 'remote-reauth-account', 'expired', 'error', 1, 1);
-                 UPDATE provider_work_items
-                   SET state = 'authentication_blocked',
-                       auth_block_reason = 'credential_locked',
-                       last_error_code = 'credential_locked'
-                   WHERE id = 'locked-work';
                  DROP TRIGGER provider_work_auth_block_insert;
                  DROP TRIGGER provider_work_auth_block_update;
+                 UPDATE provider_work_items
+                   SET state = 'authentication_blocked',
+                       auth_block_reason = 'provider_reauthorization',
+                       last_error_code = 'credential_locked'
+                   WHERE id = 'locked-work';
                  ALTER TABLE provider_work_items DROP COLUMN auth_block_reason;
                  UPDATE meta SET value = '10' WHERE key = 'schema_version';",
             )
@@ -7608,7 +5794,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let accounts = migrated
             .connection
@@ -7764,7 +5950,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let accounts = migrated
             .connection
@@ -7867,7 +6053,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v11_repairs_stale_provider_account_checks_and_preserves_vault_markers() {
+    fn schema_v11_repairs_stale_provider_account_checks_and_preserves_credential_markers() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("stale-v11-provider-accounts.db");
         let store = MuxStore::open(&path, false).expect("current schema created");
@@ -7910,7 +6096,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert_eq!(
             migrated
@@ -7938,9 +6124,10 @@ mod tests {
                 .unwrap(),
             (
                 "remote-v11".into(),
-                "credential_locked".into(),
+                // Schema 22 turns a stale locked account into one needing reauthorization.
+                "reauthorization_required".into(),
                 "provider/stale-v11".into(),
-                "credential_locked".into(),
+                "provider_reauthorization".into(),
                 "authentication_blocked".into(),
                 "credential_locked".into(),
                 222,
@@ -8705,7 +6892,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let expected = vec![(
             7001,
@@ -8799,7 +6986,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let receipts_after = migrated
             .connection
@@ -9024,7 +7211,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert_eq!(
             migrated
@@ -9691,6 +7878,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("visible projection")
             .threads
@@ -9954,7 +8143,7 @@ mod tests {
         let store = MuxStore::open(&path, true).expect("seeded store opens");
         let page = store
             .get_thread_messages(MessagePageInput {
-                thread_id: 2,
+                thread_id: DEMO_FIXTURE_THREAD_ID,
                 cursor: None,
                 limit: Some(100),
             })
@@ -10059,17 +8248,17 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(100),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("thread page");
         let counts = threads
             .threads
             .iter()
-            .filter(|thread| [1, 4, 11].contains(&thread.id))
+            .filter(|thread| thread.id == DEMO_FIXTURE_THREAD_ID)
             .map(|thread| (thread.id, thread.message_count))
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(counts.get(&1), Some(&32));
-        assert_eq!(counts.get(&4), Some(&36));
-        assert_eq!(counts.get(&11), Some(&28));
+        assert_eq!(counts.get(&DEMO_FIXTURE_THREAD_ID), Some(&35));
         drop(store);
 
         let reopened = MuxStore::open(&path, true).expect("seeded store reopens");
@@ -10077,7 +8266,7 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("message count");
-        assert_eq!(message_count, 114);
+        assert_eq!(message_count, 42);
     }
 
     #[test]
@@ -10099,6 +8288,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(1),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("first tied page");
         let tied_second = store
@@ -10107,6 +8298,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: tied_first.next_cursor.clone(),
                 limit: Some(1),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("second tied page");
         assert_eq!(tied_first.threads[0].id, 2);
@@ -10148,6 +8341,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(3),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("first thread page");
         assert_eq!(first.threads.len(), 3);
@@ -10158,6 +8353,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: first.next_cursor,
                 limit: Some(3),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("second thread page");
         assert!(first
@@ -10167,7 +8364,7 @@ mod tests {
 
         let newest = store
             .get_thread_messages(MessagePageInput {
-                thread_id: 4,
+                thread_id: DEMO_FIXTURE_THREAD_ID,
                 cursor: None,
                 limit: Some(5),
             })
@@ -10181,7 +8378,7 @@ mod tests {
         let oldest_loaded = (newest.messages[0].sent_at, newest.messages[0].id);
         let older = store
             .get_thread_messages(MessagePageInput {
-                thread_id: 4,
+                thread_id: DEMO_FIXTURE_THREAD_ID,
                 cursor: newest.next_cursor,
                 limit: Some(5),
             })
@@ -10349,6 +8546,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(500),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("bounded thread page");
         assert_eq!(first_threads.threads.len(), 100);
@@ -10359,6 +8558,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: first_threads.next_cursor,
                 limit: Some(500),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("thread continuation");
         assert!(first_threads.threads.iter().all(|left| second_threads
@@ -10437,6 +8638,8 @@ mod tests {
                 view: Some("inbox".into()),
                 cursor: Some("bad".into()),
                 limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             }),
             Err(StoreError::Validation(_))
         ));
@@ -10455,6 +8658,8 @@ mod tests {
                     view: Some("inbox".into()),
                     cursor: Some(cursor.into()),
                     limit: Some(50),
+                    hidden_account_ids: Vec::new(),
+                    container_id: None,
                 }),
                 Err(StoreError::Validation(_))
             ));
@@ -10470,46 +8675,129 @@ mod tests {
     }
 
     #[test]
+    fn the_seeded_inbox_is_four_written_conversations_and_no_filler() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("seed.db");
+        let store = MuxStore::open(&path, true).expect("seeded store");
+        let inbox = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("inbox".into()),
+                cursor: None,
+                limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
+            })
+            .expect("inbox page");
+        assert_eq!(
+            inbox
+                .threads
+                .iter()
+                .map(|thread| thread.subject.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "draft 3 — the methods section reads better now",
+                "your wheel is ready",
+                "leftovers",
+                "radiator service — Thursday between 9 and 12",
+            ]
+        );
+
+        // Bodies are written, not generated from the subject. These are the
+        // phrasings the old templated seed could never have produced.
+        let bodies: String = (1..=4)
+            .flat_map(|thread_id| {
+                store
+                    .get_thread_messages(MessagePageInput {
+                        thread_id,
+                        cursor: None,
+                        limit: Some(50),
+                    })
+                    .expect("thread messages")
+                    .messages
+                    .into_iter()
+                    .map(|message| message.body_text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bodies.contains("the second cohort is n=14"));
+        assert!(bodies.contains("your name on it in sharpie"));
+        assert!(bodies.contains("$137.00"));
+        for filler in [
+            "Let me know what you think when you have a chance",
+            "I took a look and added my notes",
+            "Update 1 on",
+        ] {
+            assert!(
+                !bodies.contains(filler),
+                "templated filler returned: {filler}"
+            );
+        }
+
+        // The shop message references images it declines to fetch.
+        let shop = store
+            .get_thread_messages(MessagePageInput {
+                thread_id: 2,
+                cursor: None,
+                limit: Some(10),
+            })
+            .expect("shop thread");
+        assert_eq!(shop.messages[0].blocked_remote_resources, 2);
+        assert_eq!(shop.messages[0].remote_images.len(), 2);
+        assert!(shop.messages[0].body_html.contains("mux-remote-image"));
+        // The radiator notice arrives as plain text only.
+        let plain = store
+            .get_thread_messages(MessagePageInput {
+                thread_id: 4,
+                cursor: None,
+                limit: Some(10),
+            })
+            .expect("radiator thread");
+        assert!(plain.messages[0].body_html.is_empty());
+    }
+
+    #[test]
     fn native_search_supports_fields_scope_and_stable_cursors() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("search.db");
         let store = MuxStore::open(&path, true).expect("seeded store opens");
         let result = store
             .search_threads(SearchInput {
-                query: "subject:architecture (from:sarah OR from:kevin)".into(),
+                query: "subject:draft (from:tomas OR from:priya)".into(),
                 account_id: Some("acc_work".into()),
                 view: Some("inbox".into()),
                 cursor: None,
                 limit: Some(10),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("fielded search");
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].id, 4);
+        assert_eq!(result.rows[0].id, 1);
         let scoped = store
             .get_thread_summary(ThreadLookupInput {
-                thread_id: 4,
+                thread_id: 1,
                 account_id: Some("acc_work".into()),
                 view: Some("inbox".into()),
-                query: Some("subject:architecture from:sarah".into()),
+                query: Some("subject:draft from:tomas".into()),
                 timezone_offset_minutes: 0,
             })
             .expect("scoped thread lookup")
             .expect("matching thread");
-        assert_eq!(scoped.id, 4);
+        assert_eq!(scoped.id, 1);
         assert!(store
             .get_thread_summary(ThreadLookupInput {
-                thread_id: 4,
+                thread_id: 1,
                 account_id: Some("acc_personal".into()),
                 view: Some("inbox".into()),
-                query: Some("subject:architecture".into()),
+                query: Some("subject:draft".into()),
                 timezone_offset_minutes: 0,
             })
             .expect("wrong-account lookup")
             .is_none());
         assert!(store
             .get_thread_summary(ThreadLookupInput {
-                thread_id: 4,
+                thread_id: 1,
                 account_id: Some("acc_work".into()),
                 view: Some("inbox".into()),
                 query: Some("subject:does-not-match".into()),
@@ -10521,7 +8809,7 @@ mod tests {
         store
             .connection
             .execute(
-                "UPDATE messages SET cc_recipients = 'planning@acme.example' WHERE thread_id = 4 AND id = (SELECT MIN(id) FROM messages WHERE thread_id = 4)",
+                "UPDATE messages SET cc_recipients = 'planning@acme.example' WHERE thread_id = 1 AND id = (SELECT MIN(id) FROM messages WHERE thread_id = 1)",
                 [],
             )
             .unwrap();
@@ -10533,11 +8821,12 @@ mod tests {
                 cursor: None,
                 limit: Some(10),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("Cc search");
         assert_eq!(
             cc_result.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            vec![4]
+            vec![1]
         );
 
         let first = store
@@ -10548,6 +8837,7 @@ mod tests {
                 cursor: None,
                 limit: Some(3),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("first page");
         assert!(first.has_more);
@@ -10559,6 +8849,7 @@ mod tests {
                 cursor: first.next_cursor,
                 limit: Some(3),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("second page");
         assert!(first
@@ -10585,10 +8876,112 @@ mod tests {
                     cursor,
                     limit: Some(10),
                     timezone_offset_minutes: 0,
+                    hidden_account_ids: Vec::new(),
                 })
                 .expect_err("invalid search must fail");
             assert!(matches!(error, StoreError::Validation(_)));
         }
+    }
+
+    #[test]
+    fn hidden_accounts_leave_the_listing_without_touching_their_mail() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("hidden-accounts.db");
+        let store = MuxStore::open(&path, true).expect("seeded store opens");
+
+        let all = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
+            })
+            .expect("unfiltered listing");
+        let hidden_account = all
+            .threads
+            .first()
+            .map(|thread| thread.account_id.clone())
+            .expect("seeded thread");
+        let expected = all
+            .threads
+            .iter()
+            .filter(|thread| thread.account_id != hidden_account)
+            .count();
+
+        let filtered = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: vec![hidden_account.clone()],
+                container_id: None,
+            })
+            .expect("filtered listing");
+        assert_eq!(filtered.threads.len(), expected);
+        assert!(filtered
+            .threads
+            .iter()
+            .all(|thread| thread.account_id != hidden_account));
+        assert!(expected < all.threads.len(), "fixture must hide something");
+
+        // Search honours the same visibility.
+        let searched = store
+            .search_threads(SearchInput {
+                query: "is:unread".into(),
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                timezone_offset_minutes: 0,
+                hidden_account_ids: vec![hidden_account.clone()],
+            })
+            .expect("filtered search");
+        assert!(searched
+            .rows
+            .iter()
+            .all(|thread| thread.account_id != hidden_account));
+
+        // Hiding is a view filter only: the mail itself is untouched.
+        let threads: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE account_id = ?1",
+                [&hidden_account],
+                |row| row.get(0),
+            )
+            .expect("hidden account rows");
+        assert!(threads > 0, "hidden account keeps its threads");
+
+        // Duplicates and order must not change the accepted set.
+        let repeated = store
+            .list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: vec![hidden_account.clone(), hidden_account.clone()],
+                container_id: None,
+            })
+            .expect("duplicate hidden ids");
+        assert_eq!(repeated.threads.len(), expected);
+
+        let too_many = (0..(MAX_HIDDEN_ACCOUNTS + 1))
+            .map(|index| format!("acc_{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.list_threads(ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(100),
+                hidden_account_ids: too_many,
+                container_id: None,
+            }),
+            Err(StoreError::Validation(_))
+        ));
     }
 
     #[test]
@@ -10602,6 +8995,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("first page");
         let cursor = first.next_cursor.expect("continuation cursor");
@@ -10613,12 +9008,24 @@ mod tests {
                 view: Some("inbox".into()),
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             },
             ThreadPageInput {
                 account_id: Some("acc_work".into()),
                 view: Some("all".into()),
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
+            },
+            ThreadPageInput {
+                account_id: None,
+                view: Some("all".into()),
+                cursor: Some(cursor.clone()),
+                limit: Some(2),
+                hidden_account_ids: vec!["acc_personal".into()],
+                container_id: None,
             },
         ] {
             assert!(matches!(
@@ -10634,6 +9041,7 @@ mod tests {
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Search cursor is invalid"
         ));
@@ -10647,6 +9055,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: Some(String::from_utf8(tampered).unwrap()),
                 limit: Some(2),
+        hidden_account_ids: Vec::new(),
+        container_id: None,
             }),
             Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
         ));
@@ -10664,6 +9074,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: Some(cursor),
                 limit: Some(2),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .expect("persistently signed cursor continues");
         assert!(second
@@ -10679,6 +9091,7 @@ mod tests {
                 cursor: None,
                 limit: Some(2),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .expect("search page");
         let search_cursor = search.next_cursor.expect("search continuation");
@@ -10691,6 +9104,7 @@ mod tests {
                 cursor: Some(search_cursor),
                 limit: Some(2),
                 timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Search cursor is invalid"
         ));
@@ -10744,6 +9158,8 @@ mod tests {
                     view: Some("all".into()),
                     cursor: None,
                     limit: Some(1),
+                    hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap()
         };
@@ -10763,14 +9179,16 @@ mod tests {
             (literal_star.next_cursor, Some(" acc_work ")),
         ] {
             assert!(matches!(
-                store.list_threads(ThreadPageInput {
-                    account_id: account_id.map(str::to_string),
-                    view: Some("all".into()),
-                    cursor,
-                    limit: Some(1),
-                }),
-                Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
-            ));
+                    store.list_threads(ThreadPageInput {
+                        account_id: account_id.map(str::to_string),
+                        view: Some("all".into()),
+                        cursor,
+                        limit: Some(1),
+            hidden_account_ids: Vec::new(),
+            container_id: None,
+                    }),
+                    Err(StoreError::Validation(ref message)) if message == "Thread cursor is invalid"
+                ));
         }
 
         let star_search = store
@@ -10781,6 +9199,7 @@ mod tests {
                 cursor: None,
                 limit: Some(1),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .unwrap();
         assert_eq!(star_search.rows[0].account_id, "*");
@@ -10792,6 +9211,7 @@ mod tests {
                 cursor: star_search.next_cursor,
                 limit: Some(1),
                 timezone_offset_minutes: 0,
+        hidden_account_ids: Vec::new(),
             }),
             Err(StoreError::Validation(ref message)) if message == "Search cursor is invalid"
         ));
@@ -10822,6 +9242,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(1),
+        hidden_account_ids: Vec::new(),
+        container_id: None,
             }),
             Err(StoreError::Validation(ref message))
                 if message == "accountId must not be empty when present"
@@ -10894,6 +9316,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(100),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .unwrap();
         let mut seen = first
@@ -10936,6 +9360,8 @@ mod tests {
                     view: Some("all".into()),
                     cursor: Some(next),
                     limit: Some(100),
+                    hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap();
             for thread in page.threads {
@@ -10970,6 +9396,7 @@ mod tests {
                     cursor: search_cursor,
                     limit: Some(100),
                     timezone_offset_minutes: 0,
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap();
             for thread in page.rows {
@@ -12193,6 +10620,8 @@ mod tests {
                 view: Some("all".into()),
                 cursor: None,
                 limit: Some(10),
+                hidden_account_ids: Vec::new(),
+                container_id: None,
             })
             .unwrap()
             .threads
@@ -12204,6 +10633,8 @@ mod tests {
                     view: Some("trash".into()),
                     cursor: None,
                     limit: Some(10),
+                    hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap()
                 .threads
@@ -12491,7 +10922,7 @@ mod tests {
         let before = store.bootstrap().unwrap().view_counts.remove(0);
         assert_eq!(
             (before.inbox, before.archive, before.all, before.snoozed),
-            (12, 0, 12, 0)
+            (4, 1, 5, 0)
         );
 
         let wake_at = now_ms() + 86_400_000;
@@ -12502,7 +10933,7 @@ mod tests {
         let counts = store.bootstrap().unwrap().view_counts.remove(0);
         assert_eq!(
             (counts.inbox, counts.archive, counts.all, counts.snoozed),
-            (10, 1, 12, 1)
+            (2, 2, 5, 1)
         );
 
         let page = |store: &MuxStore, view: &str| {
@@ -12512,6 +10943,8 @@ mod tests {
                     view: Some(view.into()),
                     cursor: None,
                     limit: Some(100),
+                    hidden_account_ids: Vec::new(),
+                    container_id: None,
                 })
                 .unwrap()
                 .threads
@@ -12521,8 +10954,9 @@ mod tests {
         };
         assert!(!page(&store, "inbox").contains(&1));
         assert_eq!(page(&store, "snoozed"), vec![1]);
-        assert_eq!(page(&store, "archive"), vec![2]);
-        assert_eq!(page(&store, "all").len(), 12);
+        // The fixture thread is out of the inbox, so it lands in archive too.
+        assert_eq!(page(&store, "archive"), vec![2, DEMO_FIXTURE_THREAD_ID]);
+        assert_eq!(page(&store, "all").len(), 5);
 
         let lookup = |store: &MuxStore, thread_id, view: &str| {
             store
@@ -12549,6 +10983,7 @@ mod tests {
                 cursor: None,
                 limit: Some(100),
                 timezone_offset_minutes: 0,
+                hidden_account_ids: Vec::new(),
             })
             .unwrap();
         assert_eq!(
@@ -12568,6 +11003,7 @@ mod tests {
                     cursor: None,
                     limit: Some(100),
                     timezone_offset_minutes: 0,
+                    hidden_account_ids: Vec::new(),
                 })
                 .unwrap();
             assert_eq!(
@@ -12594,7 +11030,7 @@ mod tests {
                 awakened.all,
                 awakened.snoozed
             ),
-            (11, 1, 12, 0)
+            (3, 2, 5, 0)
         );
     }
 
@@ -12605,13 +11041,13 @@ mod tests {
         let store = MuxStore::open(&path, true).expect("seeded store");
         let detail = store
             .get_thread_messages(MessagePageInput {
-                thread_id: 4,
+                thread_id: DEMO_FIXTURE_THREAD_ID,
                 cursor: None,
                 limit: Some(10),
             })
             .unwrap();
         let invitation = detail.invitation.expect("seeded invitation");
-        assert_eq!(invitation.thread_id, 4);
+        assert_eq!(invitation.thread_id, DEMO_FIXTURE_THREAD_ID);
         assert_eq!(invitation.uid, "mux-native-demo-invite");
         assert_eq!(invitation.title, "Mux architecture review");
         assert_eq!(invitation.response, "needsAction");
@@ -12669,8 +11105,12 @@ mod tests {
             0
         );
 
-        let first_rsvp = store.rsvp_thread(4, "accepted").unwrap();
-        let second_rsvp = store.rsvp_thread(4, "tentative").unwrap();
+        let first_rsvp = store
+            .rsvp_thread(DEMO_FIXTURE_THREAD_ID, "accepted")
+            .unwrap();
+        let second_rsvp = store
+            .rsvp_thread(DEMO_FIXTURE_THREAD_ID, "tentative")
+            .unwrap();
         assert!(matches!(
             store.undo_operation(&first_rsvp.id),
             Err(StoreError::Conflict(_))
@@ -12680,7 +11120,7 @@ mod tests {
             store
                 .connection
                 .query_row(
-                    "SELECT response FROM invitations WHERE thread_id = 4",
+                    "SELECT response FROM invitations WHERE thread_id = 5",
                     [],
                     |row| row.get::<_, String>(0)
                 )
@@ -12692,7 +11132,7 @@ mod tests {
             store
                 .connection
                 .query_row(
-                    "SELECT response FROM invitations WHERE thread_id = 4",
+                    "SELECT response FROM invitations WHERE thread_id = 5",
                     [],
                     |row| row.get::<_, String>(0)
                 )
@@ -12706,8 +11146,12 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("activity.db");
         let mut store = MuxStore::open(&path, true).expect("seeded store");
-        store.rsvp_thread(4, "accepted").unwrap();
-        store.rsvp_thread(4, "tentative").unwrap();
+        store
+            .rsvp_thread(DEMO_FIXTURE_THREAD_ID, "accepted")
+            .unwrap();
+        store
+            .rsvp_thread(DEMO_FIXTURE_THREAD_ID, "tentative")
+            .unwrap();
         let one = store
             .list_operations(ListOperationsInput { limit: Some(1) })
             .unwrap();
@@ -12816,6 +11260,160 @@ mod tests {
     }
 
     #[test]
+    fn full_resync_rewinds_cursors_without_removing_anything() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("full-resync.db");
+        let mut store = MuxStore::open(&path, false).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO accounts(id, name, email, color, provider)
+             VALUES('acct', 'acct', 'a@example.test', '#000', 'fake')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO threads(id, account_id, subject, participants, snippet, latest_at,
+               message_count, remote_in_inbox, remote_unread, remote_starred, has_attachment,
+               has_invite, has_link, has_from_me)
+             VALUES(7, 'acct', '', '', '', 1, 1, 1, 0, 0, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(id, thread_id, sender_name, sender_email, recipients,
+               sent_at, body_text, is_from_me) VALUES(7, 7, '', 's@example.test', '', 1, '', 0)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO snoozes(thread_id, wake_at, created_at) VALUES(7, 99, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO drafts(id, account_id, reply_to_thread_id, recipients, subject, body,
+               body_html, updated_at, revision)
+             VALUES('draft-1', 'acct', 7, '', '', '', '', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO operations(id, thread_id, field, kind, state, created_at, not_before)
+             VALUES('op-live', 7, 'unread', 'set', 'pending', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO provider_accounts(account_id, provider_kind, remote_account_id,
+               auth_state, created_at, updated_at)
+             VALUES('acct', 'gmail', 'remote-acct', 'signed_out', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO provider_sync_cursors(account_id, scope, cursor, updated_at)
+             VALUES('acct', 'a:v1', '{\"phase\":\"history\"}', 1)",
+                [],
+            )
+            .unwrap();
+
+        let requested = store.request_full_resync().unwrap();
+        assert_eq!(requested.accounts_reset, 1);
+
+        let count = |sql: &str| -> i64 {
+            store
+                .connection
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        };
+        // Only the sync bookmark is rewound, so the next cycle re-enumerates everything.
+        assert_eq!(count("SELECT COUNT(*) FROM provider_sync_cursors"), 0);
+        // Every layer of durable state is still exactly where it was.
+        assert_eq!(count("SELECT COUNT(*) FROM threads"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM messages"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM snoozes"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM drafts"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM accounts"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM operations WHERE state = 'pending' AND thread_id = 7"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM drafts WHERE reply_to_thread_id = 7"),
+            1
+        );
+    }
+
+    #[test]
+    fn no_product_statement_can_empty_a_table_of_mail_intent_or_metadata() {
+        // A resync must never be able to become a wipe. Bulk deletion of anything a
+        // person owns is not vocabulary this app has; single-row deletes stay legal.
+        let sources = [
+            ("store.rs", include_str!("store.rs")),
+            ("store/demo.rs", include_str!("store/demo.rs")),
+            ("store/validation.rs", include_str!("store/validation.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("provider_ingest.rs", include_str!("provider_ingest.rs")),
+            (
+                "provider_conformance.rs",
+                include_str!("provider_conformance.rs"),
+            ),
+            ("gmail.rs", include_str!("gmail.rs")),
+            ("worker.rs", include_str!("worker.rs")),
+        ];
+        let owned = [
+            "threads",
+            "messages",
+            "attachments",
+            "drafts",
+            "operations",
+            "snoozes",
+            "invitations",
+            "accounts",
+            "message_remote_images",
+            "remote_content_sender_allowlist",
+            "remote_content_domain_allowlist",
+        ];
+        for (name, source) in sources {
+            // Tests build and tear down their own fixtures; only shipping code is bound.
+            let product = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for statement in product.split("DELETE FROM ").skip(1) {
+                let table = statement
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .find(|value| !value.is_empty())
+                    .unwrap_or_default();
+                if !owned.contains(&table) {
+                    continue;
+                }
+                let clause = statement
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                assert!(
+                    clause.contains("WHERE"),
+                    "{name} can empty {table} without a WHERE clause"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn remote_content_policies_are_persistent_exact_and_account_scoped() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("remote-content-policy.db");
@@ -12894,5 +11492,226 @@ mod tests {
         let reopened = MuxStore::open(&path, false).unwrap();
         assert!(reopened.remote_images_for_message(&message_a).unwrap()[0].allowed_by_policy);
         assert!(reopened.remote_images_for_message(&message_b).unwrap()[0].allowed_by_policy);
+    }
+
+    #[test]
+    fn account_folders_are_listed_with_counts_and_can_be_opened_on_their_own() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("folders.db");
+        let mut store = configured_provider_store(&path, &["acc-folders"]);
+        let batch: ProviderBatch = serde_json::from_value(serde_json::json!({
+            "muxAccountId": "acc-folders",
+            "batchId": "folder-batch",
+            "expectedPriorCursor": null,
+            "cursor": {
+                "muxAccountId": "acc-folders",
+                "scope": { "kind": "account" },
+                "value": "folder-cursor"
+            },
+            "observedAt": 1000,
+            "threadUpserts": [{
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteThreadId": "thread-in-label"
+                },
+                "subject": "Filed away",
+                "participants": "sender@example.com",
+                "snippet": "Filed under a label",
+                "latestAt": 900,
+                "messageCount": 1,
+                "inInbox": true,
+                "unread": true,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": false,
+                "category": "primary",
+                "revision": "thread-r1"
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteThreadId": "thread-unfiled"
+                },
+                "subject": "Not filed",
+                "participants": "other@example.com",
+                "snippet": "No label at all",
+                "latestAt": 800,
+                "messageCount": 1,
+                "inInbox": true,
+                "unread": false,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": false,
+                "category": "primary",
+                "revision": "thread-r2"
+            }],
+            "messageUpserts": [{
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteMessageId": "message-in-label",
+                    "remoteThreadId": "thread-in-label"
+                },
+                "subject": "Filed away",
+                "senderName": "Sender",
+                "senderEmail": "sender@example.com",
+                "recipients": "recipient@example.com",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 900,
+                "bodyText": "Filed under a label.",
+                "bodyState": "complete",
+                "isFromMe": false,
+                "revision": "message-r1",
+                "keywords": ["unread"]
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteMessageId": "message-unfiled",
+                    "remoteThreadId": "thread-unfiled"
+                },
+                "subject": "Not filed",
+                "senderName": "Other",
+                "senderEmail": "other@example.com",
+                "recipients": "recipient@example.com",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 800,
+                "bodyText": "No label at all.",
+                "bodyState": "complete",
+                "isFromMe": false,
+                "revision": "message-r2",
+                "keywords": []
+            }],
+            "containerUpserts": [{
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteContainerId": "inbox"
+                },
+                "displayName": "Inbox",
+                "kind": "mailbox",
+                "role": "inbox",
+                "parentRemoteContainerId": null,
+                "selectable": true
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteContainerId": "Label_17"
+                },
+                "displayName": "Zoomie Cycle",
+                "kind": "label",
+                // No role at all is what a label of the account's own making
+                // looks like on the wire; the store records it as "custom".
+                "role": null,
+                "parentRemoteContainerId": null,
+                "selectable": true
+            }, {
+                "identity": {
+                    "muxAccountId": "acc-folders",
+                    "remoteContainerId": "Label_hidden"
+                },
+                "displayName": "Not selectable",
+                "kind": "label",
+                "role": null,
+                "parentRemoteContainerId": null,
+                "selectable": false
+            }],
+            "membershipChanges": [{
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "acc-folders",
+                        "remoteMessageId": "message-in-label",
+                        "remoteThreadId": "thread-in-label"
+                    },
+                    "container": {
+                        "muxAccountId": "acc-folders",
+                        "remoteContainerId": "Label_17"
+                    }
+                }
+            }, {
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "acc-folders",
+                        "remoteMessageId": "message-unfiled",
+                        "remoteThreadId": "thread-unfiled"
+                    },
+                    "container": {
+                        "muxAccountId": "acc-folders",
+                        "remoteContainerId": "inbox"
+                    }
+                }
+            }],
+            "tombstones": []
+        }))
+        .expect("valid provider batch");
+        assert!(
+            store
+                .apply_provider_batch(batch)
+                .expect("batch applies")
+                .applied
+        );
+
+        // Only the account's own folders: the roles the fixed views stand for
+        // are the sidebar's existing rows, and an unselectable label is not a
+        // place anyone can go.
+        let containers = store.list_containers().expect("containers list");
+        assert_eq!(
+            containers
+                .iter()
+                .map(|container| (container.remote_id.as_str(), container.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("Label_17", "Zoomie Cycle")]
+        );
+        assert_eq!((containers[0].total, containers[0].unread), (1, 1));
+        assert_eq!(containers[0].kind, "label");
+        assert_eq!(containers[0].role, "custom");
+
+        // Opening the folder lists exactly what is filed in it.
+        let filed = store
+            .list_threads(ThreadPageInput {
+                account_id: Some("acc-folders".into()),
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: Some("Label_17".into()),
+            })
+            .expect("folder page");
+        assert_eq!(
+            filed
+                .threads
+                .iter()
+                .map(|thread| thread.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["Filed away"]
+        );
+
+        // And a folder nothing is filed in is empty rather than everything.
+        let empty = store
+            .list_threads(ThreadPageInput {
+                account_id: Some("acc-folders".into()),
+                view: Some("all".into()),
+                cursor: None,
+                limit: Some(50),
+                hidden_account_ids: Vec::new(),
+                container_id: Some("Label_hidden".into()),
+            })
+            .expect("empty folder page");
+        assert!(empty.threads.is_empty());
+
+        // A folder belongs to one account, so it cannot be listed across all.
+        let unscoped = store.list_threads(ThreadPageInput {
+            account_id: None,
+            view: Some("all".into()),
+            cursor: None,
+            limit: Some(50),
+            hidden_account_ids: Vec::new(),
+            container_id: Some("Label_17".into()),
+        });
+        assert!(matches!(unscoped, Err(StoreError::Validation(_))));
     }
 }

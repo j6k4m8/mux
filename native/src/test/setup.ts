@@ -40,6 +40,37 @@ Object.defineProperty(window, 'matchMedia', {
   })
 });
 
+/// jsdom has no Web Animations API, which is what Svelte drives list
+/// transitions with. The stub finishes at once, so tests see the settled DOM
+/// rather than a frame mid-slide.
+Object.defineProperty(Element.prototype, 'animate', {
+  configurable: true,
+  writable: true,
+  value: () => {
+    const animation = {
+      currentTime: 0,
+      playState: 'finished',
+      finished: Promise.resolve(),
+      onfinish: null as null | (() => void),
+      cancel: () => {},
+      finish: () => {},
+      pause: () => {},
+      play: () => {},
+      reverse: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {}
+    };
+    queueMicrotask(() => animation.onfinish?.());
+    return animation;
+  }
+});
+
+Object.defineProperty(Element.prototype, 'getAnimations', {
+  configurable: true,
+  writable: true,
+  value: () => []
+});
+
 Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
   configurable: true,
   writable: true,

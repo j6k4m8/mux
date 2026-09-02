@@ -6,6 +6,12 @@ export type AccountSummary = {
   signature: string;
   unread: number;
   total: number;
+  refreshSeconds: number;
+  /// When a sync last finished, and how it went. Null for an account with no
+  /// provider attached, which is every account in a local-only mailbox.
+  lastSyncAt?: number | null;
+  syncState?: string | null;
+  lastErrorCode?: string | null;
 };
 
 export type ThreadSummary = {
@@ -160,6 +166,20 @@ export type MailboxBootstrap = {
   accounts: AccountSummary[];
   viewCounts: ViewCountSummary[];
   drafts: DraftHeaderSummary[];
+  containers: ContainerSummary[];
+};
+
+/// One of an account's own folders or labels — everything the eight fixed
+/// views do not already stand for. `remoteId` is opaque: the mailbox shows the
+/// name, passes the id back, and never reads anything into it.
+export type ContainerSummary = {
+  accountId: string;
+  remoteId: string;
+  name: string;
+  kind: 'folder' | 'label';
+  role: string;
+  unread: number;
+  total: number;
 };
 
 export type ThreadPageInput = {
@@ -167,6 +187,10 @@ export type ThreadPageInput = {
   view: 'all' | 'inbox' | 'archive' | 'starred' | 'snoozed' | 'sent' | 'trash';
   cursor: string | null;
   limit: number;
+  hiddenAccountIds: string[];
+  /// One of the account's own folders, named by the opaque remote id the
+  /// mailbox was handed. Only meaningful with the account it belongs to.
+  containerId?: string | null;
 };
 
 export type ThreadPage = {
@@ -204,6 +228,7 @@ export type SearchInput = {
   cursor: string | null;
   limit: number;
   timezoneOffsetMinutes: number;
+  hiddenAccountIds: string[];
 };
 
 export type SearchPage = {
@@ -211,3 +236,11 @@ export type SearchPage = {
   hasMore: boolean;
   nextCursor: string | null;
 };
+
+/// Re-exported so the components that only need the resolved theme keep one
+/// import; theme.ts owns what it means and how it is chosen.
+export type { Theme } from './theme';
+export type SettingsSection = 'accounts' | 'appearance' | 'mail' | 'shortcuts';
+
+export type MailboxView = 'all' | 'inbox' | 'archive' | 'starred' | 'snoozed' | 'sent' | 'trash' | 'drafts';
+export type SmartView = '' | 'unread' | 'attachments' | 'invitations' | 'finance';

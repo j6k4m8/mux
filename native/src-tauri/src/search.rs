@@ -390,6 +390,7 @@ fn compile_field(
             "inbox" => Ok("e.in_inbox = 1".into()),
             "archive" => Ok("e.in_inbox = 0".into()),
             "sent" => Ok("e.has_from_me = 1".into()),
+            "trash" => Ok("e.trashed = 1".into()),
             "all" => Ok("1 = 1".into()),
             "snoozed" => {
                 parameters.push(Value::Integer(now_ms));
@@ -765,6 +766,13 @@ mod tests {
             compile_search("has:calendar", 42).unwrap().clause,
             "e.has_invite = 1"
         );
+        // Trash is a flag rather than a folder, but the search box has to be
+        // able to say it: the mailbox scopes a search by putting the view's own
+        // term in the query, and Trash is one of the views.
+        assert_eq!(
+            compile_search("in:trash", 42).unwrap().clause,
+            "e.trashed = 1"
+        );
         for query in ["is:snoozed", "in:snoozed"] {
             let compiled = compile_search(query, 42).unwrap();
             assert_eq!(compiled.clause, "s.wake_at > ?");
@@ -790,7 +798,7 @@ mod tests {
         assert!(compile_search("has:image", 0)
             .unwrap_err()
             .contains("Unsupported has: value"));
-        assert!(compile_search("in:trash", 0)
+        assert!(compile_search("in:spam", 0)
             .unwrap_err()
             .contains("Unsupported in: value"));
         assert!(compile_search("before:someday", 0)

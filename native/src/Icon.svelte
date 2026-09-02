@@ -1,5 +1,6 @@
 <script lang="ts">
   export let name:
+    | 'settings'
     | 'search'
     | 'compose'
     | 'inbox'
@@ -21,7 +22,9 @@
     | 'command'
     | 'moon'
     | 'sun'
-    | 'chevron';
+    | 'chevron'
+    | 'sync'
+    | 'stats';
   export let size = 18;
   export let filled = false;
 </script>
@@ -38,7 +41,10 @@
   aria-hidden="true"
   focusable="false"
 >
-  {#if name === 'search'}
+  {#if name === 'settings'}
+    <circle cx="12" cy="12" r="3.2" />
+    <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1Z" />
+  {:else if name === 'search'}
     <path d="m21 21-4.35-4.35" />
     <circle cx="11.5" cy="11.5" r="7.5" />
   {:else if name === 'compose'}
@@ -84,6 +90,14 @@
     <path d="M9 7V5a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v14a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V7Z" />
   {:else if name === 'moon'}
     <path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z" />
+  {:else if name === 'sync'}
+    <path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-8.06-5" />
+    <path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 8.06 5" />
+    <path d="M21 4v4h-4M3 20v-4h4" />
+  {:else if name === 'stats'}
+    <path d="M4 20V4" />
+    <path d="M4 20h16" />
+    <path d="M8 20v-6m4 6V8m4 12v-9" />
   {:else if name === 'sun'}
     <circle cx="12" cy="12" r="4" />
     <path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" />

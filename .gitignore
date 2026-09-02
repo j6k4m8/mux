@@ -8,3 +8,6 @@ data/*.db-wal
 __pycache__/
 *.pyc
 .DS_Store
+.env
+# Local Google OAuth client registration. Never committed.
+gclient/

@@ -19,7 +19,8 @@ const account: AccountSummary = {
   color: '#5168f4',
   signature: '',
   unread: 0,
-  total: 50_000
+  total: 50_000,
+  refreshSeconds: 60
 };
 
 function message(id: number, threadId = 1): MessageSummary {
@@ -75,7 +76,7 @@ describe('native rendering responsiveness', () => {
     expect(firstCollapsed?.textContent).not.toContain('sender@example.test');
     expect(firstCollapsed?.querySelector('.collapsed-heading strong')?.textContent).toBe('External Sender');
     expect(firstCollapsed?.querySelector('.collapsed-heading time')).toBeTruthy();
-    expect(firstCollapsed?.querySelector('.collapsed-preview')?.textContent).toBe('Bounded message 1');
+    expect(firstCollapsed?.querySelector('.collapsed-preview')?.textContent?.trim()).toBe('Bounded message 1');
   });
 
   test('renders at most 120 rows from 50,000 loaded threads without changing reader selection', async () => {
@@ -86,11 +87,11 @@ describe('native rendering responsiveness', () => {
       viewCounts: [
         { accountId: null, inbox: 50_000, archive: 0, starred: 0, sent: 0, all: 50_000, snoozed: 0, trash: 0 }
       ],
-      drafts: []
+      drafts: [],
+      containers: []
     };
     const listInputs: Array<{ cursor: string | null; limit: number }> = [];
     mockIPC((command, payload) => {
-      if (command === 'vault_status') return { state: 'absent' };
       if (command === 'mailbox_bootstrap') return mailbox;
       if (command === 'list_threads') {
         const input = (payload as { input: { cursor: string | null; limit: number } }).input;
@@ -150,10 +151,10 @@ describe('native rendering responsiveness', () => {
       viewCounts: [
         { accountId: null, inbox: 1, archive: 0, starred: 0, sent: 0, all: 1, snoozed: 0, trash: 0 }
       ],
-      drafts: []
+      drafts: [],
+      containers: []
     };
     mockIPC((command) => {
-      if (command === 'vault_status') return { state: 'absent' };
       if (command === 'mailbox_bootstrap') return mailbox;
       if (command === 'list_threads') {
         return { threads: [thread(1)], hasMore: false, nextCursor: null } satisfies ThreadPage;

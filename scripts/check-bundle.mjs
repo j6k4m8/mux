@@ -50,14 +50,23 @@ const signatureDetails = spawnSync(
   { encoding: 'utf8' }
 );
 const signatureOutput = `${signatureDetails.stdout || ''}\n${signatureDetails.stderr || ''}`;
-if (
-  signatureDetails.status !== 0 ||
-  !signatureOutput.includes('Signature=adhoc') ||
-  !/flags=.*\badhoc\b/u.test(signatureOutput)
-) {
-  console.error('Mux.app is validly signed, but not with the required explicit ad-hoc identity.');
+// Keychain items are bound to the identity that created them, so the bundle
+// needs a stable signature rather than an ad-hoc one that changes per build. A
+// development certificate gives that; Developer ID would claim a distribution
+// path this project has not earned.
+const adHoc = signatureOutput.includes('Signature=adhoc')
+  && /flags=.*\badhoc\b/u.test(signatureOutput);
+const development = /Authority=Apple Development: /u.test(signatureOutput);
+if (signatureDetails.status !== 0 || !(adHoc || development)) {
+  console.error('Mux.app must be ad-hoc signed or signed with an Apple Development certificate.');
+  process.stderr.write(signatureOutput);
+  process.exit(1);
+}
+if (/Authority=Developer ID/u.test(signatureOutput)) {
+  console.error('Mux.app must not claim Developer ID distribution or notarization.');
   process.stderr.write(signatureOutput);
   process.exit(1);
 }
 
-console.log('Checked Mux.app: one executable, mux-native, matches Info.plist, explicit ad-hoc signature verified.');
+const identity = adHoc ? 'ad-hoc' : 'Apple Development';
+console.log(`Checked Mux.app: one executable, mux-native, matches Info.plist, ${identity} signature verified.`);
