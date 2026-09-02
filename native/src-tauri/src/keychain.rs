@@ -58,10 +58,16 @@ impl CredentialStore {
     #[cfg(test)]
     pub(crate) fn temporary(path: &Path) -> Self {
         use security_framework::os::macos::keychain::CreateOptions;
+        // This keychain is thrown away with the test's temporary directory and
+        // is only ever reached through the handle below, so its password
+        // protects nothing. It is derived rather than written down because a
+        // password literal in source is indistinguishable from a real
+        // credential to anything scanning for them.
+        let throwaway = format!("mux-test-{}", path.display());
         Self {
             service: SERVICE.to_owned(),
             keychain: CreateOptions::new()
-                .password("mux-test-keychain")
+                .password(&throwaway)
                 .create(path)
                 .expect("temporary keychain"),
         }
