@@ -45,11 +45,10 @@ export function failureNotice(cause: unknown, now: number = Date.now()): Notice 
 
 /// Work that can be taken back. `deadline` is the moment undo stops being
 /// offered — the window before a change is pushed, or a queued send's own
-/// not-before. Leave it out when undo stays good until something supersedes it,
-/// which is how the local snooze and invitation journals behave; the toast then
-/// waits, because hiding it would take the only Undo button with it.
-export function undoableNotice(text: string, operationId: string, deadline?: number): Notice {
-  return deadline === undefined ? { text, operationId } : { text, operationId, until: deadline };
+/// not-before — and it is not optional: a toast with no deadline never leaves,
+/// and one that never leaves is worse than a short window to undo in.
+export function undoableNotice(text: string, operationId: string, deadline: number): Notice {
+  return { text, operationId, until: deadline };
 }
 
 export function undoDeadline(now: number = Date.now()): number {

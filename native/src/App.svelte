@@ -1179,7 +1179,7 @@
     closeSnoozeDialog();
     try {
       const operation = await invoke<OperationSummary>('snooze_thread', { threadId, wakeAt });
-      notice = undoableNotice('Conversation snoozed', operation.id);
+      notice = undoableNotice('Conversation snoozed', operation.id, undoDeadline());
       await queueMailboxRefresh();
     } catch (cause) {
       notice = failureNotice(cause);
@@ -1191,7 +1191,7 @@
     if (!threadId || !selectedInvitation) return;
     try {
       const operation = await invoke<OperationSummary>('rsvp_thread', { threadId, response });
-      notice = undoableNotice('Invitation response updated', operation.id);
+      notice = undoableNotice('Invitation response updated', operation.id, undoDeadline());
       await queueMailboxRefresh();
     } catch (cause) {
       notice = failureNotice(cause);

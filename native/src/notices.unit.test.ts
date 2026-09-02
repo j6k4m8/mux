@@ -40,12 +40,13 @@ test('undoable work expires only when its undo does', () => {
   assert.ok(!noticeExpired(pushed, now + UNDO_MS - 1));
   assert.ok(noticeExpired(pushed, now + UNDO_MS));
 
-  // Local journals stay undoable until something supersedes them, so hiding
-  // the toast would take away the only Undo button there is.
-  const local = undoableNotice('Conversation snoozed', 'op_2');
-  assert.equal(local.until, undefined);
-  assert.ok(!noticeExpired(local, now + 60 * 60 * 1_000));
-  assert.ok(noticeOffersUndo(local, now + 60 * 60 * 1_000));
+  // Every undoable toast carries a deadline. A local journal entry stays
+  // undoable long after its toast has gone, but the toast still goes: one that
+  // waits forever is worse than a short window to press Undo in.
+  const local = undoableNotice('Conversation snoozed', 'op_2', undoDeadline(now));
+  assert.equal(local.until, now + UNDO_MS);
+  assert.ok(noticeExpired(local, now + 60 * 60 * 1_000));
+  assert.ok(!noticeOffersUndo(local, now + 60 * 60 * 1_000));
 });
 
 test('the undo button is offered exactly while the undo is still good', () => {
