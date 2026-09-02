@@ -3,6 +3,8 @@
   import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
   import { animationChoices } from './motion';
+  import { themeChoices } from './theme';
+  import type { ThemePreference } from './theme';
   import { shortcutCatalog, shortcutChips, visibleBindings } from './shortcuts';
   import {
     densityChoices,
@@ -20,10 +22,11 @@
   export let mailbox: MailboxBootstrap;
   export let appearance: Appearance;
   export let theme: Theme;
+  export let themePreference: ThemePreference;
   /// Applying appearance and theme stays with the application: both reach the
   /// document root, which this screen does not own.
   export let applyAppearance: (next: Appearance, persist?: boolean) => void;
-  export let setTheme: (next: Theme, persist?: boolean) => void;
+  export let setTheme: (next: ThemePreference, persist?: boolean) => void;
   /// Several of these settings change what the mailbox should show.
   export let refreshMailbox: () => Promise<void>;
   export let close: () => void;
@@ -252,13 +255,23 @@
         </header>
         <section class="settings-card">
           <h3>Theme</h3>
-          <div class="settings-choice-row" role="group" aria-label="Theme">
-          <button class:is-active={theme === 'light'} type="button" data-action="theme-light" title="Use the light appearance" on:click={() => setTheme('light')}>
-            <span aria-hidden="true"><Icon name="sun" size={16} /></span>Light
-          </button>
-            <button class:is-active={theme === 'dark'} type="button" data-action="theme-dark" title="Use the dark appearance" on:click={() => setTheme('dark')}>
-              <span aria-hidden="true"><Icon name="moon" size={16} /></span>Dark
+          <div class="settings-choice-row" role="group" aria-label="Theme" data-testid="theme-choice">
+          {#each themeChoices as choice}
+            <button
+              class:is-active={themePreference === choice.value}
+              type="button"
+              data-action={`theme-${choice.value}`}
+              data-theme-option={choice.value}
+              title={choice.value === 'system'
+                ? `Follow this Mac's appearance — ${theme} right now`
+                : `Use the ${choice.label.toLocaleLowerCase()} appearance`}
+              on:click={() => setTheme(choice.value)}
+            >
+              {#if choice.value !== 'system'}
+                <span aria-hidden="true"><Icon name={choice.value === 'light' ? 'sun' : 'moon'} size={16} /></span>
+              {/if}{choice.label}
             </button>
+          {/each}
           </div>
         </section>
 

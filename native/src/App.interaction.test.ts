@@ -621,11 +621,20 @@ describe('production mailbox interactions', () => {
     expect(calls.some((call) => call.command === 'mailbox_bootstrap')).toBe(true);
     expect(calls.some((call) => call.command === 'get_thread_messages')).toBe(true);
 
-    await user.click(screen.getByRole('button', { name: 'Switch to dark appearance' }));
+    // The theme lives with the other appearance choices rather than in the
+    // toolbar, and the stored value is the choice, not the resolved theme.
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+    const themeChoice = within(settings).getByTestId('theme-choice');
+    await user.click(within(themeChoice).getByRole('button', { name: /Dark/u }));
 
-    expect(shell.dataset.theme).toBe('dark');
     expect(document.documentElement.dataset.theme).toBe('dark');
     expect(window.localStorage.getItem('mux-theme')).toBe('dark');
+
+    await user.click(within(themeChoice).getByRole('button', { name: 'System' }));
+    expect(window.localStorage.getItem('mux-theme')).toBe('system');
+    expect(document.documentElement.dataset.theme).toBe('light');
   });
 
   test('treats a real account ID named all separately from the unified account scope', async () => {

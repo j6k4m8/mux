@@ -34,6 +34,13 @@
   import { mailboxJumpRows } from './jumpDialog';
   import { moveDestinations } from './moveTargets';
   import { motionTiming, slideAway, slideReveal, toastMotion } from './motion';
+  import {
+    persistThemePreference,
+    readThemePreference,
+    resolveTheme,
+    watchSystemTheme
+  } from './theme';
+  import type { ThemePreference } from './theme';
   import { searchIsNarrowed, searchViewFor, viewScopeTerm } from './searchQuery';
   import {
     confirmationNotice,
@@ -92,6 +99,8 @@
 
   let mailbox: MailboxBootstrap | null = null;
   let theme: Theme = 'light';
+  let themePreference: ThemePreference = 'system';
+  const themeWatchers: Array<() => void> = [];
   let compactNavigation = false;
   let compactReader = false;
   let navigationOpen = false;
@@ -288,13 +297,9 @@
 
   onMount(() => {
     destroyed = false;
-    let savedTheme: string | null = null;
-    try {
-      savedTheme = window.localStorage.getItem('mux-theme');
-    } catch {
-      // A denied storage read should not stop the local mailbox from opening.
-    }
-    setTheme(savedTheme === 'dark' ? 'dark' : 'light', false);
+    setTheme(readThemePreference(), false);
+    const stopWatchingSystemTheme = watchSystemTheme(systemThemeChanged);
+    themeWatchers.push(stopWatchingSystemTheme);
     hiddenAccounts = readHiddenAccounts();
     applyAppearance(readSavedAppearance(), false);
     navigationMediaQuery = window.matchMedia('(max-width: 980px)');
@@ -311,6 +316,8 @@
 
   onDestroy(() => {
     destroyed = true;
+    for (const stop of themeWatchers) stop();
+    themeWatchers.length = 0;
     unlistenMailbox?.();
     unlistenMailbox = null;
     window.clearInterval(clockTimer);
@@ -325,15 +332,19 @@
     document.removeEventListener('visibilitychange', refreshWhenVisible);
   });
 
-  function setTheme(nextTheme: Theme, persist = true) {
-    theme = nextTheme;
-    document.documentElement.dataset.theme = nextTheme;
-    if (!persist) return;
-    try {
-      window.localStorage.setItem('mux-theme', nextTheme);
-    } catch {
-      // Theme persistence is optional; the selected appearance still applies.
-    }
+  function setTheme(next: ThemePreference, persist = true) {
+    themePreference = next;
+    theme = resolveTheme(next);
+    document.documentElement.dataset.theme = theme;
+    if (persist) persistThemePreference(next);
+  }
+
+  /// Following the system means the answer can change while Mux is open, and
+  /// only then: a chosen light or dark stays put.
+  function systemThemeChanged(prefersDark: boolean) {
+    if (themePreference !== 'system') return;
+    theme = prefersDark ? 'dark' : 'light';
+    document.documentElement.dataset.theme = theme;
   }
 
 
@@ -382,6 +393,8 @@
     notice = sampleNotice('Like this!');
   }
 
+  /// The palette's toggle answers the question it is asked — light or dark —
+  /// which means it stops following the system.
   function toggleTheme() {
     setTheme(theme === 'light' ? 'dark' : 'light');
   }
@@ -1691,6 +1704,7 @@
         {mailbox}
         {appearance}
         {theme}
+        {themePreference}
         {applyAppearance}
         {setTheme}
         refreshMailbox={() => refreshMailbox()}

@@ -232,7 +232,9 @@ export type SearchPage = {
   nextCursor: string | null;
 };
 
-export type Theme = 'light' | 'dark';
+/// Re-exported so the components that only need the resolved theme keep one
+/// import; theme.ts owns what it means and how it is chosen.
+export type { Theme } from './theme';
 export type SettingsSection = 'accounts' | 'appearance' | 'mail' | 'shortcuts';
 
 export type MailboxView = 'all' | 'inbox' | 'archive' | 'starred' | 'snoozed' | 'sent' | 'trash' | 'drafts';
