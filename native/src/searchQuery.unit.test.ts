@@ -1,7 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 
-import { activeWordAt, lexSearchQuery, searchSegments, searchSuggestions } from './searchQuery';
+import {
+  activeWordAt,
+  lexSearchQuery,
+  searchFields,
+  searchIsNarrowed,
+  searchSegments,
+  searchSuggestions,
+  searchTerms,
+  searchViewFor,
+  viewScopeTerm
+} from './searchQuery';
 
 const accounts = [
   { id: 'acc_work', name: 'Work', email: 'jordan@acme.example' },
@@ -110,4 +120,52 @@ test('operators complete too, and the list stays short enough to read', () => {
   const suggestions = searchSuggestions({ text: 'is:unread o', caret: 11, accounts });
   assert.equal(suggestions.find((suggestion) => suggestion.kind === 'operator')?.text, 'is:unread or ');
   assert.ok(searchSuggestions({ text: '', accounts, limit: 3 }).length <= 4);
+});
+
+test('each mailbox reads as a term the query language actually accepts', () => {
+  const scoped: Array<[string, string]> = [
+    ['inbox', 'in:inbox'],
+    ['archive', 'in:archive'],
+    ['sent', 'in:sent'],
+    ['snoozed', 'in:snoozed'],
+    ['trash', 'in:trash'],
+    ['starred', 'is:starred']
+  ];
+  for (const [view, term] of scoped) {
+    assert.equal(viewScopeTerm(view as never), term, view);
+    // Whatever the term is, it has to lex as a real field with a real value.
+    const [field] = searchTerms(term);
+    const known = searchFields.find((candidate) => candidate.name === field.field);
+    assert.ok(known, term);
+    assert.ok(known.values.includes(field.value), term);
+  }
+  // All mail is the whole account already, and drafts are not searchable.
+  assert.equal(viewScopeTerm('all' as never), '');
+  assert.equal(viewScopeTerm('drafts' as never), '');
+});
+
+test('field terms are read back out of the text, quotes and all', () => {
+  assert.deepEqual(searchTerms('in:Inbox from:"Alice Example" hello'), [
+    { field: 'in', value: 'inbox' },
+    { field: 'from', value: 'alice example' }
+  ]);
+  // A field with no value yet is not a term.
+  assert.deepEqual(searchTerms('in:'), []);
+});
+
+test('only a query asking for trash is run against trash', () => {
+  assert.equal(searchViewFor('in:inbox budget'), 'all');
+  assert.equal(searchViewFor('budget'), 'all');
+  assert.equal(searchViewFor(''), 'all');
+  assert.equal(searchViewFor('in:trash budget'), 'trash');
+  assert.equal(searchViewFor('IN:TRASH'), 'trash');
+});
+
+test('a box holding only the seeded scope has not narrowed anything', () => {
+  assert.equal(searchIsNarrowed('in:inbox', 'inbox' as never), false);
+  assert.equal(searchIsNarrowed('  in:inbox  ', 'inbox' as never), false);
+  assert.equal(searchIsNarrowed('in:inbox budget', 'inbox' as never), true);
+  // The same term in a different mailbox is a real narrowing.
+  assert.equal(searchIsNarrowed('in:inbox', 'archive' as never), true);
+  assert.equal(searchIsNarrowed('', 'inbox' as never), false);
 });

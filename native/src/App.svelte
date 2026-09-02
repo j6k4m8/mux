@@ -34,6 +34,7 @@
   import { mailboxJumpRows } from './jumpDialog';
   import { moveDestinations } from './moveTargets';
   import { motionTiming, slideAway, slideReveal, toastMotion } from './motion';
+  import { searchIsNarrowed, searchViewFor, viewScopeTerm } from './searchQuery';
   import {
     confirmationNotice,
     failureNotice,
@@ -188,7 +189,11 @@
   let settingsScreen: SettingsScreen | undefined;
   let blockingDialogOpen = false;
 
-  $: visibleThreads = filter.trim() ? searchRows : threads;
+  /// The term that says which mailbox a search covers. It is seeded into the
+  /// box so the reader can see the scope — and delete it to widen the search.
+  $: scopeTerm = viewScopeTerm(selectedView);
+  $: isSearching = searchIsNarrowed(filter, selectedView);
+  $: visibleThreads = isSearching ? searchRows : threads;
   $: visibleDrafts = (mailbox?.drafts ?? []).filter((draft) => {
     if (selectedAccount !== null && draft.accountId !== selectedAccount) return false;
     if (hiddenAccounts.includes(draft.accountId)) return false;
@@ -606,9 +611,9 @@
       if (selectedView === 'drafts') {
         clearThreadPage();
       } else {
-        await loadThreads(false, initial, !filter.trim(), threadWindowSize, messageWindowSize);
+        await loadThreads(false, initial, !isSearching, threadWindowSize, messageWindowSize);
         if (request !== bootstrapRequest) return;
-        if (filter.trim()) await runSearch(false, searchWindowSize, messageWindowSize);
+        if (isSearching) await runSearch(false, searchWindowSize, messageWindowSize);
       }
     } catch (cause) {
       if (request !== bootstrapRequest) return;
@@ -872,7 +877,7 @@
     window.clearTimeout(searchTimer);
     searchRequest += 1;
     searchError = '';
-    if (!filter.trim() || selectedView === 'drafts') {
+    if (!searchIsNarrowed(filter, selectedView) || selectedView === 'drafts') {
       resetSearch();
       restoreThreadSelection();
       return;
@@ -885,8 +890,11 @@
   }
 
   async function runSearch(append: boolean, minimumRows = 50, detailMinimumRows = 50) {
-    if (!filter.trim() || selectedView === 'drafts') return;
-    const view = selectedView;
+    if (!searchIsNarrowed(filter, selectedView) || selectedView === 'drafts') return;
+    // The query carries its own scope now, so the search covers the account and
+    // the terms in the box do the narrowing. Trash is the one mailbox "all"
+    // leaves out, so a query asking for it is run against trash instead.
+    const view = searchViewFor(filter);
     const request = ++searchRequest;
     searching = true;
     searchError = '';
@@ -903,7 +911,7 @@
     const isCurrent = () => request === searchRequest
       && filter.trim() === input.query
       && selectedAccount === input.accountId
-      && selectedView === input.view;
+      && searchViewFor(filter) === input.view;
     try {
       const page = await collectPagedWindow({
         minimumRows: append ? searchRows.length + 50 : minimumRows,
@@ -1598,6 +1606,7 @@
       bind:value={filter}
       accounts={mailbox?.accounts ?? []}
       saved={savedSearches}
+      seed={scopeTerm}
       placeholder="Search mail or use from:, after:, is:…"
       hint={shortcutLabel('search')}
       oninput={filterChanged}
@@ -1677,7 +1686,7 @@
         <section class="thread-pane" aria-label={viewTitle}>
           <header class="pane-heading">
             <div><small>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.email}</small><h1>{filter ? `Search ${viewTitle.toLocaleLowerCase()}` : viewTitle}</h1></div>
-            <span>{searching ? 'Searching…' : `${filter.trim() && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
+            <span>{searching ? 'Searching…' : `${isSearching && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
           </header>
 
           <div class="thread-list" data-testid="thread-list">
@@ -1768,7 +1777,7 @@
                 </button>
                 </div>
               {:else}
-                {#if threadLoading && !filter.trim()}
+                {#if threadLoading && !isSearching}
                   <div class="empty search-state"><strong>Loading mailbox</strong><span>Reading the next local page.</span></div>
                 {:else if searching}
                   <div class="empty search-state"><strong>Searching mail</strong><span>Press Esc to clear.</span></div>
@@ -1784,9 +1793,9 @@
               {/if}
               {#if renderedThreadWindow.end < visibleThreads.length}
                 <button class="search-more" type="button" title="Load more" on:click={() => moveThreadRenderWindow(1)}>Show next loaded threads</button>
-              {:else if filter && searchHasMore && !searching}
+              {:else if isSearching && searchHasMore && !searching}
                 <button class="search-more" type="button" title="Load more" on:click={() => runSearch(true)}>Load 50 more results</button>
-              {:else if !filter.trim() && threadHasMore && !threadLoading}
+              {:else if !isSearching && threadHasMore && !threadLoading}
                 <button class="search-more" type="button" title="Load more" on:click={() => loadThreads(true)}>Load 50 more threads</button>
               {/if}
             {/if}

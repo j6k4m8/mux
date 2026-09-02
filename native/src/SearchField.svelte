@@ -8,6 +8,9 @@
   export let accounts: SuggestionAccount[] = [];
   export let saved: SavedSearch[] = [];
   export let placeholder = 'Search mail';
+  /// The scope an empty box starts with, so the mailbox being searched is
+  /// visible from the first keystroke and can be deleted to widen the search.
+  export let seed = '';
   export let label = 'Search mail';
   export let hint = '';
   export let oninput: () => void = () => {};
@@ -50,6 +53,25 @@
 
   function readCaret() {
     caret = input?.selectionStart ?? value.length;
+  }
+
+  /// Focusing or clicking into an empty box fills in the scope. The caret is
+  /// placed after it once the DOM has the text, which is also after the click
+  /// that opened the box has had its say about where the caret goes.
+  function opened() {
+    open = true;
+    if (value || !seed) {
+      readCaret();
+      return;
+    }
+    value = `${seed} `;
+    const end = value.length;
+    oninput();
+    void tick().then(() => {
+      input?.setSelectionRange(end, end);
+      readCaret();
+      syncScroll();
+    });
   }
 
   function changed() {
@@ -169,9 +191,9 @@
       on:input={changed}
       on:keydown={onKeydown}
       on:keyup={readCaret}
-      on:click={() => { open = true; readCaret(); }}
+      on:click={opened}
       on:scroll={syncScroll}
-      on:focus={() => { open = true; readCaret(); }}
+      on:focus={opened}
       on:blur={() => { open = false; }}
     />
   </div>

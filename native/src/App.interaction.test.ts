@@ -686,8 +686,10 @@ describe('production mailbox interactions', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open command palette' }));
 
     await user.click(search);
+    // Focusing an empty box seeds the mailbox being searched.
+    expect(search.value).toBe('in:inbox ');
     await user.type(search, 'subject:budget');
-    expect(search.value).toBe('subject:budget');
+    expect(search.value).toBe('in:inbox subject:budget');
     await user.keyboard('{Escape}');
 
     expect(search.value).toBe('');
@@ -883,24 +885,48 @@ describe('production mailbox interactions', () => {
     const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
 
     await user.click(search);
-    await user.type(search, 'fro');
+    await user.keyboard('fro');
     const suggestions = await screen.findByTestId('search-suggestions');
     expect(within(suggestions).getAllByRole('option')[0].textContent).toContain('from:');
 
     await user.keyboard('{Tab}');
-    expect(search.value).toBe('from:');
+    expect(search.value).toBe('in:inbox from:');
     expect(document.activeElement).toBe(search);
     // The completion reaches the query the native side runs, not just the box.
-    await user.type(search, 'alice');
+    await user.keyboard('alice');
     await waitFor(() => {
       const request = calls.filter((call) => call.command === 'search_threads').at(-1);
-      expect((request?.payload as { input: { query: string } }).input.query).toBe('from:alice');
+      expect((request?.payload as { input: { query: string } }).input.query).toBe('in:inbox from:alice');
     });
 
-    await user.type(search, 'alice is:unread');
+    await user.keyboard(' is:unread');
     const highlight = search.closest('.search-field')?.querySelector('.search-highlight');
-    expect([...(highlight?.querySelectorAll('.field') ?? [])].map((token) => token.textContent)).toEqual(['from:', 'is:']);
+    expect([...(highlight?.querySelectorAll('.field') ?? [])].map((token) => token.textContent)).toEqual(['in:', 'from:', 'is:']);
     expect(highlight?.textContent).toBe(search.value);
+  });
+
+  test('the seeded scope is what narrows a search, so deleting it widens', async () => {
+    const { calls, user } = await renderMailbox();
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+
+    // The scope alone has narrowed nothing, so the mailbox is still the mailbox.
+    await user.click(search);
+    expect(search.value).toBe('in:inbox ');
+    expect(calls.some((call) => call.command === 'search_threads')).toBe(false);
+
+    await user.keyboard('budget');
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'search_threads').at(-1);
+      expect(request?.payload).toMatchObject({ input: { query: 'in:inbox budget', view: 'all' } });
+    });
+
+    // Take the scope away and the same words cover the whole account.
+    await user.clear(search);
+    await user.keyboard('budget');
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'search_threads').at(-1);
+      expect(request?.payload).toMatchObject({ input: { query: 'budget', view: 'all' } });
+    });
   });
 
   test('enter runs the search, and never saves one on its own', async () => {
@@ -908,7 +934,8 @@ describe('production mailbox interactions', () => {
     const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
 
     await user.click(search);
-    await user.type(search, 'subject:budget');
+    await user.clear(search);
+    await user.keyboard('subject:budget');
     // The only thing on offer is the save row, and it is not preselected.
     const suggestions = await screen.findByTestId('search-suggestions');
     expect(within(suggestions).getAllByRole('option').map((option) => option.getAttribute('aria-selected')))
@@ -923,6 +950,7 @@ describe('production mailbox interactions', () => {
     await user.keyboard('{ArrowDown}{Enter}');
     await user.clear(search);
     await user.click(search);
+    await user.clear(search);
     const reopened = await screen.findByTestId('search-suggestions');
     expect(within(reopened).getAllByRole('option')[0].textContent).toContain('subject:budget');
   });
@@ -932,13 +960,15 @@ describe('production mailbox interactions', () => {
     const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
 
     await user.click(search);
-    await user.type(search, 'is:unread');
+    await user.clear(search);
+    await user.keyboard('is:unread');
     const suggestions = await screen.findByTestId('search-suggestions');
     const save = within(suggestions).getByText('Save "is:unread"');
     await user.click(save);
 
     await user.clear(search);
     await user.click(search);
+    await user.clear(search);
     const reopened = await screen.findByTestId('search-suggestions');
     const saved = within(reopened).getAllByRole('option')[0];
     expect(saved.textContent).toContain('is:unread');

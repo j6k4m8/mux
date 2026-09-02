@@ -3,6 +3,8 @@
 /// what is typed, once to suggest what could come next — so the box never
 /// offers a term the query engine would reject.
 
+import type { MailboxView } from './types';
+
 export type SearchTokenKind = 'field' | 'value' | 'operator' | 'paren' | 'text';
 
 export type SearchToken = { kind: SearchTokenKind; start: number; end: number };
@@ -25,7 +27,7 @@ export const searchFields: SearchField[] = [
   { name: 'subject', description: 'Words in the subject line', values: [] },
   { name: 'is', description: 'Conversation state', values: ['unread', 'read', 'starred', 'unstarred', 'snoozed', 'sent', 'me'] },
   { name: 'has', description: 'What the conversation carries', values: ['attachment', 'invite', 'calendar', 'link'] },
-  { name: 'in', description: 'Where it lives', values: ['inbox', 'archive', 'sent', 'snoozed', 'all'] },
+  { name: 'in', description: 'Where it lives', values: ['inbox', 'archive', 'sent', 'snoozed', 'trash', 'all'] },
   { name: 'after', description: 'Newer than a date', values: DATE_VALUES },
   { name: 'before', description: 'Older than a date', values: DATE_VALUES },
   { name: 'date', description: 'On one day', values: DATE_VALUES },
@@ -127,6 +129,65 @@ export function searchSegments(input: string): SearchSegment[] {
   }
   if (cursor < input.length) segments.push({ kind: 'gap', text: input.slice(cursor) });
   return segments;
+}
+
+/// The field terms a query carries, unquoted and lowercased. Reading them back
+/// out of the text is what lets the mailbox scope a search with a term the
+/// reader can see — and delete.
+export function searchTerms(input: string): Array<{ field: SearchFieldName; value: string }> {
+  const tokens = lexSearchQuery(input);
+  const terms: Array<{ field: SearchFieldName; value: string }> = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.kind !== 'field') continue;
+    const name = input.slice(token.start, token.end - 1).toLocaleLowerCase() as SearchFieldName;
+    const next = tokens[index + 1];
+    if (!next || next.kind !== 'value') continue;
+    const raw = input.slice(next.start, next.end).trim();
+    const unquoted = raw.length > 1 && (raw.startsWith('"') || raw.startsWith("'")) && raw.at(-1) === raw[0]
+      ? raw.slice(1, -1)
+      : raw;
+    terms.push({ field: name, value: unquoted.toLocaleLowerCase() });
+  }
+  return terms;
+}
+
+/// How each mailbox view reads as a search term. Views that are flags rather
+/// than folders still have one, because the reader has to be able to see the
+/// scope they are searching inside and take it away.
+const VIEW_SCOPES: Record<MailboxView, string> = {
+  inbox: 'in:inbox',
+  archive: 'in:archive',
+  sent: 'in:sent',
+  snoozed: 'in:snoozed',
+  trash: 'in:trash',
+  starred: 'is:starred',
+  // Neither of these narrows anything: All mail is the whole account already,
+  // and drafts are not searchable at all.
+  all: '',
+  drafts: ''
+};
+
+export function viewScopeTerm(view: MailboxView): string {
+  return VIEW_SCOPES[view] ?? '';
+}
+
+/// Which mailbox the native side should search, given a query that carries its
+/// own scope. Everything except trash lives under "all", so the query's own
+/// terms do the narrowing; trash is the one view "all" excludes outright, so a
+/// query asking for it has to be run against trash instead.
+/// Whether the box has actually narrowed anything. A query that is only the
+/// scope the mailbox seeded describes the view the reader is already in, so it
+/// is not a search yet.
+export function searchIsNarrowed(query: string, view: MailboxView): boolean {
+  const trimmed = query.trim();
+  return Boolean(trimmed) && trimmed !== viewScopeTerm(view);
+}
+
+export function searchViewFor(input: string): Extract<MailboxView, 'all' | 'trash'> {
+  return searchTerms(input).some((term) => term.field === 'in' && term.value === 'trash')
+    ? 'trash'
+    : 'all';
 }
 
 export type SearchSuggestionKind = 'saved' | 'field' | 'value' | 'account' | 'operator' | 'save';
