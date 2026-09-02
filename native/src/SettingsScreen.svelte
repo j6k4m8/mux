@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
+  import ThreadRowSample from './ThreadRowSample.svelte';
   import { animationChoices } from './motion';
   import { themeChoices } from './theme';
   import type { ThemePreference } from './theme';
@@ -255,6 +256,10 @@
           <h2>Appearance</h2>
           <p>Mux follows this choice on every launch.</p>
         </header>
+        <!-- Answers every choice below it, so it comes first and stays put. The
+             account colour is borrowed rather than passed as a preference: the
+             stripe means "this account", and inventing one would misdescribe it. -->
+        <ThreadRowSample {appearance} accountColor={mailbox.accounts[0]?.color ?? null} />
         <section class="settings-card">
           <h3>Theme</h3>
           <div class="settings-choice-row" role="group" aria-label="Theme" data-testid="theme-choice">
@@ -389,6 +394,15 @@
             >{choice.label}</button>
           {/each}
           </div>
+        </section>
+
+        <section class="settings-card">
+          <h3>Message list</h3>
+          <p class="settings-hint">The third line of every row in the list.</p>
+          <div class="settings-toggle-row" data-testid="list-display">
+          <label><input type="checkbox" bind:checked={appearance.listSnippet} on:change={() => applyAppearance(appearance)} /><span>Show preview of body text in mail list</span></label>
+        </div>
+
         </section>
       {:else if settingsSection === 'mail'}
         <header class="settings-heading">

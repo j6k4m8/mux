@@ -1803,6 +1803,9 @@
                   <span class="thread-copy">
                     <span class="thread-line"><strong>{draft.recipients || 'No recipient'}</strong><time>{relativeTime(draft.updatedAt)}</time></span>
                     <span class="subject">{draft.subject || 'No subject'}</span>
+                    <!-- Shares the snippet class but not the meaning: this line is where a
+                         draft says it is mid-send, and losing that to a preview setting would
+                         leave a sending draft looking like a saved one. -->
                     <span class="snippet">{draft.locked ? 'Sending…' : 'Saved locally'}</span>
                   </span>
                 </button>
@@ -1865,7 +1868,7 @@
                   <span class="thread-copy">
                     <span class="thread-line"><strong>{thread.participants}</strong><time>{relativeTime(thread.latestAt)}</time></span>
                     <span class="subject">{thread.starred ? '★ ' : ''}{thread.subject}</span>
-                    <span class="snippet">{thread.snippet}</span>
+                    {#if appearance.listSnippet}<span class="snippet">{thread.snippet}</span>{/if}
                   </span>
                   {#if thread.unread}<span class="unread-dot" aria-label="Unread"></span>{/if}
                 </button>

@@ -9,6 +9,7 @@ import {
   APPEARANCE_KEY,
   DEFAULT_APPEARANCE,
   isAccentChoice,
+  persistAppearance,
   readSavedAppearance
 } from './appearance';
 
@@ -48,4 +49,21 @@ test('a stored accent is read back, and anything else falls to the default', () 
   assert.equal(readSavedAppearance().accent, 'rose');
   window.localStorage.setItem(APPEARANCE_KEY, JSON.stringify({ accent: 'chartreuse' }));
   assert.equal(readSavedAppearance().accent, 'account');
+});
+
+test('the list body preview starts on, and hiding it survives a round trip', () => {
+  assert.equal(DEFAULT_APPEARANCE.listSnippet, true);
+  persistAppearance({ ...DEFAULT_APPEARANCE, listSnippet: false });
+  assert.equal(readSavedAppearance().listSnippet, false);
+  persistAppearance({ ...DEFAULT_APPEARANCE, listSnippet: true });
+  assert.equal(readSavedAppearance().listSnippet, true);
+});
+
+test('a stored list preview that is not a boolean shows the preview', () => {
+  window.localStorage.setItem(APPEARANCE_KEY, JSON.stringify({ listSnippet: 'yes please' }));
+  const read = readSavedAppearance();
+  assert.equal(read.listSnippet, true);
+  // The two previews are separate settings and must not be read from each other.
+  window.localStorage.setItem(APPEARANCE_KEY, JSON.stringify({ railPreview: false }));
+  assert.equal(readSavedAppearance().listSnippet, true);
 });

@@ -387,6 +387,67 @@ describe('production mailbox interactions', () => {
     expect(saved.animation).toBe('none');
   });
 
+  test('turning off the body preview takes the third line out of the list', async () => {
+    const { user } = await renderMailbox();
+    const firstRow = () => screen.getAllByTestId('thread-row')[0];
+    expect(firstRow().querySelector('.snippet')?.textContent).toBe('Here are the decisions from today.');
+
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+    await user.click(within(screen.getByTestId('list-display')).getByRole('checkbox', {
+      name: 'Show preview of body text in mail list'
+    }));
+    await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
+
+    await waitFor(() => {
+      for (const row of screen.getAllByTestId('thread-row')) {
+        expect(row.querySelector('.snippet')).toBeNull();
+      }
+    });
+    // The line is gone from the markup rather than hidden, and the two lines
+    // that say what the mail is stay.
+    expect(firstRow().querySelector('.thread-line strong')?.textContent).toBe('Alice Example, Bob Example');
+    expect(firstRow().querySelector('.subject')?.textContent).toContain('Architecture sync');
+    expect(JSON.parse(window.localStorage.getItem('mux-appearance')!).listSnippet).toBe(false);
+  });
+
+  test('the appearance sample is a real list row, and answers the preview setting', async () => {
+    const { user } = await renderMailbox();
+    // The stripe the sample has to match, read off the mail list itself.
+    const realStripe = screen.getAllByTestId('thread-row')[0]
+      .querySelector<HTMLElement>('.thread-accent')!.style.background;
+
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
+
+    const sample = screen.getByTestId('appearance-sample');
+    // Built from the list's own class names, so the list's own styling — text
+    // size, typeface, density — reaches it without being restated here. Density
+    // arrives by inheritance, which needs the sample inside the shell that
+    // carries it.
+    const shell = screen.getByTestId('mux-shell');
+    expect(shell.getAttribute('data-density')).toBe('default');
+    expect(shell.contains(sample)).toBe(true);
+    const unread = sample.querySelector<HTMLElement>('.thread-row.is-unread')!;
+    expect(unread.querySelector<HTMLElement>('.thread-accent')!.style.background).toBe(realStripe);
+    expect(unread.querySelector('.avatar')).toBeTruthy();
+    expect(unread.querySelector('.thread-copy .thread-line strong')).toBeTruthy();
+    expect(unread.querySelector('.thread-copy .subject')).toBeTruthy();
+    expect(sample.querySelector('.thread-row.is-selected')).toBeTruthy();
+    expect(sample.querySelectorAll('.snippet')).toHaveLength(2);
+    // Invented mail: a new install with no messages still has a sample to show.
+    expect(sample.textContent).not.toContain('Architecture sync');
+
+    await user.click(within(screen.getByTestId('list-display')).getByRole('checkbox', {
+      name: 'Show preview of body text in mail list'
+    }));
+    await waitFor(() =>
+      expect(screen.getByTestId('appearance-sample').querySelectorAll('.snippet')).toHaveLength(0)
+    );
+  });
+
   test('each account carries its own refresh cadence, defaulting to a minute', async () => {
     const { calls, user } = await renderMailbox();
     await user.keyboard('{Meta>},{/Meta}');

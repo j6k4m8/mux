@@ -26,6 +26,10 @@ export type Appearance = {
   toolbarCollapseNarrow: boolean;
   swipeLeft: SwipeAction;
   swipeRight: SwipeAction;
+  /// The body line under the participants and the subject in the mail list.
+  /// Nothing to do with railPreview, which is the reader's hover preview: this
+  /// one is always on screen, and it is a third of every row's height.
+  listSnippet: boolean;
   railPreview: boolean;
   animation: AnimationSpeed;
   accent: AccentChoice;
@@ -45,6 +49,7 @@ export const DEFAULT_APPEARANCE: Appearance = {
   toolbarCollapseNarrow: true,
   swipeLeft: 'archive',
   swipeRight: 'snooze',
+  listSnippet: true,
   railPreview: true,
   animation: 'medium',
   accent: 'account'
@@ -201,6 +206,7 @@ export function readSavedAppearance(): Appearance {
       toolbarCollapseNarrow: flag(value.toolbarCollapseNarrow, true),
       swipeLeft: swipe(value.swipeLeft, 'archive'),
       swipeRight: swipe(value.swipeRight, 'snooze'),
+      listSnippet: flag(value.listSnippet, true),
       railPreview: flag(value.railPreview, true),
       animation: isAnimationSpeed(value.animation) ? value.animation : 'medium',
       accent: isAccentChoice(value.accent) ? value.accent : 'account'
