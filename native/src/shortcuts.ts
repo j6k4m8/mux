@@ -92,7 +92,7 @@ export const shortcutCatalog: ShortcutDefinition[] = [
     title: 'Snooze',
     description: 'Hide it until a time you pick.',
     group: 'Conversation',
-    bindings: [{ key: 'h' }]
+    bindings: [{ key: 'b' }]
   },
   {
     action: 'toggle-star',

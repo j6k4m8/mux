@@ -1437,7 +1437,7 @@
         id: thread.inInbox ? 'archive' : 'restore',
         label: thread.inInbox ? 'Archive' : 'Move to inbox',
         icon: 'archive',
-        shortcut: 'E',
+        shortcut: shortcutLabel('archive'),
         run: () => void applyThreadAction(
           thread.inInbox ? 'archive' : 'restore',
           thread.inInbox ? 'Archived' : 'Restored to inbox'
@@ -1451,20 +1451,20 @@
         run: () => void applyThreadAction('delete', 'Moved to Trash')
       });
     }
-    actions.push({ id: 'snooze', label: 'Snooze', icon: 'clock', shortcut: 'H', run: openSnoozeDialog });
+    actions.push({ id: 'snooze', label: 'Snooze', icon: 'clock', shortcut: shortcutLabel('snooze'), run: openSnoozeDialog });
     actions.push({
       id: thread.unread ? 'read' : 'unread',
       label: thread.unread ? 'Mark read' : 'Mark unread',
       icon: 'mail',
-      shortcut: 'U',
+      shortcut: shortcutLabel('toggle-unread'),
       run: () => void applyThreadAction(
         thread.unread ? 'read' : 'unread',
         thread.unread ? 'Marked read' : 'Marked unread'
       )
     });
-    actions.push({ id: 'reply', label: 'Reply', icon: 'reply', shortcut: 'R', run: () => openReply('reply') });
-    actions.push({ id: 'reply-all', label: 'Reply all', icon: 'replyAll', shortcut: 'A', run: () => openReply('replyAll') });
-    actions.push({ id: 'forward', label: 'Forward', icon: 'forward', shortcut: 'F', run: openForward });
+    actions.push({ id: 'reply', label: 'Reply', icon: 'reply', shortcut: shortcutLabel('reply'), run: () => openReply('reply') });
+    actions.push({ id: 'reply-all', label: 'Reply all', icon: 'replyAll', shortcut: shortcutLabel('reply-all'), run: () => openReply('replyAll') });
+    actions.push({ id: 'forward', label: 'Forward', icon: 'forward', shortcut: shortcutLabel('forward'), run: openForward });
     if (thread.unread) {
       actions.push({
         id: 'jump-unread',

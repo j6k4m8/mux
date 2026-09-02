@@ -42,7 +42,8 @@ test('native mailbox shortcuts map only the documented mailbox keys', () => {
   assert.equal(mailboxShortcutFor(event('Enter')), 'open-thread');
   assert.equal(mailboxShortcutFor(event('e')), 'archive');
   assert.equal(mailboxShortcutFor(event('s')), 'toggle-star');
-  assert.equal(mailboxShortcutFor(event('h')), 'snooze');
+  assert.equal(mailboxShortcutFor(event('b')), 'snooze');
+  assert.equal(mailboxShortcutFor(event('h')), null);
   assert.equal(mailboxShortcutFor(event('u')), 'toggle-unread');
   assert.equal(mailboxShortcutFor(event('r')), 'reply');
   assert.equal(mailboxShortcutFor(event('a')), 'reply-all');

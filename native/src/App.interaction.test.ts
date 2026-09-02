@@ -280,7 +280,11 @@ describe('production mailbox interactions', () => {
     expect(within(settings).queryByRole('button', { name: 'Add Gmail account' })).toBeNull();
 
     await user.click(within(settings).getByRole('button', { name: 'Shortcuts' }));
-    expect(within(settings).getByText('Open the command palette')).toBeTruthy();
+    // The reference reads from the shortcut catalog, so it lists the keys that
+    // actually work rather than a list kept by hand.
+    expect(within(settings).getByText('Command palette')).toBeTruthy();
+    expect(within(settings).getByText('Go to folder')).toBeTruthy();
+    expect(within(settings).getByText('Move to folder')).toBeTruthy();
 
     await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
     await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
@@ -434,7 +438,7 @@ describe('production mailbox interactions', () => {
   test('a custom snooze time must be in the future', async () => {
     const { calls, user } = await renderMailbox();
     blurActiveElement();
-    await fireEvent.keyDown(window, { key: 'h' });
+    await fireEvent.keyDown(window, { key: 'b' });
     const dialog = screen.getByTestId('snooze-dialog');
     const input = within(dialog).getByTestId('custom-snooze-input') as HTMLInputElement;
 
@@ -773,11 +777,11 @@ describe('production mailbox interactions', () => {
     await waitFor(() => expect(document.activeElement).not.toBe(editor));
   });
 
-  test('opens snooze with h and operates the command palette with Command K', async () => {
+  test('opens snooze with b and operates the command palette with Command K', async () => {
     const { user } = await renderMailbox();
     blurActiveElement();
 
-    await fireEvent.keyDown(window, { key: 'h' });
+    await fireEvent.keyDown(window, { key: 'b' });
     const snoozeDialog = screen.getByTestId('snooze-dialog');
     expect(document.activeElement).toBe(within(snoozeDialog).getByRole('button', { name: /Later today/u }));
     // Presets, then the custom time field and its submit, then back to close.

@@ -3,6 +3,7 @@
   import { onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
   import { animationChoices } from './motion';
+  import { shortcutCatalog, shortcutChips, visibleBindings } from './shortcuts';
   import {
     densityChoices,
     DEFAULT_FONT,
@@ -34,19 +35,12 @@
     { id: 'shortcuts', title: 'Shortcuts' }
   ];
 
-  const shortcutReference: Array<{ keys: string; action: string }> = [
-    { keys: '\u2318P', action: 'Open the command palette' },
-    { keys: '\u2318,', action: 'Open settings' },
-    { keys: 'C', action: 'Compose' },
-    { keys: 'R / A / F', action: 'Reply, reply all, forward' },
-    { keys: 'J / K', action: 'Next or previous conversation' },
-    { keys: 'E', action: 'Archive or restore' },
-    { keys: 'S', action: 'Star' },
-    { keys: 'U', action: 'Toggle unread' },
-    { keys: 'H', action: 'Snooze' },
-    { keys: '\u2318F', action: 'Search' },
-    { keys: 'Esc', action: 'Close or step back' }
-  ];
+  /// Read from the shortcut catalog rather than typed out again: a list of
+  /// keys kept by hand is a list of keys that goes stale.
+  const shortcutReference = shortcutCatalog.map((definition) => ({
+    keys: visibleBindings(definition).map((binding) => shortcutChips(binding).join(' ')).join('  or  '),
+    action: definition.title
+  }));
 
   let settingsSection: SettingsSection = 'accounts';
   let settingsBusy = false;
