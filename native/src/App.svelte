@@ -15,6 +15,7 @@
   import ShortcutSheet from './ShortcutSheet.svelte';
   import SettingsScreen from './SettingsScreen.svelte';
   import StatsScreen from './StatsScreen.svelte';
+  import SyncScreen from './SyncScreen.svelte';
   import ThreadConversation from './ThreadConversation.svelte';
   import {
     applyAccentToRoot,
@@ -143,6 +144,7 @@
   let selectedContainer: ContainerSummary | null = null;
   let sidebar: SidebarLayout = DEFAULT_SIDEBAR_LAYOUT;
   let statsOpen = false;
+  let syncOpen = false;
   let searchField: SearchField;
   let savedSearches: SavedSearch[] = [];
   let searchRows: ThreadSummary[] = [];
@@ -593,6 +595,7 @@
     navigationOpen = false;
     closeCommandPalette(false);
     statsOpen = false;
+    syncOpen = false;
     settingsOpen = true;
     await tick();
     settingsScreen?.show(section);
@@ -608,11 +611,24 @@
     navigationOpen = false;
     closeCommandPalette(false);
     settingsOpen = false;
+    syncOpen = false;
     statsOpen = true;
+  }
+
+  function openSync() {
+    navigationOpen = false;
+    closeCommandPalette(false);
+    settingsOpen = false;
+    statsOpen = false;
+    syncOpen = true;
   }
 
   function closeStats() {
     statsOpen = false;
+  }
+
+  function closeSync() {
+    syncOpen = false;
   }
 
   async function subscribeToMailboxChanges() {
@@ -1413,11 +1429,12 @@
       }
       return;
     }
-    if (settingsOpen || statsOpen) {
+    if (settingsOpen || statsOpen || syncOpen) {
       if (event.key === 'Escape') {
         event.preventDefault();
         closeSettings();
         closeStats();
+        closeSync();
       }
       return;
     }
@@ -1716,22 +1733,23 @@
       <button
         class="topbar-icon-button"
         type="button"
+        aria-label="Open sync status"
+        title="Sync status and queue"
+        data-action="open-sync"
+        data-testid="sync-button"
+        on:click={openSync}
+      >
+        <Icon name="sync" size={19} />
+      </button>
+      <button
+        class="topbar-icon-button"
+        type="button"
         aria-label="Open command palette"
         title="Command palette (⌘K)"
         data-action="open-command-palette"
         on:click={openCommandPalette}
       >
         <Icon name="command" size={19} />
-      </button>
-      <button
-        class="topbar-icon-button"
-        type="button"
-        aria-label={theme === 'light' ? 'Switch to dark appearance' : 'Switch to light appearance'}
-        title={theme === 'light' ? 'Dark appearance' : 'Light appearance'}
-        data-action="toggle-theme"
-        on:click={toggleTheme}
-      >
-        <Icon name={theme === 'light' ? 'moon' : 'sun'} size={19} />
       </button>
     </div>
   </header>
@@ -1762,8 +1780,11 @@
       />
     {:else if statsOpen}
       <StatsScreen accounts={mailbox.accounts} close={closeStats} />
+    {:else if syncOpen}
+      <SyncScreen
         accounts={mailbox.accounts}
         refreshMailbox={() => refreshMailbox()}
+        close={closeSync}
       />
     {:else}
       <div

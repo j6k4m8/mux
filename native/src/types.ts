@@ -7,6 +7,11 @@ export type AccountSummary = {
   unread: number;
   total: number;
   refreshSeconds: number;
+  /// When a sync last finished, and how it went. Null for an account with no
+  /// provider attached, which is every account in a local-only mailbox.
+  lastSyncAt?: number | null;
+  syncState?: string | null;
+  lastErrorCode?: string | null;
 };
 
 export type ThreadSummary = {

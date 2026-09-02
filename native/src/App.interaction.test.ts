@@ -754,7 +754,7 @@ describe('production mailbox interactions', () => {
 
     await user.click(search);
     await user.tab();
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open command palette' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open sync status' }));
 
     await user.click(search);
     // Focusing an empty box seeds the mailbox being searched.
@@ -879,6 +879,22 @@ describe('production mailbox interactions', () => {
 
     expect(screen.queryByTestId('command-palette')).toBeNull();
     expect(screen.getByTestId('mux-shell').dataset.theme).toBe('dark');
+  });
+
+  test('the toolbar opens sync status, and the rail opens stats', async () => {
+    const { user } = await renderMailbox();
+
+    await user.click(screen.getByTestId('sync-button'));
+    expect(await screen.findByTestId('sync-screen')).toBeTruthy();
+    expect(screen.queryByTestId('mailbox-workspace')).toBeNull();
+
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
+
+    await user.click(within(screen.getByTestId('mailbox-navigation')).getByTestId('stats-button'));
+    expect(await screen.findByTestId('stats-screen')).toBeTruthy();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
   });
 
   test('the sender shows who else was on the message, and only the caret closes it', async () => {

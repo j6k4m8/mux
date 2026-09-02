@@ -76,6 +76,12 @@ pub struct AccountSummary {
     total: i64,
     /// How often Mux asks the provider for new mail, in seconds.
     refresh_seconds: i64,
+    /// When a sync last finished, and how it went. Null throughout for an
+    /// account with no provider attached, which is every account in a local-only
+    /// mailbox.
+    last_sync_at: Option<i64>,
+    sync_state: Option<String>,
+    last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -513,7 +519,13 @@ impl MuxStore {
                             WHERE s.thread_id = e.id AND s.wake_at > ?1
                           ) THEN 1 ELSE 0 END), 0) AS unread,
                         COUNT(e.id) AS total,
-                        COALESCE(MAX(p.refresh_seconds), ?2) AS refresh_seconds
+                        COALESCE(MAX(p.refresh_seconds), ?2) AS refresh_seconds,
+                        -- An account has at most one provider row, so these
+                        -- aggregates are the row itself; they are aggregates
+                        -- only to satisfy the grouping the counts need.
+                        MAX(p.last_sync_at) AS last_sync_at,
+                        MAX(p.sync_state) AS sync_state,
+                        MAX(p.last_error_code) AS last_error_code
                  FROM accounts a
                  LEFT JOIN thread_effective e
                    ON e.account_id = a.id AND e.remote_deleted = 0 AND e.trashed = 0
@@ -531,6 +543,9 @@ impl MuxStore {
                     unread: row.get(5)?,
                     total: row.get(6)?,
                     refresh_seconds: row.get(7)?,
+                    last_sync_at: row.get(8)?,
+                    sync_state: row.get(9)?,
+                    last_error_code: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

@@ -23,6 +23,7 @@
     | 'moon'
     | 'sun'
     | 'chevron'
+    | 'sync'
     | 'stats';
   export let size = 18;
   export let filled = false;
@@ -89,6 +90,10 @@
     <path d="M9 7V5a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v14a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V7Z" />
   {:else if name === 'moon'}
     <path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z" />
+  {:else if name === 'sync'}
+    <path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-8.06-5" />
+    <path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 8.06 5" />
+    <path d="M21 4v4h-4M3 20v-4h4" />
   {:else if name === 'stats'}
     <path d="M4 20V4" />
     <path d="M4 20h16" />
