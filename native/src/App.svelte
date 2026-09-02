@@ -14,6 +14,7 @@
   import SearchField from './SearchField.svelte';
   import ShortcutSheet from './ShortcutSheet.svelte';
   import SettingsScreen from './SettingsScreen.svelte';
+  import StatsScreen from './StatsScreen.svelte';
   import ThreadConversation from './ThreadConversation.svelte';
   import {
     applyAccentToRoot,
@@ -141,6 +142,7 @@
   /// The account folder being read, when one is open instead of a fixed view.
   let selectedContainer: ContainerSummary | null = null;
   let sidebar: SidebarLayout = DEFAULT_SIDEBAR_LAYOUT;
+  let statsOpen = false;
   let searchField: SearchField;
   let savedSearches: SavedSearch[] = [];
   let searchRows: ThreadSummary[] = [];
@@ -590,6 +592,7 @@
   async function openSettings(section: SettingsSection = 'accounts') {
     navigationOpen = false;
     closeCommandPalette(false);
+    statsOpen = false;
     settingsOpen = true;
     await tick();
     settingsScreen?.show(section);
@@ -597,6 +600,19 @@
 
   function closeSettings() {
     settingsOpen = false;
+  }
+
+  /// Stats and sync are places rather than dialogs: they take the whole
+  /// workspace the way settings does, and only one of the three is ever open.
+  function openStats() {
+    navigationOpen = false;
+    closeCommandPalette(false);
+    settingsOpen = false;
+    statsOpen = true;
+  }
+
+  function closeStats() {
+    statsOpen = false;
   }
 
   async function subscribeToMailboxChanges() {
@@ -1397,10 +1413,11 @@
       }
       return;
     }
-    if (settingsOpen) {
+    if (settingsOpen || statsOpen) {
       if (event.key === 'Escape') {
         event.preventDefault();
         closeSettings();
+        closeStats();
       }
       return;
     }
@@ -1743,6 +1760,11 @@
         refreshMailbox={() => refreshMailbox()}
         close={closeSettings}
       />
+    {:else if statsOpen}
+      <StatsScreen accounts={mailbox.accounts} close={closeStats} />
+        accounts={mailbox.accounts}
+        refreshMailbox={() => refreshMailbox()}
+      />
     {:else}
       <div
         class="workspace-grid"
@@ -1768,6 +1790,7 @@
           openFolderAccounts={sidebar.openFolderAccounts}
           {toggleRail}
           {toggleFolderSection}
+          {openStats}
           {selectView}
           {selectSmartView}
           {selectAccount}

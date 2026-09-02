@@ -3992,7 +3992,10 @@ fn cancel_waiting_work(
 }
 
 mod demo;
+mod stats;
 mod validation;
+
+pub use stats::{AddressCount, DayVolume, MailStats, MailStatsInput};
 
 use validation::*;
 // Reached from the Gmail adapter when it recomputes a send fingerprint.

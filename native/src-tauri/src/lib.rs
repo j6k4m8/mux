@@ -29,9 +29,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use store::{
-    AttachmentContent, DraftSummary, ListOperationsInput, MailboxBootstrap, MessagePage,
-    MessagePageInput, MuxStore, OperationActivitySummary, OperationSummary, SaveDraftInput,
-    SearchInput, SearchPage, ThreadLookupInput, ThreadPage, ThreadPageInput, ThreadSummary,
+    AttachmentContent, DraftSummary, ListOperationsInput, MailStats, MailStatsInput,
+    MailboxBootstrap, MessagePage, MessagePageInput, MuxStore, OperationActivitySummary,
+    OperationSummary, SaveDraftInput, SearchInput, SearchPage, ThreadLookupInput, ThreadPage,
+    ThreadPageInput, ThreadSummary,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
@@ -315,6 +316,15 @@ fn search_threads(state: State<'_, AppState>, input: SearchInput) -> Result<Sear
     store
         .search_threads(input)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn mailbox_stats(state: State<'_, AppState>, input: MailStatsInput) -> Result<MailStats, String> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "Native mailbox state is unavailable".to_string())?;
+    store.mail_stats(input).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -687,6 +697,7 @@ pub fn run() {
             get_thread_summary,
             get_thread_messages,
             search_threads,
+            mailbox_stats,
             read_attachment,
             get_draft,
             open_message_link,
@@ -883,6 +894,7 @@ mod tests {
                 "get_thread_summary",
                 "get_thread_messages",
                 "search_threads",
+                "mailbox_stats",
                 "read_attachment",
                 "get_draft",
                 "open_message_link",

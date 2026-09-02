@@ -36,6 +36,7 @@
   export let toggleFolderSection: (accountId: string) => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
+  export let openStats: () => void;
   export let openActivity: () => void;
 
   /// Folders belong to one account each, so they are listed under the account
@@ -196,6 +197,10 @@
       </div>
     {/each}
   </section>
+
+  <button class="settings-button" type="button" data-action="open-stats" data-testid="stats-button" title="Mail statistics" on:click={() => openStats()}>
+    <span class="nav-icon"><Icon name="stats" size={16} /></span><strong>Stats</strong>
+  </button>
 
   <button class="settings-button" type="button" data-action="open-settings" title="Settings (⌘,)" on:click={() => openSettings()}>
     <span class="nav-icon"><Icon name="settings" size={16} /></span><strong>Settings</strong>
