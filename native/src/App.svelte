@@ -8,7 +8,10 @@
   import InlineReply from './InlineReply.svelte';
   import { swipeGesture } from './swipeGesture';
   import type { SwipeSide } from './swipeGesture';
+  import JumpDialog from './JumpDialog.svelte';
   import MailboxSidebar from './MailboxSidebar.svelte';
+  import SearchField from './SearchField.svelte';
+  import ShortcutSheet from './ShortcutSheet.svelte';
   import SettingsScreen from './SettingsScreen.svelte';
   import ThreadConversation from './ThreadConversation.svelte';
   import {
@@ -25,7 +28,21 @@
   } from './appearance';
   import type { Appearance, Density, SwipeAction } from './appearance';
   import { replyRecipients } from './replyRecipients';
-  import { isInteractiveShortcutTarget, mailboxShortcutFor } from './shortcuts';
+  import { chordShortcutFor, mailboxShortcutFor, shortcutLabel } from './shortcuts';
+  import { trapModalKeydown } from './modalFocus';
+  import { mailboxJumpRows } from './jumpDialog';
+  import { moveDestinations } from './moveTargets';
+  import {
+    confirmationNotice,
+    failureNotice,
+    noticeExpired,
+    noticeOffersUndo,
+    undoDeadline,
+    undoableNotice
+  } from './notices';
+  import type { Notice } from './notices';
+  import { addSavedSearch, persistSavedSearches, readSavedSearches, removeSavedSearch } from './savedSearches';
+  import type { SavedSearch } from './savedSearches';
   import {
     adjacentMailboxWindowStart,
     boundedRefreshRowTarget,
@@ -65,8 +82,7 @@
     ViewCountSummary
   } from './types';
 
-  type Notice = { text: string; operationId?: string; until?: number };
-  type PaletteCommandId = 'compose' | 'archive' | 'snooze' | 'star' | 'read' | 'inbox' | 'starred' | 'activity' | 'theme' | 'settings';
+  type PaletteCommandId = 'compose' | 'archive' | 'move' | 'snooze' | 'star' | 'read' | 'inbox' | 'starred' | 'shortcuts' | 'activity' | 'theme' | 'settings';
   type PaletteCommand = { id: PaletteCommandId; title: string; description: string; shortcut: string };
 
   let mailbox: MailboxBootstrap | null = null;
@@ -100,7 +116,8 @@
   let messageRequest = 0;
   let loadedThreadId: number | null = null;
   let filter = '';
-  let filterInput: HTMLInputElement;
+  let searchField: SearchField;
+  let savedSearches: SavedSearch[] = [];
   let searchRows: ThreadSummary[] = [];
   let searchCursor: string | null = null;
   let searchHasMore = false;
@@ -133,12 +150,15 @@
   let customSnoozeValue = '';
   let customSnoozeError = '';
   let commandPaletteOpen = false;
-  let commandFilter = '';
-  let commandIndex = 0;
-  let commandInput: HTMLInputElement;
-  let commandDialog: HTMLElement;
   let commandReturnFocus: HTMLElement | null = null;
   let paletteCommands: PaletteCommand[] = [];
+  let goToOpen = false;
+  let goToScoped = false;
+  let goToReturnFocus: HTMLElement | null = null;
+  let moveOpen = false;
+  let moveReturnFocus: HTMLElement | null = null;
+  let shortcutSheetOpen = false;
+  let shortcutReturnFocus: HTMLElement | null = null;
   let snoozeDialog: HTMLElement;
   let snoozeReturnFocus: HTMLElement | null = null;
   let activityDialogOpen = false;
@@ -213,15 +233,39 @@
     trash: 0
   };
   $: selectedThreadTotal = selectedView === 'drafts' ? visibleDrafts.length : selectedCounts[selectedView];
-  $: remainingSeconds = notice?.until ? Math.max(0, Math.ceil((notice.until - clock) / 1_000)) : 0;
-  $: blockingDialogOpen = commandPaletteOpen || snoozeDialogOpen || activityDialogOpen || composerOpen;
-  $: if (notice?.until && clock >= notice.until) notice = null;
+  $: offersUndo = noticeOffersUndo(notice, clock);
+  $: blockingDialogOpen = commandPaletteOpen || snoozeDialogOpen || activityDialogOpen
+    || composerOpen || goToOpen || moveOpen || shortcutSheetOpen;
+  $: if (noticeExpired(notice, clock)) notice = null;
   $: {
-    commandFilter;
     selectedThread;
     theme;
     paletteCommands = availablePaletteCommands();
   }
+  $: paletteRows = paletteCommands.map((command) => ({
+    id: command.id,
+    title: command.title,
+    subtitle: command.description,
+    chip: command.shortcut
+  }));
+  /// Only ever the selected conversation's own account: the destinations are
+  /// built from the thread itself, so there is no other account to reach.
+  $: moveRows = selectedThread && moveOpen
+    ? moveDestinations(selectedThread, {
+        trashed: selectedView === 'trash',
+        accountLabel: accountLabelFor(selectedThread.accountId),
+        accountColor: accountFor(selectedThread.accountId)?.color
+      })
+    : [];
+  /// ⇧G narrows the jump list to the account being read; G offers every one.
+  $: goToRows = mailbox && goToOpen
+    ? mailboxJumpRows({
+        accounts: mailbox.accounts,
+        selectedAccount,
+        scoped: goToScoped,
+        scopeAccountId: selectedAccount
+      })
+    : [];
 
   onMount(() => {
     destroyed = false;
@@ -313,39 +357,37 @@
 
   function availablePaletteCommands(): PaletteCommand[] {
     const items: PaletteCommand[] = [
-      { id: 'compose', title: 'Compose message', description: 'Start a new local draft', shortcut: 'C' },
+      { id: 'compose', title: 'Compose message', description: 'Start a new local draft', shortcut: shortcutLabel('compose') },
       ...(selectedThread ? [
-        { id: 'archive', title: selectedThread.inInbox ? 'Archive conversation' : 'Move conversation to inbox', description: 'Update the focused conversation locally', shortcut: 'E' },
-        { id: 'snooze', title: 'Snooze conversation', description: 'Hide it until a chosen time', shortcut: 'H' },
-        { id: 'star', title: selectedThread.starred ? 'Remove star' : 'Star conversation', description: 'Update the focused conversation', shortcut: 'S' },
-        { id: 'read', title: selectedThread.unread ? 'Mark conversation read' : 'Mark conversation unread', description: 'Update the focused conversation', shortcut: 'U' }
+        { id: 'archive', title: selectedThread.inInbox ? 'Archive conversation' : 'Move conversation to inbox', description: 'Update the focused conversation locally', shortcut: shortcutLabel('archive') },
+        { id: 'move', title: 'Move conversation', description: 'Move it within its own account', shortcut: shortcutLabel('move') },
+        { id: 'snooze', title: 'Snooze conversation', description: 'Hide it until a chosen time', shortcut: shortcutLabel('snooze') },
+        { id: 'star', title: selectedThread.starred ? 'Remove star' : 'Star conversation', description: 'Update the focused conversation', shortcut: shortcutLabel('toggle-star') },
+        { id: 'read', title: selectedThread.unread ? 'Mark conversation read' : 'Mark conversation unread', description: 'Update the focused conversation', shortcut: shortcutLabel('toggle-unread') }
       ] satisfies PaletteCommand[] : []),
-      { id: 'inbox', title: 'Go to Inbox', description: 'Open the current unified inbox', shortcut: 'G I' },
-      { id: 'starred', title: 'Go to Starred', description: 'Open starred conversations', shortcut: 'G S' },
+      { id: 'inbox', title: 'Go to Inbox', description: 'Open the current unified inbox', shortcut: shortcutLabel('go-to') },
+      { id: 'starred', title: 'Go to Starred', description: 'Open starred conversations', shortcut: shortcutLabel('go-to') },
+      { id: 'shortcuts', title: 'Keyboard shortcuts', description: 'Every key Mux answers to', shortcut: shortcutLabel('shortcuts') },
       { id: 'activity', title: 'Open activity', description: 'Inspect the local operation journal', shortcut: '' },
       { id: 'theme', title: 'Toggle appearance', description: `Switch to ${theme === 'light' ? 'dark' : 'light'} mode`, shortcut: '' },
-      { id: 'settings', title: 'Open settings', description: 'Accounts, appearance, and mail data', shortcut: '⌘,' }
+      { id: 'settings', title: 'Open settings', description: 'Accounts, appearance, and mail data', shortcut: shortcutLabel('settings') }
     ];
-    const query = commandFilter.trim().toLocaleLowerCase();
-    return query
-      ? items.filter((item) => `${item.title} ${item.description}`.toLocaleLowerCase().includes(query))
-      : items;
+    // The dialog does the filtering; this is the whole menu.
+    return items;
   }
 
-  async function openCommandPalette() {
+  function openCommandPalette() {
     commandReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    commandFilter = '';
-    commandIndex = 0;
     commandPaletteOpen = true;
-    await tick();
-    commandInput?.focus();
   }
 
   function closeCommandPalette(restoreFocus = true) {
     commandPaletteOpen = false;
-    commandFilter = '';
-    commandIndex = 0;
     if (restoreFocus) restoreDialogFocus(commandReturnFocus);
+  }
+
+  function runPaletteCommand(id: string) {
+    executePaletteCommand(paletteCommands.find((command) => command.id === id));
   }
 
   function executePaletteCommand(command: PaletteCommand | undefined) {
@@ -353,14 +395,82 @@
     closeCommandPalette(false);
     if (command.id === 'compose') openComposer();
     else if (command.id === 'archive') void applyThreadAction(selectedThread?.inInbox ? 'archive' : 'restore', selectedThread?.inInbox ? 'Archived' : 'Restored to inbox');
+    else if (command.id === 'move') openMove();
     else if (command.id === 'snooze') openSnoozeDialog();
     else if (command.id === 'star') void applyThreadAction(selectedThread?.starred ? 'unstar' : 'star', selectedThread?.starred ? 'Star removed' : 'Starred');
     else if (command.id === 'read') void applyThreadAction(selectedThread?.unread ? 'read' : 'unread', selectedThread?.unread ? 'Marked read' : 'Marked unread');
     else if (command.id === 'inbox') selectView('inbox');
     else if (command.id === 'starred') selectView('starred');
+    else if (command.id === 'shortcuts') openShortcutSheet();
     else if (command.id === 'activity') void openActivity();
     else if (command.id === 'theme') toggleTheme();
     else if (command.id === 'settings') void openSettings();
+  }
+
+  function openGoTo(scoped: boolean) {
+    goToReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    goToScoped = scoped;
+    goToOpen = true;
+  }
+
+  function closeGoTo(restoreFocus = true) {
+    goToOpen = false;
+    if (restoreFocus) restoreDialogFocus(goToReturnFocus);
+  }
+
+  /// One row is one destination. Setting the account before the view keeps this
+  /// to a single mailbox load rather than one per axis.
+  function jumpTo(id: string) {
+    const row = goToRows.find((entry) => entry.id === id);
+    closeGoTo(false);
+    if (!row) return;
+    if (row.target.kind === 'account') {
+      selectAccount(row.target.accountId);
+      return;
+    }
+    selectedAccount = row.target.accountId;
+    if (row.target.kind === 'view') selectView(row.target.view);
+    else selectSmartView(row.target.smart, row.target.query);
+  }
+
+  function openMove() {
+    if (!selectedThread) return;
+    moveReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    moveOpen = true;
+  }
+
+  function closeMove(restoreFocus = true) {
+    moveOpen = false;
+    if (restoreFocus) restoreDialogFocus(moveReturnFocus);
+  }
+
+  function runMove(id: string) {
+    const destination = moveRows.find((row) => row.id === id);
+    closeMove(false);
+    if (!destination) return;
+    void applyThreadAction(destination.action, destination.notice);
+  }
+
+  function openShortcutSheet() {
+    shortcutReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    shortcutSheetOpen = true;
+  }
+
+  function closeShortcutSheet(restoreFocus = true) {
+    shortcutSheetOpen = false;
+    if (restoreFocus) restoreDialogFocus(shortcutReturnFocus);
+  }
+
+  function saveSearch(query: string) {
+    if (!query) return;
+    savedSearches = addSavedSearch(savedSearches, query);
+    persistSavedSearches(savedSearches);
+    notice = confirmationNotice(`Saved “${savedSearches[0].name}”`);
+  }
+
+  function forgetSearch(query: string) {
+    savedSearches = removeSavedSearch(savedSearches, query);
+    persistSavedSearches(savedSearches);
   }
 
   function restoreDialogFocus(target: HTMLElement | null) {
@@ -370,32 +480,6 @@
     });
   }
 
-  function handleModalKeydown(event: KeyboardEvent, dialog: HTMLElement, close: () => void) {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      close();
-      return;
-    }
-    if (event.key !== 'Tab') return;
-    const focusable = [...dialog.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])'
-    )].filter((element) => !element.hasAttribute('hidden'));
-    if (!focusable.length) {
-      event.preventDefault();
-      dialog.focus();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable.at(-1) ?? first;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
 
   function syncResponsiveLayout() {
     compactNavigation = (navigationMediaQuery ?? window.matchMedia('(max-width: 980px)')).matches;
@@ -958,10 +1042,10 @@
     closeSnoozeDialog();
     try {
       const operation = await invoke<OperationSummary>('snooze_thread', { threadId, wakeAt });
-      notice = { text: 'Conversation snoozed', operationId: operation.id };
+      notice = undoableNotice('Conversation snoozed', operation.id);
       await queueMailboxRefresh();
     } catch (cause) {
-      notice = { text: cause instanceof Error ? cause.message : String(cause) };
+      notice = failureNotice(cause);
     }
   }
 
@@ -970,10 +1054,10 @@
     if (!threadId || !selectedInvitation) return;
     try {
       const operation = await invoke<OperationSummary>('rsvp_thread', { threadId, response });
-      notice = { text: 'Invitation response updated', operationId: operation.id };
+      notice = undoableNotice('Invitation response updated', operation.id);
       await queueMailboxRefresh();
     } catch (cause) {
-      notice = { text: cause instanceof Error ? cause.message : String(cause) };
+      notice = failureNotice(cause);
     }
   }
 
@@ -1018,7 +1102,7 @@
   async function resolveUnknownSend(operationId: string) {
     try {
       await invoke<OperationSummary>('resolve_outcome_unknown_send', { operationId });
-      notice = { text: 'Draft unlocked without retrying the uncertain send' };
+      notice = confirmationNotice('Draft unlocked without retrying the uncertain send');
       await queueMailboxRefresh();
       await openActivity();
     } catch (cause) {
@@ -1061,7 +1145,7 @@
       openComposer(draft);
     } catch (cause) {
       if (request !== draftOpenRequest || selectedView !== 'drafts') return;
-      notice = { text: cause instanceof Error ? cause.message : String(cause) };
+      notice = failureNotice(cause);
     }
   }
 
@@ -1111,7 +1195,7 @@
     restoreDialogFocus(composerReturnFocus);
     await queueMailboxRefresh();
     inlineReplyKey += 1;
-    notice = { text: composerReply ? 'Reply queued' : 'Message queued', operationId: event.detail.id, until: event.detail.notBefore };
+    notice = undoableNotice(composerReply ? 'Reply queued' : 'Message queued', event.detail.id, event.detail.notBefore);
   }
 
   async function composerClosed() {
@@ -1124,13 +1208,13 @@
   async function inlineQueued(event: CustomEvent<OperationSummary>) {
     await queueMailboxRefresh();
     inlineReplyKey += 1;
-    notice = { text: 'Reply queued', operationId: event.detail.id, until: event.detail.notBefore };
+    notice = undoableNotice('Reply queued', event.detail.id, event.detail.notBefore);
   }
 
   async function composerDeleted() {
     composerOpen = false;
     restoreDialogFocus(composerReturnFocus);
-    notice = { text: 'Draft deleted' };
+    notice = confirmationNotice('Draft deleted');
     await queueMailboxRefresh();
     inlineReplyKey += 1;
   }
@@ -1144,9 +1228,9 @@
         action
       });
       await queueMailboxRefresh();
-      notice = { text: label, operationId: operation.id, until: Date.now() + 5_000 };
+      notice = undoableNotice(label, operation.id, undoDeadline());
     } catch (cause) {
-      notice = { text: cause instanceof Error ? cause.message : String(cause) };
+      notice = failureNotice(cause);
     }
   }
 
@@ -1155,45 +1239,38 @@
     const operationId = notice.operationId;
     try {
       await invoke('undo_operation', { operationId });
-      notice = { text: 'Undone' };
+      notice = confirmationNotice('Undone');
       await queueMailboxRefresh();
     } catch (cause) {
-      notice = { text: cause instanceof Error ? cause.message : String(cause) };
+      notice = failureNotice(cause);
     }
   }
 
   function handleKeydown(event: KeyboardEvent) {
     if (event.defaultPrevented) return;
-    if (commandPaletteOpen) {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        closeCommandPalette();
-      } else if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        commandIndex = Math.min(Math.max(0, paletteCommands.length - 1), commandIndex + 1);
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        commandIndex = Math.max(0, commandIndex - 1);
-      } else if (event.key === 'Enter') {
-        event.preventDefault();
-        executePaletteCommand(paletteCommands[commandIndex]);
-      }
-      return;
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'f' && !composerOpen && !settingsOpen) {
+    // Dialogs answer their own keys, including Escape, which they stop from
+    // reaching this handler.
+    if (commandPaletteOpen || goToOpen || moveOpen || shortcutSheetOpen) return;
+    const chord = chordShortcutFor(event);
+    if (chord === 'search' && !composerOpen && !settingsOpen) {
       event.preventDefault();
       closeCommandPalette(false);
-      filterInput?.focus();
+      searchField?.focus();
       return;
     }
-    if ((event.metaKey || event.ctrlKey) && event.key === ',' && !composerOpen) {
+    if (chord === 'settings' && !composerOpen) {
       event.preventDefault();
       void openSettings();
       return;
     }
-    if ((event.metaKey || event.ctrlKey) && ['p', 'k'].includes(event.key.toLocaleLowerCase()) && !composerOpen && !snoozeDialogOpen && !activityDialogOpen && !settingsOpen) {
+    if (chord === 'shortcuts' && !composerOpen) {
       event.preventDefault();
-      void openCommandPalette();
+      openShortcutSheet();
+      return;
+    }
+    if (chord === 'palette' && !composerOpen && !snoozeDialogOpen && !activityDialogOpen && !settingsOpen) {
+      event.preventDefault();
+      openCommandPalette();
       return;
     }
     if (snoozeDialogOpen) {
@@ -1218,18 +1295,6 @@
       return;
     }
     if (composerOpen) return;
-    if (
-      event.key === 'Enter'
-      && !readerFocused
-      && selectedThread
-      && selectedView !== 'drafts'
-      && !isInteractiveShortcutTarget(event.target)
-    ) {
-      event.preventDefault();
-      readerFocused = true;
-      void threadConversation?.focusFirstMessage();
-      return;
-    }
     if (readerFocused && event.key === 'Escape') {
       event.preventDefault();
       exitReaderFocus();
@@ -1250,7 +1315,7 @@
         event.preventDefault();
         filter = '';
         selectedSmartView = '';
-        filterInput?.blur();
+        searchField?.blur();
         resetSearch();
         restoreThreadSelection();
       } else if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
@@ -1261,6 +1326,24 @@
     const action = mailboxShortcutFor(event);
     if (!action) return;
     event.preventDefault();
+    if (action === 'open-thread') {
+      if (readerFocused || !selectedThread || selectedView === 'drafts') return;
+      readerFocused = true;
+      void threadConversation?.focusFirstMessage();
+      return;
+    }
+    if (action === 'go-to' || action === 'go-to-account') {
+      openGoTo(action === 'go-to-account');
+      return;
+    }
+    if (action === 'shortcuts') {
+      openShortcutSheet();
+      return;
+    }
+    if (action === 'move') {
+      openMove();
+      return;
+    }
     if (action === 'compose') {
       openComposer();
       return;
@@ -1436,6 +1519,11 @@
     return mailbox?.accounts.find((account) => account.id === accountId);
   }
 
+  function accountLabelFor(accountId: string): string {
+    const account = accountFor(accountId);
+    return account ? `${account.name} · ${account.email}` : accountId;
+  }
+
   function initials(name: string): string {
     return name.split(/\s+/u).map((part) => part[0] ?? '').join('').slice(0, 2).toLocaleUpperCase();
   }
@@ -1485,11 +1573,17 @@
       <span>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.name}</span>
       <small>{viewTitle}</small>
     </div>
-    <label class="filter">
-      <Icon name="search" size={17} />
-      <input bind:this={filterInput} bind:value={filter} aria-label="Search mail" placeholder="Search mail or use from:, after:, is:…" data-testid="mailbox-search" on:input={filterChanged} />
-      <kbd>/</kbd>
-    </label>
+    <SearchField
+      bind:this={searchField}
+      bind:value={filter}
+      accounts={mailbox?.accounts ?? []}
+      saved={savedSearches}
+      placeholder="Search mail or use from:, after:, is:…"
+      hint={shortcutLabel('search')}
+      oninput={filterChanged}
+      onsave={saveSearch}
+      onforget={forgetSearch}
+    />
     <div class="topbar-actions">
       <button
         class="topbar-icon-button"
@@ -1799,7 +1893,7 @@
   {#if notice}
     <div class="undo-toast" role="status" data-testid="undo-toast" inert={blockingDialogOpen}>
       <span>{notice.text}</span>
-      {#if notice.operationId && (!notice.until || remainingSeconds > 0)}
+      {#if offersUndo}
         <button on:click={undoNotice}>Undo</button>
       {/if}
     </div>
@@ -1826,46 +1920,48 @@
   {/if}
 
   {#if commandPaletteOpen}
-    <div class="modal-backdrop command-backdrop" role="presentation" on:click|self={() => closeCommandPalette()}>
-      <div bind:this={commandDialog} class="modal-card command-dialog" role="dialog" aria-modal="true" aria-label="Command palette" data-testid="command-palette" tabindex="-1" on:keydown={(event) => handleModalKeydown(event, commandDialog, closeCommandPalette)}>
-        <label class="command-filter">
-          <Icon name="search" size={17} />
-          <input
-            bind:this={commandInput}
-            bind:value={commandFilter}
-            aria-label="Command search"
-            autocomplete="off"
-            placeholder="Type a command…"
-            on:input={() => { commandIndex = 0; }}
-          />
-          <kbd>esc</kbd>
-        </label>
-        <div class="command-list" role="listbox" aria-label="Available commands">
-          {#if paletteCommands.length}
-            {#each paletteCommands as command, index (command.id)}
-              <button
-                class:is-selected={commandIndex === index}
-                type="button"
-                role="option"
-                aria-selected={commandIndex === index}
-                on:mouseenter={() => { commandIndex = index; }}
-                on:click={() => executePaletteCommand(command)}
-              >
-                <span><strong>{command.title}</strong><small>{command.description}</small></span>
-                <kbd>{command.shortcut || 'enter'}</kbd>
-              </button>
-            {/each}
-          {:else}
-            <div class="empty"><strong>No matching command</strong></div>
-          {/if}
-        </div>
-      </div>
-    </div>
+    <JumpDialog
+      title="Commands"
+      placeholder="Type a command…"
+      rows={paletteRows}
+      emptyLabel="No matching command"
+      testid="command-palette"
+      onselect={runPaletteCommand}
+      onclose={closeCommandPalette}
+    />
+  {/if}
+
+  {#if goToOpen}
+    <JumpDialog
+      title={goToScoped ? 'Go to folder in this account' : 'Go to'}
+      placeholder="Folder, smart view, or account…"
+      rows={goToRows}
+      emptyLabel="No matching folder"
+      testid="go-to-dialog"
+      onselect={jumpTo}
+      onclose={closeGoTo}
+    />
+  {/if}
+
+  {#if moveOpen && selectedThread}
+    <JumpDialog
+      title="Move to"
+      placeholder="Inbox, Archive, Trash…"
+      rows={moveRows}
+      emptyLabel="Nowhere to move this"
+      testid="move-dialog"
+      onselect={runMove}
+      onclose={closeMove}
+    />
+  {/if}
+
+  {#if shortcutSheetOpen}
+    <ShortcutSheet onclose={closeShortcutSheet} />
   {/if}
 
   {#if snoozeDialogOpen && selectedThread}
     <div class="modal-backdrop" role="presentation" on:click|self={() => closeSnoozeDialog()}>
-      <div bind:this={snoozeDialog} class="modal-card snooze-dialog" role="dialog" aria-modal="true" aria-labelledby="snooze-title" data-testid="snooze-dialog" tabindex="-1" on:keydown={(event) => handleModalKeydown(event, snoozeDialog, closeSnoozeDialog)}>
+      <div bind:this={snoozeDialog} class="modal-card snooze-dialog" role="dialog" aria-modal="true" aria-labelledby="snooze-title" data-testid="snooze-dialog" tabindex="-1" on:keydown={(event) => trapModalKeydown(event, snoozeDialog, closeSnoozeDialog)}>
         <header>
           <div><small>Bring it back</small><h1 id="snooze-title">Snooze conversation</h1></div>
           <button class="icon-button" type="button" aria-label="Close snooze options" on:click={() => closeSnoozeDialog()}>×</button>
@@ -1892,7 +1988,7 @@
 
   {#if activityDialogOpen}
     <div class="modal-backdrop" role="presentation" on:click|self={() => closeActivity()}>
-      <div bind:this={activityDialog} class="modal-card activity-dialog" role="dialog" aria-modal="true" aria-labelledby="activity-title" data-testid="activity-dialog" tabindex="-1" on:keydown={(event) => handleModalKeydown(event, activityDialog, closeActivity)}>
+      <div bind:this={activityDialog} class="modal-card activity-dialog" role="dialog" aria-modal="true" aria-labelledby="activity-title" data-testid="activity-dialog" tabindex="-1" on:keydown={(event) => trapModalKeydown(event, activityDialog, closeActivity)}>
         <header>
           <div><small>Local operation journal</small><h1 id="activity-title">Activity</h1></div>
           <button class="icon-button" data-autofocus type="button" aria-label="Close activity" on:click={() => closeActivity()}>×</button>

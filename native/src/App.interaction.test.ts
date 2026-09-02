@@ -786,12 +786,150 @@ describe('production mailbox interactions', () => {
 
     await fireEvent.keyDown(window, { key: 'k', metaKey: true });
     const palette = await screen.findByTestId('command-palette');
-    const commandSearch = within(palette).getByRole('textbox', { name: 'Command search' });
+    const commandSearch = within(palette).getByRole('textbox', { name: 'Commands filter' });
     await user.type(commandSearch, 'appearance');
-    await fireEvent.keyDown(window, { key: 'Enter' });
+    await user.keyboard('{Enter}');
 
     expect(screen.queryByTestId('command-palette')).toBeNull();
     expect(screen.getByTestId('mux-shell').dataset.theme).toBe('dark');
+  });
+
+  test('jumps to a folder with g without leaving the keyboard', async () => {
+    const { calls, user } = await renderMailbox();
+    blurActiveElement();
+
+    await fireEvent.keyDown(window, { key: 'g' });
+    const dialog = await screen.findByTestId('go-to-dialog');
+    const filter = within(dialog).getByRole('textbox', { name: 'Go to filter' });
+    expect(document.activeElement).toBe(filter);
+
+    await user.type(filter, 'arch');
+    const options = within(dialog).getAllByRole('option');
+    expect(options[0].textContent).toContain('Archive');
+    await user.keyboard('{Enter}');
+
+    expect(screen.queryByTestId('go-to-dialog')).toBeNull();
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'list_threads').at(-1);
+      expect((request?.payload as { input: { view: string } }).input.view).toBe('archive');
+    });
+  });
+
+  test('shift+g offers only the account being read, and escape backs out', async () => {
+    const { user } = await renderMailbox();
+    await user.click(screen.getByTitle('Show only Work'));
+    blurActiveElement();
+
+    await fireEvent.keyDown(window, { key: 'G', shiftKey: true });
+    const dialog = await screen.findByTestId('go-to-dialog');
+    const subtitles = within(dialog).getAllByRole('option').map((option) => option.querySelector('small')?.textContent);
+    expect(new Set(subtitles)).toEqual(new Set(['Work · jordan@acme.example']));
+
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByTestId('go-to-dialog')).toBeNull();
+  });
+
+  test('m moves a conversation, and only within its own account', async () => {
+    const { calls, user } = await renderMailbox();
+    blurActiveElement();
+
+    await fireEvent.keyDown(window, { key: 'm' });
+    const dialog = await screen.findByTestId('move-dialog');
+    const options = within(dialog).getAllByRole('option');
+    expect(options.map((option) => option.querySelector('strong')?.textContent)).toEqual(['Archive', 'Trash']);
+    // Every destination names the conversation's own account and no other.
+    expect(new Set(options.map((option) => option.querySelector('small')?.textContent)))
+      .toEqual(new Set(['Work · jordan@acme.example']));
+
+    await user.click(options[0]);
+    expect(screen.queryByTestId('move-dialog')).toBeNull();
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'apply_thread_action').at(-1);
+      expect(request?.payload).toMatchObject({ threadId: 1, action: 'archive' });
+    });
+  });
+
+  test('the shortcut sheet documents the keys that actually work', async () => {
+    await renderMailbox();
+    blurActiveElement();
+
+    await fireEvent.keyDown(window, { key: '?', shiftKey: true });
+    const sheet = await screen.findByTestId('shortcut-sheet');
+    const goTo = within(sheet).getByText('Go to folder').closest('.shortcut-row');
+    expect([...(goTo?.querySelectorAll('kbd') ?? [])].map((key) => key.textContent)).toEqual(['G']);
+    expect([...within(sheet).getByText('Command palette').closest('.shortcut-row')?.querySelectorAll('kbd') ?? []]
+      .map((key) => key.textContent)).toEqual(['⌘', 'K']);
+
+    await fireEvent.keyDown(sheet, { key: 'Escape' });
+    expect(screen.queryByTestId('shortcut-sheet')).toBeNull();
+  });
+
+  test('the search box colours the query and completes a field with Tab', async () => {
+    const { calls, user } = await renderMailbox();
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+
+    await user.click(search);
+    await user.type(search, 'fro');
+    const suggestions = await screen.findByTestId('search-suggestions');
+    expect(within(suggestions).getAllByRole('option')[0].textContent).toContain('from:');
+
+    await user.keyboard('{Tab}');
+    expect(search.value).toBe('from:');
+    expect(document.activeElement).toBe(search);
+    // The completion reaches the query the native side runs, not just the box.
+    await user.type(search, 'alice');
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'search_threads').at(-1);
+      expect((request?.payload as { input: { query: string } }).input.query).toBe('from:alice');
+    });
+
+    await user.type(search, 'alice is:unread');
+    const highlight = search.closest('.search-field')?.querySelector('.search-highlight');
+    expect([...(highlight?.querySelectorAll('.field') ?? [])].map((token) => token.textContent)).toEqual(['from:', 'is:']);
+    expect(highlight?.textContent).toBe(search.value);
+  });
+
+  test('enter runs the search, and never saves one on its own', async () => {
+    const { user } = await renderMailbox();
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+
+    await user.click(search);
+    await user.type(search, 'subject:budget');
+    // The only thing on offer is the save row, and it is not preselected.
+    const suggestions = await screen.findByTestId('search-suggestions');
+    expect(within(suggestions).getAllByRole('option').map((option) => option.getAttribute('aria-selected')))
+      .toEqual(['false']);
+
+    await user.keyboard('{Enter}');
+    expect(search.value).toBe('subject:budget');
+    expect(screen.queryByTestId('search-suggestions')).toBeNull();
+
+    // Walking onto the row and pressing enter is the deliberate act that saves.
+    await user.click(search);
+    await user.keyboard('{ArrowDown}{Enter}');
+    await user.clear(search);
+    await user.click(search);
+    const reopened = await screen.findByTestId('search-suggestions');
+    expect(within(reopened).getAllByRole('option')[0].textContent).toContain('subject:budget');
+  });
+
+  test('a saved search comes back from the dropdown', async () => {
+    const { user } = await renderMailbox();
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+
+    await user.click(search);
+    await user.type(search, 'is:unread');
+    const suggestions = await screen.findByTestId('search-suggestions');
+    const save = within(suggestions).getByText('Save "is:unread"');
+    await user.click(save);
+
+    await user.clear(search);
+    await user.click(search);
+    const reopened = await screen.findByTestId('search-suggestions');
+    const saved = within(reopened).getAllByRole('option')[0];
+    expect(saved.textContent).toContain('is:unread');
+    await user.click(saved);
+    expect(search.value).toBe('is:unread');
   });
 
   test('dispatches toolbar, snooze, and invitation actions through typed native commands', async () => {

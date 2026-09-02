@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import { mailboxViews, smartViews } from './mailboxViews';
   import type {
     AccountSummary,
     MailboxBootstrap,
@@ -27,33 +28,6 @@
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openActivity: () => void;
-
-  /// Eight near-identical buttons were eight near-identical blocks of markup.
-  /// The only things that differ are the icon, the label, and where the count
-  /// comes from, so that is all this says.
-  const views: Array<{
-    id: MailboxView;
-    icon: 'inbox' | 'star' | 'clock' | 'sent' | 'drafts' | 'archive' | 'trash' | 'allMail';
-    label: string;
-    title: string;
-    count: (counts: ViewCountSummary) => number;
-  }> = [
-    { id: 'inbox', icon: 'inbox', label: 'Inbox', title: 'Inbox', count: (c) => c.inbox },
-    { id: 'starred', icon: 'star', label: 'Starred', title: 'Starred conversations', count: (c) => c.starred },
-    { id: 'snoozed', icon: 'clock', label: 'Snoozed', title: 'Snoozed conversations', count: (c) => c.snoozed },
-    { id: 'sent', icon: 'sent', label: 'Sent', title: 'Sent mail', count: (c) => c.sent },
-    { id: 'drafts', icon: 'drafts', label: 'Drafts', title: 'Local drafts', count: () => draftCount },
-    { id: 'archive', icon: 'archive', label: 'Archive', title: 'Archived conversations', count: (c) => c.archive },
-    { id: 'trash', icon: 'trash', label: 'Trash', title: 'Trash', count: (c) => c.trash },
-    { id: 'all', icon: 'allMail', label: 'All mail', title: 'All mail', count: (c) => c.all }
-  ];
-
-  const smartViews: Array<{ id: Exclude<SmartView, ''>; label: string; dot: string; query: string; title: string }> = [
-    { id: 'unread', label: 'Unread', dot: 'blue', query: 'is:unread', title: 'Unread conversations' },
-    { id: 'attachments', label: 'Attachments', dot: 'violet', query: 'has:attachment', title: 'Conversations with attachments' },
-    { id: 'invitations', label: 'Invitations', dot: 'green', query: 'has:invite', title: 'Conversations with invitations' },
-    { id: 'finance', label: 'Finance', dot: 'amber', query: 'category:Finance', title: 'Finance conversations' }
-  ];
 
   $: draftCount = mailbox.drafts.filter(
     (draft) => selectedAccount === null || draft.accountId === selectedAccount
@@ -87,7 +61,7 @@
   </button>
 
   <section class="nav-section">
-    {#each views as view}
+    {#each mailboxViews as view}
       <button
         class:is-active={isActive(view.id)}
         data-action={`view-${view.id}`}
@@ -95,7 +69,7 @@
         on:click={() => selectView(view.id)}
       >
         <span class="nav-icon"><Icon name={view.icon} size={17} /></span><strong>{view.label}</strong>
-        <em>{view.count(counts)}</em>
+        <em>{view.count(counts, draftCount)}</em>
       </button>
     {/each}
   </section>

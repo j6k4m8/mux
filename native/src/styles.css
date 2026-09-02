@@ -16,6 +16,10 @@
   --danger: #d83b4c;
   --warning: #c77a09;
   --success: #178563;
+  --token-field: #0a6fa8;
+  --token-value: #1f7a52;
+  --token-operator: #b1501e;
+  --token-paren: #7a6020;
   --shadow-sm: 0 1px 2px rgba(20, 28, 50, .06), 0 1px 5px rgba(20, 28, 50, .04);
   --shadow-lg: 0 24px 70px rgba(18, 25, 45, .18), 0 4px 14px rgba(18, 25, 45, .08);
   --radius-sm: 8px;
@@ -56,6 +60,10 @@ html[data-theme="dark"] {
   --danger: #ff6c7d;
   --warning: #f4b04e;
   --success: #55cba5;
+  --token-field: #7ec8e3;
+  --token-value: #7fd6a8;
+  --token-operator: #e08e6d;
+  --token-paren: #ccaa55;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, .32);
   --shadow-lg: 0 24px 80px rgba(0, 0, 0, .58);
   color-scheme: dark;
@@ -131,6 +139,63 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .filter:focus-within { border-color: color-mix(in srgb, var(--accent) 58%, var(--border)); background: var(--surface); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent); }
 .filter input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 14px; }
 .filter input::placeholder { color: var(--text-faint); }
+
+/* Search field: the coloured text is an overlay sitting on a transparent
+   input, so the caret, the selection, and every input behaviour stay real. */
+.search-field { position: relative; }
+.search-input { position: relative; flex: 1; min-width: 0; height: 22px; }
+.search-field input,
+.search-highlight {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-family: var(--app-font);
+  font-size: 14px;
+  line-height: 22px;
+  letter-spacing: normal;
+  white-space: pre;
+}
+.search-field input { outline: 0; color: transparent; background: transparent; caret-color: var(--text); -webkit-text-fill-color: transparent; }
+.search-field input::placeholder { color: var(--text-faint); -webkit-text-fill-color: var(--text-faint); }
+/* Above the input, so a selection highlight cannot hide the text it covers. */
+.search-highlight { z-index: 1; overflow: hidden; color: var(--text); pointer-events: none; }
+/* Colour only. Weight, size, and transforms all change glyph widths, and the
+   caret is drawn from the input's own metrics: the moment the two disagree,
+   the caret stops pointing at the character it is actually on. */
+.search-highlight .token { white-space: pre; }
+.search-highlight .field { color: var(--token-field); }
+.search-highlight .value { color: var(--token-value); }
+.search-highlight .operator { color: var(--token-operator); }
+.search-highlight .paren { color: var(--token-paren); }
+
+.search-suggestions {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  max-height: 320px;
+  padding: 6px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+}
+.search-suggestion { display: flex; align-items: center; gap: 10px; padding: 7px 9px; border-radius: 8px; color: var(--text-soft); cursor: pointer; }
+.search-suggestion.is-selected { color: var(--text); background: var(--accent-soft); }
+.suggestion-mark { flex: 0 0 16px; color: var(--text-faint); font-size: 12px; font-weight: 700; text-align: center; }
+.suggestion-mark.saved { color: var(--warning); }
+.suggestion-mark.save { color: var(--accent); }
+.suggestion-mark.field, .suggestion-mark.value, .suggestion-mark.account { color: var(--token-field); }
+.suggestion-text { min-width: 0; display: flex; flex-direction: column; }
+.suggestion-text strong { overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.suggestion-text small { margin-top: 2px; overflow: hidden; color: var(--text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.suggestion-forget { margin-left: auto; padding: 2px 6px; border-radius: 6px; color: var(--text-faint); background: transparent; font-size: 11px; cursor: pointer; }
+.suggestion-forget:hover { color: var(--danger); background: var(--surface-hover); }
 .topbar-actions { justify-self: end; display: flex; align-items: center; }
 .mobile-menu-button, .reader-back-button, .mobile-scrim { display: none; }
 .mobile-menu-button {
@@ -607,6 +672,29 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .command-list strong { color: inherit; font-size: 12px; }
 .command-list small { margin-top: 3px; color: var(--text-faint); font-size: 10px; }
 .command-list kbd { flex: 0 0 auto; color: var(--text-faint); }
+
+.jump-dialog > .jump-header { min-height: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 16px 18px 10px 20px; border-bottom: 0; background: transparent; }
+.jump-header h1 { margin: 0; font-size: 15px; }
+.jump-header small { color: var(--text-faint); font-size: 10px; font-weight: 650; letter-spacing: .04em; }
+.jump-dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%; }
+.jump-dialog .command-list > button { min-height: 46px; }
+/* The shared row is justified apart, which is right when it is a title and a
+   key. With a leading dot the title has to stay next to it. */
+.jump-dialog .command-list > button > span:not(.jump-dot) { flex: 1 1 auto; }
+
+/* Keyboard sheet: two columns where there is room, one where there is not. */
+.shortcut-sheet { width: min(880px, calc(100vw - 48px)); max-height: min(720px, calc(100vh - 56px)); }
+.shortcut-body { min-height: 0; padding: 6px 20px 18px; overflow-y: auto; }
+.shortcut-group { break-inside: avoid; }
+.shortcut-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 6px; }
+.shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 48px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
+.shortcut-name { min-width: 0; display: flex; flex-direction: column; }
+.shortcut-name strong { color: var(--text); font-size: 12px; font-weight: 650; }
+.shortcut-name small { margin-top: 2px; color: var(--text-faint); font-size: 10px; }
+.shortcut-keys { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+.shortcut-chord { display: inline-flex; align-items: center; gap: 4px; }
+.shortcut-chord i, .shortcut-or { color: var(--text-faint); font-size: 10px; font-style: normal; }
+.shortcut-footer { padding: 12px 20px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 10px; }
 
 .composer-mount { display: contents; }
 .composer-backdrop { z-index: 30; }
