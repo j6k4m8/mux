@@ -811,6 +811,25 @@ describe('production mailbox interactions', () => {
     expect(screen.getByTestId('mux-shell').dataset.theme).toBe('dark');
   });
 
+  test('the sender shows who else was on the message, and only the caret closes it', async () => {
+    const { user } = await renderMailbox();
+    const reader = screen.getByTestId('reader');
+    const sender = within(reader).getAllByTitle('Show who this went to')[0];
+
+    // Reading the addresses must not cost you the message.
+    await user.click(sender);
+    const addresses = reader.querySelector('.message-addresses');
+    expect(addresses?.textContent).toContain('alice@example.com');
+    expect(within(reader).getAllByRole('button', { name: /^Collapse message/u }).length).toBeGreaterThan(0);
+
+    await user.click(sender);
+    expect(reader.querySelector('.message-addresses')).toBeNull();
+
+    // Collapsing is the caret's job alone.
+    const caret = within(reader).getAllByRole('button', { name: /^Collapse message/u })[0];
+    await user.click(caret);
+    expect(within(reader).getAllByRole('button', { name: /^Expand message/u }).length).toBeGreaterThan(0);
+  });
   test('an account folder is listed, opens on its own, and is a jump target', async () => {
     mailbox.containers.push({
       accountId: account.id,

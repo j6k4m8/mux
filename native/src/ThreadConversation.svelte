@@ -215,6 +215,17 @@
     await revealMessage(messages[next]?.id ?? null);
   }
 
+  /// Which messages are showing their full address list. Kept apart from
+  /// expandedIds so opening the addresses is not a kind of expanding.
+  let addressIds = new Set<number>();
+
+  function toggleAddresses(messageId: number) {
+    const next = new Set(addressIds);
+    if (next.has(messageId)) next.delete(messageId);
+    else next.add(messageId);
+    addressIds = next;
+  }
+
   export function clearMessageFocus() {
     focusedId = null;
   }
@@ -265,38 +276,72 @@
     {#if message.id === unreadMessageId}
       <div class="unread-boundary" id="native-unread-boundary"><span>Unread from here</span></div>
     {/if}
+    {@const expanded = expandedIds.has(message.id)}
     <section
       class="message-card"
-      class:is-collapsed={!expandedIds.has(message.id)}
+      class:is-collapsed={!expanded}
       class:is-focused={focusedId === message.id}
       class:is-mine={message.isFromMe}
       id={`native-message-${message.id}`}
     >
-      <button
-        class="message-card-toggle"
-        type="button"
-        aria-expanded={expandedIds.has(message.id)}
-        aria-controls={`native-message-body-${message.id}`}
-        on:click={() => toggle(message.id)}
-      >
-        <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
-        {#if expandedIds.has(message.id)}
-          <span class="message-meta"><strong>{message.senderName}</strong><small>{message.senderEmail} → {message.recipients}{message.ccRecipients ? ` · Cc ${message.ccRecipients}` : ''}</small></span>
-          <time>{fullTime(message.sentAt)}</time>
+      <div class="message-card-toggle">
+        {#if expanded}
+          <!-- Expanded, the header is two controls: the sender shows who else
+               was on the message, and the caret is the only thing that closes
+               it. Reading the addresses used to cost you the message. -->
+          <button
+            class="message-sender"
+            type="button"
+            aria-expanded={addressIds.has(message.id)}
+            aria-controls={`native-message-addresses-${message.id}`}
+            title={addressIds.has(message.id) ? 'Hide addresses' : 'Show who this went to'}
+            on:click={() => toggleAddresses(message.id)}
+          >
+            <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
+            <span class="message-meta"><strong>{message.senderName}</strong><small>{message.senderEmail} → {message.recipients}{message.ccRecipients ? ` · Cc ${message.ccRecipients}` : ''}</small></span>
+            <time>{fullTime(message.sentAt)}</time>
+          </button>
         {:else}
           {@const collapsed = newContentParagraphs(message.bodyText)}
-          <span class="collapsed-summary">
-            <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
-            <span class="collapsed-preview">
-              {#each collapsed.paragraphs as lines}
-                <span class="collapsed-paragraph">{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</span>
-              {/each}
-              {#if collapsed.trimmed}<span class="collapsed-trimmed">quoted text and signature hidden</span>{/if}
+          <button
+            class="message-open"
+            type="button"
+            aria-expanded="false"
+            aria-controls={`native-message-body-${message.id}`}
+            on:click={() => toggle(message.id)}
+          >
+            <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
+            <span class="collapsed-summary">
+              <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
+              <span class="collapsed-preview">
+                {#each collapsed.paragraphs as lines}
+                  <span class="collapsed-paragraph">{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</span>
+                {/each}
+                {#if collapsed.trimmed}<span class="collapsed-trimmed">quoted text and signature hidden</span>{/if}
+              </span>
             </span>
-          </span>
+          </button>
         {/if}
-        <span class="collapse-glyph" aria-hidden="true">{expandedIds.has(message.id) ? '⌃' : '⌄'}</span>
-      </button>
+        <button
+          class="collapse-glyph"
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={`native-message-body-${message.id}`}
+          aria-label={expanded ? `Collapse message from ${message.senderName}` : `Expand message from ${message.senderName}`}
+          title={expanded ? 'Collapse' : 'Expand'}
+          data-action="toggle-message"
+          on:click={() => toggle(message.id)}
+        >{expanded ? '⌃' : '⌄'}</button>
+      </div>
+      {#if expanded && addressIds.has(message.id)}
+        <dl class="message-addresses" id={`native-message-addresses-${message.id}`}>
+          <dt>From</dt><dd>{message.senderName ? `${message.senderName} · ` : ''}{message.senderEmail}</dd>
+          {#if message.recipients}<dt>To</dt><dd>{message.recipients}</dd>{/if}
+          {#if message.ccRecipients}<dt>Cc</dt><dd>{message.ccRecipients}</dd>{/if}
+          {#if message.bccRecipients}<dt>Bcc</dt><dd>{message.bccRecipients}</dd>{/if}
+          <dt>Sent</dt><dd>{fullTime(message.sentAt)}</dd>
+        </dl>
+      {/if}
       {#if expandedIds.has(message.id)}
         <div class="message-body" id={`native-message-body-${message.id}`}>
           {#if blockedCounts[message.id] > 0}
