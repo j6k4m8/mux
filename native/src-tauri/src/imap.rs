@@ -1406,8 +1406,15 @@ fn schedule_syncs(
     }
     let mut connection = Connection::open(database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Launch schedules the first sync of every mailbox that has never had one;
+    // the timer and the resume path leave those alone. "Sync now" names one
+    // mailbox and means it whatever its history — a mailbox that has never
+    // synced is exactly the one someone presses it for, and the one a fresh
+    // provisioning hands here.
     let state = if initial_only {
         "account.sync_state = 'never_synced'"
+    } else if only_account.is_some() {
+        "account.sync_state IN ('never_synced', 'idle', 'scheduled')"
     } else {
         "account.sync_state IN ('idle', 'scheduled')"
     };

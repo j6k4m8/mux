@@ -749,6 +749,39 @@ mod tests {
         let _ = credentials.remove(&second.record_ref);
     }
 
+    #[test]
+    fn a_new_mailbox_is_queued_for_its_first_sync() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("first-sync.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let credentials =
+            CredentialStore::temporary(&directory.path().join("first-sync.keychain-db"));
+        let prepared = prepare_imap_account(&provision_request(993, "secret")).expect("prepare");
+        persist_imap_account(&path, &credentials, &prepared, 5_000).expect("persist");
+
+        // The row starts never_synced, and "sync now" is what the command calls
+        // next: it has to take a mailbox with no history.
+        assert_eq!(
+            crate::imap::sync_account_now(&path, &prepared.account_id, 6_000).expect("schedule"),
+            1
+        );
+        let connection = Connection::open(&path).expect("connection");
+        let (sync_state, queued): (String, i64) = connection
+            .query_row(
+                "SELECT provider.sync_state,
+                        (SELECT COUNT(*) FROM provider_work_items work
+                         WHERE work.account_id = provider.account_id
+                           AND work.kind = 'sync' AND work.state = 'queued')
+                 FROM provider_accounts provider
+                 WHERE provider.account_id = ?1",
+                [&prepared.account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row after scheduling");
+        assert_eq!((sync_state.as_str(), queued), ("scheduled", 1));
+        let _ = credentials.remove(&prepared.record_ref);
+    }
+
     fn configured_fixture() -> (tempfile::TempDir, PathBuf, CredentialStore, String) {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("imap-access.db");
