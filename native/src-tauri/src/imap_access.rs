@@ -41,7 +41,6 @@ impl ImapAccessSource for ImapKeychainAccess {
     fn access_for_account(&self, account_id: &str) -> Result<ImapAccessGrant, ImapAccessError> {
         let configured = read_configured_account(&self.database_path, account_id)?;
         match configured.auth_state.as_str() {
-            "credential_locked" => return Err(ImapAccessError::CredentialUnavailable),
             "reauthorization_required" | "signed_out" => {
                 return Err(ImapAccessError::ReauthorizationRequired)
             }
@@ -88,7 +87,7 @@ pub(crate) fn reconcile_credential_records(
             "SELECT account_id, remote_account_id, credential_ref
              FROM provider_accounts
              WHERE provider_kind = 'imap' AND credential_ref IS NOT NULL
-               AND auth_state IN ('credential_locked', 'ready')
+               AND auth_state = 'ready'
              ORDER BY account_id",
         )?;
         let values = statement
@@ -795,6 +794,19 @@ mod tests {
             .expect("row after scheduling");
         assert_eq!((sync_state.as_str(), queued), ("scheduled", 1));
         let _ = credentials.remove(&prepared.record_ref);
+    }
+
+    #[test]
+    fn the_locked_credential_state_cannot_be_written() {
+        let (_directory, path, _credentials, _reference) = configured_fixture();
+        let connection = Connection::open(&path).expect("connection");
+        // The schema retired it, so nothing reading auth_state needs an arm for it.
+        let refused = connection.execute(
+            "UPDATE provider_accounts SET auth_state = 'credential_locked'
+             WHERE account_id = 'imap-account'",
+            [],
+        );
+        assert!(refused.is_err());
     }
 
     fn configured_fixture() -> (tempfile::TempDir, PathBuf, CredentialStore, String) {
