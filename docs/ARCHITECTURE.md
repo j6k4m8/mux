@@ -65,7 +65,7 @@ The mailbox keeps every loaded row but renders at most 120 of them.
 
 ## Credentials
 
-Secrets are never stored in SQLite and never cross IPC. Svelte can invoke the Gmail connect and cancel lifecycle commands and nothing else; client values, authorization codes, and tokens stay in Rust. There is no command that reads, writes, or unlocks a credential, and none that accepts a password.
+Secrets are never stored in SQLite, and none ever leaves Rust: no command reads, writes, or unlocks a credential, and no response carries a password, token, host, or username. One secret goes the other way — `imap_account_add` takes the mailbox password from the form, proves it against the server, and files it in the keychain — because generic IMAP has no browser flow to borrow. Gmail is connected through its lifecycle commands alone; client values, authorization codes, and tokens stay in Rust.
 
 The installed-desktop flow uses the system browser, random state, PKCE S256, an exact random-port IPv4 loopback redirect with bounded reads and deadlines, fixed Google endpoints, `gmail.modify`, and Gmail profile identity binding. Completed authority goes to the macOS Keychain; SQLite keeps only the normalized mailbox identity and an opaque reference. At startup every stored reference is revalidated against the keychain, and an account whose record is missing or malformed is marked for reauthorization.
 
