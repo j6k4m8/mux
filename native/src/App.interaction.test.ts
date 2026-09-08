@@ -1060,6 +1060,100 @@ describe('production mailbox interactions', () => {
     }
   });
 
+  test('both headers name a folder and its account, and give every account back afterwards', async () => {
+    mailbox.containers.push({
+      accountId: account.id,
+      remoteId: 'Label_17',
+      name: 'Zoomie Cycle',
+      kind: 'label',
+      role: 'custom',
+      unread: 1,
+      total: 3
+    });
+    try {
+      const { user } = await renderMailbox();
+      const topbar = screen.getByTestId('topbar-workspace');
+      const heading = screen.getByTestId('thread-list-header');
+      const navigation = screen.getByTestId('mailbox-navigation');
+      expect(topbar.querySelector('span')?.textContent).toBe('All accounts');
+      expect(within(heading).getByRole('heading').textContent).toBe('Inbox');
+
+      await user.click(within(navigation).getByRole('button', { name: /Work's folders/u }));
+      await user.click(within(navigation).getByRole('button', { name: /Zoomie Cycle/u }));
+      // A folder exists in one account, so that account is the scope in both places.
+      expect(topbar.querySelector('span')?.textContent).toBe('Work');
+      expect(topbar.querySelector('small')?.textContent).toBe('Zoomie Cycle');
+      expect(heading.querySelector('small')?.textContent).toBe('jordan@acme.example');
+      expect(within(heading).getByRole('heading').textContent).toBe('Zoomie Cycle');
+
+      // A search from inside a folder covers the account, not the folder.
+      await user.click(screen.getByTestId('mailbox-search'));
+      await user.keyboard('budget');
+      expect(topbar.querySelector('span')?.textContent).toBe('Work');
+      expect(topbar.querySelector('small')?.textContent).toBe('Search all mail');
+      expect(within(heading).getByRole('heading').textContent).toBe('Search all mail');
+      await user.keyboard('{Escape}');
+      expect(topbar.querySelector('small')?.textContent).toBe('Zoomie Cycle');
+      expect(within(heading).getByRole('heading').textContent).toBe('Zoomie Cycle');
+
+      await user.click(screen.getByRole('button', { name: /All accounts/u }));
+      expect(topbar.querySelector('span')?.textContent).toBe('All accounts');
+      expect(topbar.querySelector('small')?.textContent).toBe('All mail');
+      expect(heading.querySelector('small')?.textContent).toBe('All accounts');
+      expect(within(heading).getByRole('heading').textContent).toBe('All mail');
+    } finally {
+      mailbox.containers.pop();
+    }
+  });
+
+  test('both headers say a search is on, how wide it is, and step back when it is cleared', async () => {
+    const { user } = await renderMailbox();
+    const topbar = screen.getByTestId('topbar-workspace');
+    const heading = within(screen.getByTestId('thread-list-header')).getByRole('heading');
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+
+    // The seeded scope alone is not a search yet, so nothing changes.
+    await user.click(search);
+    expect(search.value).toBe('in:inbox ');
+    expect(topbar.querySelector('small')?.textContent).toBe('Inbox');
+    expect(heading.textContent).toBe('Inbox');
+
+    await user.keyboard('budget');
+    expect(topbar.querySelector('small')?.textContent).toBe('Search inbox');
+    expect(heading.textContent).toBe('Search inbox');
+
+    // Without the scope the same words cover the whole account, and the headers say so.
+    await user.clear(search);
+    await user.keyboard('budget');
+    expect(topbar.querySelector('small')?.textContent).toBe('Search all mail');
+    expect(heading.textContent).toBe('Search all mail');
+
+    await user.keyboard('{Escape}');
+    expect(search.value).toBe('');
+    expect(topbar.querySelector('small')?.textContent).toBe('Inbox');
+    expect(heading.textContent).toBe('Inbox');
+  });
+
+  test('a smart view keeps its own name in both headers', async () => {
+    const { user } = await renderMailbox();
+    const topbar = screen.getByTestId('topbar-workspace');
+    const heading = screen.getByTestId('thread-list-header');
+
+    await user.click(screen.getByTitle('Show only Work'));
+    await user.click(screen.getByTitle('Unread conversations'));
+    // It runs as a search, but it is the view the reader chose, not a search of one.
+    await waitFor(() => expect(within(heading).getByRole('heading').textContent).toBe('Unread'));
+    expect(topbar.querySelector('span')?.textContent).toBe('Work');
+    expect(topbar.querySelector('small')?.textContent).toBe('Unread');
+    expect(heading.querySelector('small')?.textContent).toBe('jordan@acme.example');
+
+    await user.click(screen.getByRole('button', { name: /All accounts/u }));
+    expect(topbar.querySelector('span')?.textContent).toBe('All accounts');
+    expect(heading.querySelector('small')?.textContent).toBe('All accounts');
+    expect(topbar.querySelector('small')?.textContent).toBe('All mail');
+    expect(within(heading).getByRole('heading').textContent).toBe('All mail');
+  });
+
   test('jumps to a folder with g without leaving the keyboard', async () => {
     const { calls, user } = await renderMailbox();
     blurActiveElement();

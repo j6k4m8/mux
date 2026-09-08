@@ -51,7 +51,7 @@
     watchSystemTheme
   } from './theme';
   import type { ThemePreference } from './theme';
-  import { searchIsNarrowed, searchViewFor, viewScopeTerm } from './searchQuery';
+  import { searchIsNarrowed, searchScopeView, searchViewFor, viewScopeTerm } from './searchQuery';
   import {
     confirmationNotice,
     failureNotice,
@@ -243,7 +243,7 @@
     invitations: 'Invitations',
     finance: 'Finance'
   } as const)[selectedSmartView];
-  $: viewTitle = selectedContainer?.name || smartViewTitle || ({
+  const VIEW_TITLES: Record<MailboxView, string> = {
     all: 'All mail',
     inbox: 'Inbox',
     archive: 'Archive',
@@ -252,7 +252,21 @@
     sent: 'Sent',
     trash: 'Trash',
     drafts: 'Drafts'
-  } as const)[selectedView];
+  };
+  $: viewTitle = selectedContainer?.name || smartViewTitle || VIEW_TITLES[selectedView];
+  /// Both headers read from these, so the topbar and the pane heading cannot
+  /// describe two different lists. A folder is only ever read inside its own
+  /// account, so its account is the scope whatever the account list says. A
+  /// smart view is a search the reader chose by name, so it keeps that name;
+  /// any other search is titled by the mailbox it still covers, which is the
+  /// view it started from only while the seeded scope is in the box.
+  $: headerAccountId = selectedContainer?.accountId ?? selectedAccount;
+  $: headerScope = headerAccountId === null
+    ? { name: 'All accounts', email: 'All accounts' }
+    : mailbox?.accounts.find((account) => account.id === headerAccountId) ?? { name: headerAccountId, email: headerAccountId };
+  $: headerTitle = isSearching && !selectedSmartView
+    ? `Search ${VIEW_TITLES[searchScopeView(filter, selectedView)].toLocaleLowerCase()}`
+    : viewTitle;
   $: selectedCounts = mailbox?.viewCounts.find((counts) =>
     counts.accountId === selectedAccount
   ) ?? {
@@ -1713,9 +1727,9 @@
       <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
       <strong>mux</strong>
     </div>
-    <div class="workspace">
-      <span>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.name}</span>
-      <small>{viewTitle}</small>
+    <div class="workspace" data-testid="topbar-workspace">
+      <span>{headerScope.name}</span>
+      <small>{headerTitle}</small>
     </div>
     <SearchField
       bind:this={searchField}
@@ -1823,7 +1837,7 @@
 
         <section class="thread-pane" aria-label={viewTitle}>
           <header class="pane-heading" data-testid="thread-list-header">
-            <div><small>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.email}</small><h1>{filter ? `Search ${viewTitle.toLocaleLowerCase()}` : viewTitle}</h1></div>
+            <div><small>{headerScope.email}</small><h1>{headerTitle}</h1></div>
             <span>{searching ? 'Searching…' : `${isSearching && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
           </header>
 

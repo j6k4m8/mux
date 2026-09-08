@@ -6,6 +6,7 @@ import {
   lexSearchQuery,
   searchFields,
   searchIsNarrowed,
+  searchScopeView,
   searchSegments,
   searchSuggestions,
   searchTerms,
@@ -168,4 +169,16 @@ test('a box holding only the seeded scope has not narrowed anything', () => {
   // The same term in a different mailbox is a real narrowing.
   assert.equal(searchIsNarrowed('in:inbox', 'archive' as never), true);
   assert.equal(searchIsNarrowed('', 'inbox' as never), false);
+});
+
+test('a search covers its view only while the seeded scope is still in the box', () => {
+  assert.equal(searchScopeView('in:inbox budget', 'inbox' as never), 'inbox');
+  assert.equal(searchScopeView('budget in:inbox', 'inbox' as never), 'inbox');
+  assert.equal(searchScopeView('is:starred budget', 'starred' as never), 'starred');
+  // Deleting the scope widens the search to the whole account, and the title with it.
+  assert.equal(searchScopeView('budget', 'inbox' as never), 'all');
+  assert.equal(searchScopeView('in:trash budget', 'inbox' as never), 'trash');
+  // All mail has no scope to keep, and drafts are only ever filtered in place.
+  assert.equal(searchScopeView('budget', 'all' as never), 'all');
+  assert.equal(searchScopeView('budget', 'drafts' as never), 'drafts');
 });
