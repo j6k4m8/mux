@@ -333,6 +333,26 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .folder-section strong { min-width: 0; overflow: hidden; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .folder-section em { color: var(--text-faint); font-size: 10px; font-style: normal; font-weight: 700; }
 .folder-chevron { color: var(--text-faint); font-size: 12px; }
+/* A saved search is a row like any other, with a quiet × beside it. The × is
+   only faded out, never removed, so it stays a tab stop: it shows for the row
+   under the pointer and for whichever of the pair has the keyboard. */
+.saved-search-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.saved-search-row .saved-search-forget {
+  width: 22px;
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 4px;
+  padding: 0;
+  border-radius: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  opacity: 0;
+}
+.saved-search-row:hover .saved-search-forget,
+.saved-search-row:focus-within .saved-search-forget { opacity: 1; }
+.saved-search-row .saved-search-forget:hover { color: var(--danger); background: var(--surface-hover); }
 .folders { margin: 0 0 4px 6px; }
 
 /* The narrow rail. Everything that is a word goes away; the icons stay put so
@@ -362,7 +382,9 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .sidebar.is-rail .settings-button strong,
 .sidebar.is-rail .settings-button kbd,
 .sidebar.is-rail .smart-views button > span:not(.smart-dot),
+.sidebar.is-rail .saved-search-forget,
 .sidebar.is-rail .compose > span { display: none; }
+.sidebar.is-rail .saved-search-row { grid-template-columns: minmax(0, 1fr); }
 .sidebar.is-rail .nav-section button,
 .sidebar.is-rail .accounts button,
 .sidebar.is-rail .settings-button { grid-template-columns: 22px; justify-content: center; padding: 0; }
@@ -856,6 +878,9 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .command-list strong { color: inherit; font-size: 12px; }
 .command-list small { margin-top: 3px; color: var(--text-faint); font-size: 10px; }
 .command-list kbd { flex: 0 0 auto; color: var(--text-faint); }
+/* A saved search's chip is its whole query, which can be long; it gives way
+   before the row does. */
+.jump-dialog .command-list kbd { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .jump-dialog > .jump-header { min-height: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 16px 18px 10px 20px; border-bottom: 0; background: transparent; }
 .jump-header h1 { margin: 0; font-size: 15px; }

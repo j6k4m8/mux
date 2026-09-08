@@ -41,6 +41,7 @@
     persistSidebarLayout,
     readSidebarLayout,
     toggleFolderAccount,
+    toggleSavedSearches,
     toggleSmartViews,
     DEFAULT_SIDEBAR_LAYOUT
   } from './sidebarLayout';
@@ -323,6 +324,7 @@
     ? mailboxJumpRows({
         accounts: mailbox.accounts,
         containers: mailbox.containers,
+        saved: savedSearches,
         selectedAccount,
         scoped: goToScoped,
         scopeAccountId: selectedAccount
@@ -332,6 +334,7 @@
   onMount(() => {
     destroyed = false;
     sidebar = readSidebarLayout();
+    savedSearches = readSavedSearches();
     setTheme(readThemePreference(), false);
     const stopWatchingSystemTheme = watchSystemTheme(systemThemeChanged);
     themeWatchers.push(stopWatchingSystemTheme);
@@ -397,6 +400,11 @@
 
   function toggleSmartViewsSection() {
     sidebar = toggleSmartViews(sidebar);
+    persistSidebarLayout(sidebar);
+  }
+
+  function toggleSavedSearchesSection() {
+    sidebar = toggleSavedSearches(sidebar);
     persistSidebarLayout(sidebar);
   }
 
@@ -534,7 +542,8 @@
     }
     selectedAccount = row.target.accountId;
     if (row.target.kind === 'view') selectView(row.target.view);
-    else selectSmartView(row.target.smart, row.target.query);
+    else if (row.target.kind === 'smart') selectSmartView(row.target.smart, row.target.query);
+    else selectSavedSearch(row.target);
   }
 
   function openMove() {
@@ -575,6 +584,15 @@
   function forgetSearch(query: string) {
     savedSearches = removeSavedSearch(savedSearches, query);
     persistSavedSearches(savedSearches);
+  }
+
+  /// A saved search is run by putting its query in the box and handing it to
+  /// `filterChanged`, which is what picking the ★ row in the dropdown does
+  /// through the box's binding and `oninput`. The sidebar row and the jump
+  /// dialog come here, so the three cannot come apart.
+  function selectSavedSearch(search: SavedSearch) {
+    filter = search.query;
+    filterChanged();
   }
 
   function restoreDialogFocus(target: HTMLElement | null) {
@@ -1830,12 +1848,17 @@
           railCollapsed={railCollapsed}
           openFolderAccounts={sidebar.openFolderAccounts}
           smartViewsOpen={sidebar.smartViewsOpen}
+          savedSearchesOpen={sidebar.savedSearchesOpen}
+          {savedSearches}
           {toggleRail}
           {toggleFolderSection}
           {toggleSmartViewsSection}
+          {toggleSavedSearchesSection}
           {openStats}
           {selectView}
           {selectSmartView}
+          {selectSavedSearch}
+          {forgetSearch}
           {selectAccount}
           {selectContainer}
           {toggleAccountVisibility}
@@ -2145,7 +2168,7 @@
   {#if goToOpen}
     <JumpDialog
       title={goToScoped ? 'Go to folder in this account' : 'Go to'}
-      placeholder="Folder, smart view, or account…"
+      placeholder="Folder, smart view, saved search, or account…"
       rows={goToRows}
       emptyLabel="No matching folder"
       testid="go-to-dialog"

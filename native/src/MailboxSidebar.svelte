@@ -1,7 +1,8 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import { mailboxViews, smartViews } from './mailboxViews';
-  import { folderSectionIsOpen, smartViewsSectionIsOpen } from './sidebarLayout';
+  import { folderSectionIsOpen, savedSearchesSectionIsOpen, smartViewsSectionIsOpen } from './sidebarLayout';
+  import type { SavedSearch } from './savedSearches';
   import type {
     AccountSummary,
     ContainerSummary,
@@ -21,6 +22,8 @@
   export let railCollapsed = false;
   export let openFolderAccounts: string[] = [];
   export let smartViewsOpen = true;
+  export let savedSearchesOpen = true;
+  export let savedSearches: SavedSearch[] = [];
   export let hiddenAccounts: string[] = [];
   export let filter = '';
   export let collapsed = false;
@@ -31,11 +34,14 @@
   export let compose: () => void;
   export let selectView: (view: MailboxView) => void;
   export let selectSmartView: (view: Exclude<SmartView, ''>, query: string) => void;
+  export let selectSavedSearch: (search: SavedSearch) => void;
+  export let forgetSearch: (query: string) => void;
   export let selectAccount: (accountId: string | null) => void;
   export let selectContainer: (container: ContainerSummary) => void;
   export let toggleRail: () => void;
   export let toggleFolderSection: (accountId: string) => void;
   export let toggleSmartViewsSection: () => void;
+  export let toggleSavedSearchesSection: () => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openStats: () => void;
@@ -52,6 +58,10 @@
     .filter((section) => section.folders.length > 0);
   $: openFolderAccountId = selectedContainer?.accountId ?? null;
   $: smartViewsShown = smartViewsSectionIsOpen(smartViewsOpen, selectedSmartView);
+  /// The saved search being run, if the box holds one of them. Queries are
+  /// stored trimmed, so the box is compared trimmed.
+  $: activeSavedQuery = savedSearches.find((search) => search.query === filter.trim())?.query ?? '';
+  $: savedSearchesShown = savedSearchesSectionIsOpen(savedSearchesOpen, activeSavedQuery);
 
   $: draftCount = mailbox.drafts.filter(
     (draft) => selectedAccount === null || draft.accountId === selectedAccount
@@ -136,6 +146,49 @@
         </button>
       {/each}
     </section>
+  {/if}
+
+  {#if savedSearches.length}
+    <button
+      class="section-label section-toggle"
+      type="button"
+      aria-expanded={savedSearchesShown}
+      data-action="toggle-saved-searches"
+      title={savedSearchesShown ? 'Fold away saved searches' : 'Show saved searches'}
+      on:click={() => toggleSavedSearchesSection()}
+    >
+      <span>Saved searches</span>
+      <span class="folder-chevron" aria-hidden="true">{savedSearchesShown ? '\u2304' : '\u203A'}</span>
+    </button>
+    {#if savedSearchesShown || railCollapsed}
+      <section class="nav-section saved-searches">
+        <!-- The forget control cannot live inside the row's own button, so the
+             two sit side by side on one grid row, as an account's dot and name
+             do. Rows are keyed by query, the one thing the list is unique on. -->
+        {#each savedSearches as search (search.query)}
+          <div class="saved-search-row">
+            <button
+              class:is-active={activeSavedQuery === search.query}
+              data-action="select-saved-search"
+              data-query={search.query}
+              title={search.query}
+              on:click={() => selectSavedSearch(search)}
+            >
+              <span class="nav-icon"><Icon name="search" size={15} /></span><strong>{search.name}</strong>
+            </button>
+            <button
+              class="saved-search-forget"
+              type="button"
+              aria-label={`Forget “${search.name}”`}
+              title="Forget this search"
+              data-action="forget-saved-search"
+              data-query={search.query}
+              on:click={() => forgetSearch(search.query)}
+            >✕</button>
+          </div>
+        {/each}
+      </section>
+    {/if}
   {/if}
 
   {#if folderSections.length}

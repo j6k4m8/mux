@@ -1389,6 +1389,129 @@ describe('production mailbox interactions', () => {
     expect(search.value).toBe('is:unread');
   });
 
+  test('a saved search gets a row in the sidebar, and the row runs it', async () => {
+    const { calls, user } = await renderMailbox();
+    const navigation = screen.getByTestId('mailbox-navigation');
+    expect(within(navigation).queryByRole('button', { name: 'Saved searches' })).toBeNull();
+
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+    await user.click(search);
+    await user.clear(search);
+    await user.keyboard('from:alice');
+    await user.click(within(await screen.findByTestId('search-suggestions')).getByText('Save "from:alice"'));
+
+    // The section appears with the save, and its row is the search now running.
+    const heading = within(navigation).getByRole('button', { name: 'Saved searches' });
+    expect(heading.getAttribute('aria-expanded')).toBe('true');
+    const row = within(navigation).getByRole('button', { name: 'from:alice' });
+    expect(row.title).toBe('from:alice');
+    expect(row.classList.contains('is-active')).toBe(true);
+
+    // Leaving the search leaves the row behind; coming back to it is one click.
+    await user.click(within(navigation).getByRole('button', { name: /Inbox/u }));
+    expect(row.classList.contains('is-active')).toBe(false);
+    expect(search.value).toBe('');
+    const before = calls.length;
+    await user.click(row);
+    expect(search.value).toBe('from:alice');
+    expect(row.classList.contains('is-active')).toBe(true);
+    // from:alice carries no in:inbox scope, so it runs, and reads, account-wide.
+    expect(within(screen.getByTestId('thread-list-header')).getByRole('heading').textContent).toBe('Search all mail');
+    await waitFor(() => {
+      const request = calls.slice(before).find((call) => call.command === 'search_threads');
+      expect(request?.payload).toMatchObject({ input: { query: 'from:alice' } });
+    });
+  });
+
+  test('forgetting a saved search from its row removes it, and the last one takes the section with it', async () => {
+    const { user } = await renderMailbox();
+    const navigation = screen.getByTestId('mailbox-navigation');
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+    for (const query of ['from:alice', 'subject:budget']) {
+      await user.click(search);
+      await user.clear(search);
+      await user.keyboard(query);
+      await user.click(within(await screen.findByTestId('search-suggestions')).getByText(`Save "${query}"`));
+    }
+    // Newest first, as the dropdown lists them.
+    const rows = () => [...navigation.querySelectorAll('[data-action="select-saved-search"]')].map((row) => row.textContent);
+    expect(rows()).toEqual(['subject:budget', 'from:alice']);
+
+    await user.click(within(navigation).getByRole('button', { name: 'Forget “from:alice”' }));
+    expect(rows()).toEqual(['subject:budget']);
+    expect(JSON.parse(window.localStorage.getItem('mux-saved-searches')!)).toEqual([{ name: 'subject:budget', query: 'subject:budget' }]);
+
+    await user.click(within(navigation).getByRole('button', { name: 'Forget “subject:budget”' }));
+    expect(rows()).toEqual([]);
+    expect(within(navigation).queryByRole('button', { name: 'Saved searches' })).toBeNull();
+    expect(JSON.parse(window.localStorage.getItem('mux-saved-searches')!)).toEqual([]);
+  });
+
+  test('saved searches come back at launch and fold away, with the one being run kept in view', async () => {
+    // What was saved last time is there at launch. Storage is untrusted, so
+    // the entry with nothing to run is dropped on the way in.
+    window.localStorage.setItem('mux-saved-searches', JSON.stringify([
+      { name: 'Alice', query: 'from:alice' },
+      { name: 'Nothing', query: '' }
+    ]));
+    const { user } = await renderMailbox();
+    const navigation = screen.getByTestId('mailbox-navigation');
+    const heading = within(navigation).getByRole('button', { name: 'Saved searches' });
+    expect(heading.title).toBe('Fold away saved searches');
+    expect(within(navigation).getByRole('button', { name: 'Alice' }).title).toBe('from:alice');
+    expect(within(navigation).queryByRole('button', { name: 'Nothing' })).toBeNull();
+
+    await user.click(heading);
+    expect(heading.getAttribute('aria-expanded')).toBe('false');
+    expect(heading.title).toBe('Show saved searches');
+    expect(within(navigation).queryByRole('button', { name: 'Alice' })).toBeNull();
+    const stored = JSON.parse(window.localStorage.getItem('mux-sidebar')!);
+    expect(stored.savedSearchesOpen).toBe(false);
+    // The fold is its own; the smart views are not touched by it.
+    expect(stored.smartViewsOpen).toBe(true);
+    expect(within(navigation).getByRole('button', { name: 'Unread' })).toBeTruthy();
+
+    // Picking the row in the dropdown runs the same search the sidebar row
+    // would, so the folded section shows it as the one running.
+    const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
+    await user.click(search);
+    await user.clear(search);
+    await user.click(within(await screen.findByTestId('search-suggestions')).getByText('Alice'));
+    expect(search.value).toBe('from:alice');
+    expect(within(navigation).getByRole('button', { name: 'Alice' }).classList.contains('is-active')).toBe(true);
+    expect(heading.getAttribute('aria-expanded')).toBe('true');
+    // Showing it was not a choice to keep it open: the fold is still what is stored.
+    expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).savedSearchesOpen).toBe(false);
+
+    // Leaving the search folds the section back away.
+    await user.click(within(navigation).getByRole('button', { name: /Inbox/u }));
+    expect(within(navigation).queryByRole('button', { name: 'Alice' })).toBeNull();
+    expect(heading.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  test('a saved search is somewhere g can go', async () => {
+    window.localStorage.setItem('mux-saved-searches', JSON.stringify([{ name: 'Alice', query: 'from:alice' }]));
+    const { calls, user } = await renderMailbox();
+    blurActiveElement();
+
+    await fireEvent.keyDown(window, { key: 'g' });
+    const dialog = await screen.findByTestId('go-to-dialog');
+    await user.type(within(dialog).getByRole('textbox', { name: 'Go to filter' }), 'alice');
+    const first = within(dialog).getAllByRole('option')[0];
+    expect(first.textContent).toContain('Alice');
+    expect(first.querySelector('kbd')?.textContent).toBe('from:alice');
+    await user.keyboard('{Enter}');
+
+    expect(screen.queryByTestId('go-to-dialog')).toBeNull();
+    expect((screen.getByTestId('mailbox-search') as HTMLInputElement).value).toBe('from:alice');
+    const navigation = screen.getByTestId('mailbox-navigation');
+    expect(within(navigation).getByRole('button', { name: 'Alice' }).classList.contains('is-active')).toBe(true);
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'search_threads').at(-1);
+      expect(request?.payload).toMatchObject({ input: { query: 'from:alice', accountId: null } });
+    });
+  });
+
   test('dispatches toolbar, snooze, and invitation actions through typed native commands', async () => {
     const { calls, user } = await renderMailbox();
 

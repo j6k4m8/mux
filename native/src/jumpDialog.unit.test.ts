@@ -63,6 +63,44 @@ test('a folder is offered only under the account it belongs to', () => {
   assert.equal(folders[1].priority, false);
 });
 
+test('a saved search is offered under every scope, after the views, carrying the query it runs', () => {
+  const saved = [
+    { name: 'Alice', query: 'from:alice' },
+    { name: 'Alice', query: 'from:alice has:attachment' }
+  ];
+  const rows = mailboxJumpRows({ accounts, saved, selectedAccount: 'acc_home' });
+  const alice = rows.filter((row) => row.target.kind === 'saved' && row.target.query === 'from:alice');
+  assert.deepEqual(
+    alice.map((row) => (row.target.kind === 'saved' ? row.target.accountId : undefined)),
+    [null, 'acc_work', 'acc_home']
+  );
+  assert.deepEqual(alice[2].target, { kind: 'saved', name: 'Alice', query: 'from:alice', accountId: 'acc_home' });
+  assert.equal(alice[2].title, 'Alice');
+  assert.equal(alice[2].subtitle, 'Home · jordan@home.example');
+  assert.equal(alice[2].chip, 'from:alice');
+  assert.equal(alice[2].priority, true);
+  assert.equal(alice[0].priority, false);
+  // Two searches may share a name; their rows are still told apart.
+  assert.equal(new Set(rows.map((row) => row.id)).size, rows.length);
+  // Within a scope the fixed views and smart views come first; the reader's own
+  // searches follow them, and the next scope starts after.
+  const ids = rows.map((row) => row.id);
+  assert.ok(ids.indexOf('smart:all:finance') < ids.indexOf('saved:all:from:alice'));
+  assert.ok(ids.indexOf('saved:all:from:alice') < ids.indexOf('view:acc_work:inbox'));
+  // With nothing saved, nothing is offered.
+  assert.ok(mailboxJumpRows({ accounts, selectedAccount: null }).every((row) => row.target.kind !== 'saved'));
+});
+
+test('the scoped list keeps the saved searches under that one account', () => {
+  const saved = [{ name: 'Alice', query: 'from:alice' }];
+  const rows = mailboxJumpRows({ accounts, saved, selectedAccount: 'acc_work', scoped: true, scopeAccountId: 'acc_work' });
+  assert.deepEqual(
+    rows.filter((row) => row.target.kind === 'saved').map((row) => row.target),
+    [{ kind: 'saved', name: 'Alice', query: 'from:alice', accountId: 'acc_work' }]
+  );
+  assert.ok(rows.every((row) => row.subtitle === 'Work · jordan@acme.example'));
+});
+
 test('the scoped list keeps that account folders and no others', () => {
   const containers = [
     { accountId: 'acc_work', remoteId: 'Label_17', name: 'Zoomie Cycle', kind: 'label' as const, role: 'custom', unread: 1, total: 3 },

@@ -1,8 +1,8 @@
-/// What the sidebar is showing: how wide it is, whether the smart views are out,
-/// and which accounts' folders are open. All of it is the reader's own
-/// arrangement of the rail rather than mail data, so it lives on this Mac next
-/// to the appearance choices — and is read back defensively, because storage is
-/// untrusted input.
+/// What the sidebar is showing: how wide it is, whether the smart views and the
+/// saved searches are out, and which accounts' folders are open. All of it is
+/// the reader's own arrangement of the rail rather than mail data, so it lives
+/// on this Mac next to the appearance choices — and is read back defensively,
+/// because storage is untrusted input.
 
 import type { SmartView } from './types';
 
@@ -20,12 +20,16 @@ export type SidebarLayout = {
   /// Whether the smart views are shown. They start open: there are only four,
   /// and they are folded away only by a reader who asked for that.
   smartViewsOpen: boolean;
+  /// Whether the saved searches are shown. They start open too: the section is
+  /// only there once a search has been saved, which is already a wish to see it.
+  savedSearchesOpen: boolean;
 };
 
 export const DEFAULT_SIDEBAR_LAYOUT: SidebarLayout = {
   collapsed: false,
   openFolderAccounts: [],
-  smartViewsOpen: true
+  smartViewsOpen: true,
+  savedSearchesOpen: true
 };
 
 export function readSidebarLayout(): SidebarLayout {
@@ -48,9 +52,14 @@ export function readSidebarLayout(): SidebarLayout {
       openFolderAccounts.push(entry);
       if (openFolderAccounts.length === MAX_REMEMBERED_ACCOUNTS) break;
     }
-    // Anything but a stored `false` reads as open, so a layout written before
-    // the smart views could fold keeps showing them.
-    return { collapsed: value.collapsed === true, openFolderAccounts, smartViewsOpen: value.smartViewsOpen !== false };
+    // Anything but a stored `false` reads as open, so a layout written before a
+    // section could fold keeps showing it.
+    return {
+      collapsed: value.collapsed === true,
+      openFolderAccounts,
+      smartViewsOpen: value.smartViewsOpen !== false,
+      savedSearchesOpen: value.savedSearchesOpen !== false
+    };
   } catch {
     return { ...DEFAULT_SIDEBAR_LAYOUT };
   }
@@ -78,6 +87,10 @@ export function toggleSmartViews(layout: SidebarLayout): SidebarLayout {
   return { ...layout, smartViewsOpen: !layout.smartViewsOpen };
 }
 
+export function toggleSavedSearches(layout: SidebarLayout): SidebarLayout {
+  return { ...layout, savedSearchesOpen: !layout.savedSearchesOpen };
+}
+
 /// The section holding the folder being read is open whether or not it was
 /// folded away: the rail should show where you are.
 export function folderSectionIsOpen(
@@ -92,4 +105,10 @@ export function folderSectionIsOpen(
 /// them must not hide the row that says what the list is.
 export function smartViewsSectionIsOpen(open: boolean, selectedSmartView: SmartView): boolean {
   return open || selectedSmartView !== '';
+}
+
+/// And the saved searches stay out while one of them is the search being run.
+/// `activeQuery` is that search's query, or '' when the list is not one of them.
+export function savedSearchesSectionIsOpen(open: boolean, activeQuery: string): boolean {
+  return open || activeQuery !== '';
 }
