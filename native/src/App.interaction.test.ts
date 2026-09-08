@@ -753,6 +753,22 @@ describe('production mailbox interactions', () => {
     }
   });
 
+  test('All accounts is laid out as one more account row', async () => {
+    await renderMailbox();
+    const [allRow, accountRow] = document.querySelectorAll<HTMLElement>('.accounts > .account-row');
+    expect(allRow.children[1]).toBe(screen.getByRole('button', { name: /All accounts/u }));
+    expect(accountRow.children[1]).toBe(document.querySelector('[data-action="select-account"]'));
+    // The dot cell, then the button carrying name and count: the same two
+    // cells in the same order, so the two kinds of row line up.
+    for (const row of [allRow, accountRow]) {
+      expect(row.children).toHaveLength(2);
+      expect(row.children[0].querySelector('.account-dot')).toBeTruthy();
+      expect(row.children[1].classList.contains('account-select')).toBe(true);
+    }
+    // There is nothing to hide for every account at once, so its dot is not a toggle.
+    expect(allRow.querySelectorAll('button')).toHaveLength(1);
+  });
+
   test('leaves Tab to the browser and clears search with Escape', async () => {
     const { user } = await renderMailbox();
     const search = screen.getByTestId('mailbox-search') as HTMLInputElement;

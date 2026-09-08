@@ -164,10 +164,23 @@
 
   <p class="section-label">Accounts</p>
   <section class="accounts">
-    <button class:is-active={selectedAccount === null} data-action="account-all" title="Show every account together" on:click={() => selectAccount(null)}>
-      <span class="account-dot all"></span><span>All accounts</span>
-      <em>{totalUnread}</em>
-    </button>
+    <!-- All accounts is one more account row, so its dot and name sit in the
+         same columns as the accounts under it. Nothing is shown or hidden for
+         all of them at once, so its dot cell is only the dot. -->
+    <div class="account-row all">
+      <span class="account-mark" aria-hidden="true"><span class="account-dot all"></span></span>
+      <button
+        class="account-select"
+        class:is-active={selectedAccount === null}
+        type="button"
+        data-action="account-all"
+        title="Show every account together"
+        on:click={() => selectAccount(null)}
+      >
+        <span>All accounts</span>
+        <em>{totalUnread}</em>
+      </button>
+    </div>
     {#each mailbox.accounts as account}
       {@const hidden = hiddenAccounts.includes(account.id)}
       <div class="account-row" class:is-hidden={hidden}>

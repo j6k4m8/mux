@@ -277,10 +277,13 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 }
 .nav-section button:hover, .accounts button:hover { color: var(--text); background: var(--surface-hover); }
 .nav-section button.is-active, .accounts button.is-active { color: var(--accent-strong); background: var(--accent-soft); }
-.nav-section strong, .accounts button > span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-section strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-row { display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: center; }
 .account-row .account-visibility { min-height: 37px; display: flex; align-items: center; justify-content: center; padding: 0; border-radius: 9px; background: transparent; cursor: pointer; }
 .account-row .account-visibility:hover { background: var(--surface-hover); }
+/* All accounts has no toggle; its dot cell is only the dot, centred where the
+   toggles centre theirs. */
+.account-row .account-mark { display: flex; justify-content: center; }
 .account-row .account-select { grid-template-columns: minmax(0, 1fr) auto; padding-left: 0; }
 .account-row .account-select > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* A hidden account still syncs; it is only absent from the list. */
@@ -334,7 +337,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .sidebar.is-rail .folder-section,
 .sidebar.is-rail .folders,
 .sidebar.is-rail .projection-status,
-.sidebar.is-rail .account-row,
+.sidebar.is-rail .account-row:not(.all),
 .sidebar.is-rail .nav-section strong,
 .sidebar.is-rail .nav-section em,
 .sidebar.is-rail .accounts button > span:not(.account-dot),
@@ -347,6 +350,12 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .sidebar.is-rail .accounts button,
 .sidebar.is-rail .settings-button { grid-template-columns: 22px; justify-content: center; padding: 0; }
 .sidebar.is-rail .smart-views button { grid-template-columns: 10px; justify-content: center; padding: 0; }
+/* All accounts keeps just its dot in the rail, laid over its button at the
+   row's full width, so the row still takes a click and still shows whether
+   every account is in scope. */
+.sidebar.is-rail .account-row.all { grid-template-columns: minmax(0, 1fr); }
+.sidebar.is-rail .account-row.all > * { grid-area: 1 / 1; }
+.sidebar.is-rail .account-row.all .account-mark { z-index: 1; pointer-events: none; }
 /* Nothing in the rail is wider than the rail, so nothing should be scrollable
    sideways. */
 .sidebar.is-rail { overflow-x: hidden; }
