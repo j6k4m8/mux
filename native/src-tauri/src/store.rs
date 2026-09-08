@@ -730,6 +730,26 @@ impl MuxStore {
         Ok(())
     }
 
+    /// Recolours one account. Every account has a colour whether or not a
+    /// provider is attached, so this writes to the account itself and a
+    /// local-only mailbox can be recoloured like any other.
+    pub(crate) fn set_account_color(
+        &mut self,
+        account_id: &str,
+        color: &str,
+    ) -> Result<(), StoreError> {
+        let account_id = bounded_text(account_id, "accountId", 200)?;
+        let color = account_color(color)?;
+        let changed = self.connection.execute(
+            "UPDATE accounts SET color = ?2 WHERE id = ?1",
+            params![account_id, color],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("Account was not found".into()));
+        }
+        Ok(())
+    }
+
     pub fn list_threads(&self, input: ThreadPageInput) -> Result<ThreadPage, StoreError> {
         let limit = input.limit.unwrap_or(50).clamp(1, 100);
         let account_id = exact_account_id(input.account_id.as_deref())?;
@@ -8982,6 +9002,91 @@ mod tests {
             }),
             Err(StoreError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn recolouring_an_account_reads_back_lowercased_through_the_listing() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("account-colour.db");
+        let mut store = MuxStore::open(&path, true).expect("seeded store opens");
+        let color_of = |store: &MuxStore, id: &str| {
+            store
+                .bootstrap()
+                .expect("bootstrap")
+                .accounts
+                .into_iter()
+                .find(|account| account.id == id)
+                .map(|account| account.color)
+                .expect("seeded account")
+        };
+        assert_eq!(color_of(&store, "acc_work"), "#3b82f6");
+
+        store
+            .set_account_color("acc_work", "#C93B63")
+            .expect("recolour");
+        // Kept the way it will be written into a style: lowercase, six digits.
+        assert_eq!(color_of(&store, "acc_work"), "#c93b63");
+        // The other account keeps its own.
+        assert_eq!(color_of(&store, "acc_research"), "#21b89a");
+    }
+
+    #[test]
+    fn anything_but_a_six_digit_hex_colour_is_refused_and_changes_nothing() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("bad-account-colour.db");
+        let mut store = MuxStore::open(&path, true).expect("seeded store opens");
+        for bad in [
+            "",
+            "#",
+            "#abc",
+            "red",
+            "c93b63",
+            "#abcdefg",
+            "#12345g",
+            " #c93b63",
+            "#c93b63 ",
+            "#c93b63;background:url(x)",
+            "url(#c93b63)",
+            "javascript:",
+            "#ｃ９３ｂ６３",
+        ] {
+            assert!(
+                matches!(
+                    store.set_account_color("acc_work", bad),
+                    Err(StoreError::Validation(_))
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        let color: String = store
+            .connection
+            .query_row(
+                "SELECT color FROM accounts WHERE id = 'acc_work'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("colour");
+        assert_eq!(color, "#3b82f6");
+    }
+
+    #[test]
+    fn recolouring_an_unknown_account_is_refused() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("unknown-account-colour.db");
+        let mut store = MuxStore::open(&path, true).expect("seeded store opens");
+        assert!(matches!(
+            store.set_account_color("acc_nobody", "#c93b63"),
+            Err(StoreError::NotFound(_))
+        ));
+        let recoloured: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE color = '#c93b63'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(recoloured, 0);
     }
 
     #[test]

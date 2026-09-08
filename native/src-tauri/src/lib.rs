@@ -213,6 +213,26 @@ fn set_account_refresh(
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountColorInput {
+    account_id: String,
+    color: String,
+}
+
+/// Recolours one account. The colour comes back out as an inline style on the
+/// other side of the bridge, so the store keeps nothing but a literal `#rrggbb`.
+#[tauri::command]
+fn set_account_color(state: State<'_, AppState>, input: AccountColorInput) -> Result<(), String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Native mailbox state is unavailable".to_string())?;
+    store
+        .set_account_color(&input.account_id, &input.color)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AccountIdInput {
     account_id: String,
 }
@@ -790,6 +810,7 @@ pub fn run() {
             imap_account_add,
             resync_all_mail,
             set_account_refresh,
+            set_account_color,
             sync_account_now
         ])
         .build(tauri::generate_context!())
@@ -993,6 +1014,7 @@ mod tests {
                 "imap_account_add",
                 "resync_all_mail",
                 "set_account_refresh",
+                "set_account_color",
                 "sync_account_now",
             ]
         );

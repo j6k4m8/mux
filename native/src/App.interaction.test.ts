@@ -104,6 +104,8 @@ type DraftLoader = (draftId: string) => unknown;
 
 function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
   const calls: IpcCall[] = [];
+  // Recolouring is the one setting whose effect the next bootstrap has to show.
+  const accountColors = new Map<string, string>();
   mockIPC((command, payload) => {
     calls.push({ command, payload });
     if (command === 'gmail_oauth_begin') {
@@ -115,7 +117,13 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
       if (input.host === 'wrong.example.test') throw new Error('The server refused that username and password');
       return { accountId: 'imap:fixture', email: input.email, folders: 12 };
     }
-    if (command === 'mailbox_bootstrap') return mailbox;
+    if (command === 'mailbox_bootstrap') {
+      if (!accountColors.size) return mailbox;
+      return {
+        ...mailbox,
+        accounts: mailbox.accounts.map((entry) => ({ ...entry, color: accountColors.get(entry.id) ?? entry.color }))
+      };
+    }
     if (command === 'list_threads') {
       return { threads, hasMore: false, nextCursor: null } satisfies ThreadPage;
     }
@@ -197,6 +205,11 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
     }
     if (command === 'resync_all_mail') return { accountsReset: 1 };
     if (command === 'set_account_refresh') return null;
+    if (command === 'set_account_color') {
+      const input = (payload as { input: { accountId: string; color: string } }).input;
+      accountColors.set(input.accountId, input.color);
+      return null;
+    }
     if (command === 'sync_account_now') return 1;
     throw new Error(`Unexpected IPC command: ${command}`);
   }, { shouldMockEvents: true });
@@ -471,6 +484,49 @@ describe('production mailbox interactions', () => {
     await waitFor(() =>
       expect(within(settings).getByRole('status').textContent).toBe('Checking for new mail every 5 min.')
     );
+  });
+
+  test('recolouring an account moves its dot, its rows, and the accent that follows it', async () => {
+    const { calls, user } = await renderMailbox();
+    // A conversation is open, so the accent is following its account.
+    expect(document.documentElement.style.getPropertyValue('--accent')).toBe(account.color);
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const group = within(settings).getAllByTestId('account-color')[0];
+    expect(group.getAttribute('data-account-id')).toBe(account.id);
+    expect(within(group).getByRole('button', { pressed: true }).getAttribute('aria-label')).toBe('Indigo for Work');
+
+    await user.click(within(group).getByRole('button', { name: 'Rose for Work' }));
+    await waitFor(() => {
+      const call = calls.filter((entry) => entry.command === 'set_account_color').at(-1);
+      expect(call?.payload).toEqual({ input: { accountId: account.id, color: '#c93b63' } });
+    });
+    await waitFor(() => expect(within(settings).getByRole('status').textContent).toBe('Work is now rose.'));
+    expect(within(group).getByRole('button', { pressed: true }).getAttribute('aria-label')).toBe('Rose for Work');
+
+    // The picker takes a colour Settings does not offer.
+    const custom = within(group).getByTestId('account-color-custom') as HTMLInputElement;
+    await fireEvent.change(custom, { target: { value: '#ABCDEF' } });
+    await waitFor(() => {
+      const call = calls.filter((entry) => entry.command === 'set_account_color').at(-1);
+      expect(call?.payload).toEqual({ input: { accountId: account.id, color: '#abcdef' } });
+    });
+    await waitFor(() => expect(within(settings).getByRole('status').textContent).toBe('Work is now #abcdef.'));
+    expect(within(group).queryByRole('button', { pressed: true })).toBeNull();
+
+    await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
+    await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
+    // Compared through an element so the assertion follows however the DOM
+    // spells a colour back, rather than a guess at it.
+    const swatch = document.createElement('span');
+    swatch.style.background = '#abcdef';
+    const dot = document.querySelector<HTMLElement>(
+      '[data-action="toggle-account-visibility"][data-account-id="acc_work"] .account-dot'
+    )!;
+    expect(dot.style.background).toBe(swatch.style.background);
+    expect(screen.getAllByTestId('thread-row')[0].querySelector<HTMLElement>('.thread-accent')!.style.background)
+      .toBe(swatch.style.background);
+    expect(document.documentElement.style.getPropertyValue('--accent')).toBe('#abcdef');
   });
 
   test('thread action buttons show icon, text, and shortcut independently', async () => {

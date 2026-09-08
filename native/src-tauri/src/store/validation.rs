@@ -408,6 +408,21 @@ pub(super) fn exact_account_id(value: Option<&str>) -> Result<Option<String>, St
     Ok(Some(value.to_string()))
 }
 
+/// Exactly `#rrggbb`, handed back lowercased. The interface writes an account's
+/// colour into inline styles, so nothing looser than a literal colour is kept:
+/// no names, no shorthand, and nothing that could carry a `url(` along.
+pub(super) fn account_color(value: &str) -> Result<String, StoreError> {
+    let digits = value
+        .strip_prefix('#')
+        .filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    match digits {
+        Some(digits) => Ok(format!("#{}", digits.to_ascii_lowercase())),
+        None => Err(StoreError::Validation(
+            "Account colour must be a hex colour like #5168f4".into(),
+        )),
+    }
+}
+
 pub(super) fn load_or_create_cursor_signing_key(
     connection: &Connection,
 ) -> Result<[u8; 32], StoreError> {

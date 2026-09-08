@@ -793,13 +793,22 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .settings-account-list { max-width: 520px; margin: 0 0 22px; padding: 0; list-style: none; display: grid; gap: 8px; }
 .settings-account-list li { display: grid; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .settings-account-head { display: flex; align-items: center; gap: 11px; }
-.settings-account-refresh { display: grid; gap: 7px; }
+.settings-account-refresh, .settings-account-color { display: grid; gap: 7px; }
 .settings-account-refresh { position: relative; }
-.settings-account-refresh > span { color: var(--text-faint); font-size: 10px; font-weight: 700; }
+.settings-account-refresh > span, .settings-account-color > span { color: var(--text-faint); font-size: 10px; font-weight: 700; }
 .settings-sync-now { position: absolute; top: -2px; right: 0; height: 26px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--accent-strong); background: var(--surface); cursor: pointer; font-size: 10px; font-weight: 700; }
 .settings-sync-now:hover:enabled { background: var(--accent-soft); }
 .settings-sync-now:disabled { color: var(--text-faint); cursor: progress; }
-.settings-account-refresh .settings-choice-row button { height: 30px; padding: 0 11px; font-size: 11px; }
+.settings-account-refresh .settings-choice-row button, .settings-account-color .settings-choice-row button, .settings-color-custom { height: 30px; padding: 0 11px; font-size: 11px; }
+/* A label dressed as the buttons beside it, so the native picker sits in the
+   row rather than under it; a button may not hold an input. */
+.settings-color-custom { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--border-strong); border-radius: 9px; color: var(--text-soft); background: var(--surface); cursor: pointer; font-weight: 620; }
+.settings-color-custom.is-active { border-color: var(--accent); color: var(--accent-strong); background: var(--accent-soft); }
+.settings-color-custom:focus-within { outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent); outline-offset: 2px; }
+.settings-color-custom input { width: 11px; height: 11px; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
+.settings-color-custom input:focus-visible { outline: 0; }
+.settings-color-custom input::-webkit-color-swatch-wrapper { padding: 0; }
+.settings-color-custom input::-webkit-color-swatch { border: 0; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12); }
 .settings-account-head > span:nth-child(2) { min-width: 0; flex: 1; display: flex; flex-direction: column; }
 .settings-account-list strong { overflow: hidden; color: var(--text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .settings-account-list small { margin-top: 2px; overflow: hidden; color: var(--text-faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }

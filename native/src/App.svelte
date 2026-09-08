@@ -287,10 +287,13 @@
   $: offersUndo = noticeOffersUndo(notice, clock);
   $: motion = motionTiming(appearance.animation);
   $: railCollapsed = sidebar.collapsed && !compactNavigation;
+  /// `mailbox` is named here so recolouring an account moves the accent at
+  /// once: a `$:` statement follows the variables it names, and accountFor()
+  /// reads the mailbox out of its sight.
   $: applyAccentToRoot(
     appearance.accent,
     theme,
-    selectedThread ? accountFor(selectedThread.accountId)?.color ?? null : null
+    selectedThread && mailbox ? accountFor(selectedThread.accountId)?.color ?? null : null
   );
   /// Swapping mailbox, account, search, or page replaces every row at once.
   /// That is a new list rather than mail coming and going, so it is keyed: the

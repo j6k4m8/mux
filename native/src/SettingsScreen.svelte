@@ -18,6 +18,7 @@
     textSizes
   } from './appearance';
   import type { Appearance } from './appearance';
+  import { accountColorChoices, describeAccountColor, normalizeAccountColor } from './accountColor';
   import type { MailboxBootstrap, SettingsSection, Theme } from './types';
 
   type GmailOAuthResult = { state: 'connected'; accountId: string; email: string };
@@ -173,6 +174,25 @@
     }
   }
 
+  async function setAccountColor(accountId: string, name: string, value: string) {
+    settingsError = '';
+    settingsMessage = '';
+    // Checked here as well as in the store: the colour is written into inline
+    // styles, and the interface should not offer one the store would refuse.
+    const color = normalizeAccountColor(value);
+    if (!color) {
+      settingsError = 'Mux only takes a colour written as #rrggbb.';
+      return;
+    }
+    try {
+      await invoke('set_account_color', { input: { accountId, color } });
+      await refreshMailbox();
+      settingsMessage = `${name} is now ${describeAccountColor(color)}.`;
+    } catch (cause) {
+      settingsError = settingsErrorText(cause);
+    }
+  }
+
   async function connectGmail() {
     settingsError = '';
     settingsMessage = '';
@@ -250,6 +270,7 @@
         {#if mailbox.accounts.length}
           <ul class="settings-account-list">
             {#each mailbox.accounts as account (account.id)}
+              {@const currentColor = normalizeAccountColor(account.color)}
               <li>
                 <div class="settings-account-head">
                   <span class="settings-account-dot" style:--avatar-color={account.color}></span>
@@ -275,6 +296,39 @@
                         on:click={() => setAccountRefresh(account.id, choice.value)}
                       >{choice.label}</button>
                     {/each}
+                  </div>
+                </div>
+                <div class="settings-account-color">
+                  <span>Colour</span>
+                  <div class="settings-choice-row settings-accents" role="group" aria-label={`Colour for ${account.name}`} data-testid="account-color" data-account-id={account.id}>
+                    {#each accountColorChoices as choice}
+                      <button
+                        class:is-active={currentColor === choice.value}
+                        type="button"
+                        data-account-color={choice.value}
+                        aria-pressed={currentColor === choice.value}
+                        aria-label={`${choice.label} for ${account.name}`}
+                        title={`Use ${choice.label.toLocaleLowerCase()} for ${account.name}`}
+                        on:click={() => setAccountColor(account.id, account.name, choice.value)}
+                      >
+                        <span class="accent-swatch" style:background={choice.value} aria-hidden="true"></span>{choice.label}
+                      </button>
+                    {/each}
+                    <!-- A label rather than a button, so the native picker can sit in
+                         the row: a button may not hold an input. -->
+                    <label
+                      class="settings-color-custom"
+                      class:is-active={!accountColorChoices.some((choice) => choice.value === currentColor)}
+                      title={`Pick any colour for ${account.name}`}
+                    >
+                      <input
+                        type="color"
+                        value={currentColor ?? '#000000'}
+                        aria-label={`Custom colour for ${account.name}`}
+                        data-testid="account-color-custom"
+                        on:change={(event) => setAccountColor(account.id, account.name, event.currentTarget.value)}
+                      />Custom
+                    </label>
                   </div>
                 </div>
               </li>

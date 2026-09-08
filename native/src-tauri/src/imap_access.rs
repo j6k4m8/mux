@@ -290,7 +290,9 @@ pub(crate) struct PreparedImapAccount {
 }
 
 /// Colours for new mailboxes, so a second account does not arrive looking like
-/// the first. Indexed by how many accounts already exist.
+/// the first. Indexed by how many accounts already exist. Settings offers the
+/// same six by name, from `accountColorChoices` in `native/src/accountColor.ts`;
+/// a test below holds the two lists together.
 const ACCOUNT_COLORS: [&str; 6] = [
     "#5168f4", "#12a58c", "#b3730a", "#c93b63", "#7c4ddb", "#0a6fa8",
 ];
@@ -893,5 +895,24 @@ mod tests {
                 .expect("blocked state"),
             "reauthorization_required:provider_reauthorization:imap_authority_invalid"
         );
+    }
+
+    /// Settings offers the six colours new mailboxes are dealt, and the
+    /// interface keeps its own copy of the list so it can name them. This holds
+    /// the two together: a colour changed on one side fails here until the
+    /// other follows.
+    #[test]
+    fn the_interface_offers_exactly_the_colours_new_mailboxes_are_dealt() {
+        let source = include_str!("../../src/accountColor.ts");
+        let palette = source
+            .split("accountColorChoices")
+            .nth(1)
+            .and_then(|tail| tail.split("];").next())
+            .expect("palette source");
+        let offered = palette
+            .split('\'')
+            .filter(|literal| literal.starts_with('#'))
+            .collect::<Vec<_>>();
+        assert_eq!(offered, ACCOUNT_COLORS);
     }
 }
