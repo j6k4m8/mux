@@ -292,6 +292,23 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .nav-section em, .accounts em { color: var(--text-faint); font-size: 11px; font-style: normal; font-variant-numeric: tabular-nums; }
 .nav-icon { display: inline-flex; color: currentColor; }
 .section-label { margin: 23px 10px 7px; color: var(--text-faint); font-size: 10px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+/* A section heading that folds its section away. It keeps the label's type so
+   the rail still reads as one list of sections; only the chevron says it takes
+   a click. The hit area grows around the label's text instead of pushing it
+   down, so the heading sits where the plain label would have. */
+.section-toggle {
+  min-height: 24px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin: 17px 0 1px;
+  padding: 0 10px;
+  border-radius: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.section-toggle:hover { color: var(--text-soft); background: var(--surface-hover); }
 /* An account's own folders sit in the same rail as the fixed views, so they
    read as places to go rather than as a different kind of thing. Under All
    accounts each row carries its account's colour, which is a fourth column the

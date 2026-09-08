@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import { mailboxViews, smartViews } from './mailboxViews';
-  import { folderSectionIsOpen } from './sidebarLayout';
+  import { folderSectionIsOpen, smartViewsSectionIsOpen } from './sidebarLayout';
   import type {
     AccountSummary,
     ContainerSummary,
@@ -20,6 +20,7 @@
   /// The narrow rail: icons only, no labels, no counts.
   export let railCollapsed = false;
   export let openFolderAccounts: string[] = [];
+  export let smartViewsOpen = true;
   export let hiddenAccounts: string[] = [];
   export let filter = '';
   export let collapsed = false;
@@ -34,6 +35,7 @@
   export let selectContainer: (container: ContainerSummary) => void;
   export let toggleRail: () => void;
   export let toggleFolderSection: (accountId: string) => void;
+  export let toggleSmartViewsSection: () => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openStats: () => void;
@@ -49,6 +51,7 @@
     }))
     .filter((section) => section.folders.length > 0);
   $: openFolderAccountId = selectedContainer?.accountId ?? null;
+  $: smartViewsShown = smartViewsSectionIsOpen(smartViewsOpen, selectedSmartView);
 
   $: draftCount = mailbox.drafts.filter(
     (draft) => selectedAccount === null || draft.accountId === selectedAccount
@@ -107,19 +110,33 @@
     {/each}
   </section>
 
-  <p class="section-label">Smart views</p>
-  <section class="smart-views">
-    {#each smartViews as view}
-      <button
-        class:is-active={selectedSmartView === view.id}
-        data-action={`smart-${view.id}`}
-        title={view.title}
-        on:click={() => selectSmartView(view.id, view.query)}
-      >
-        <span class={`smart-dot ${view.dot}`}></span><span>{view.label}</span>
-      </button>
-    {/each}
-  </section>
+  <button
+    class="section-label section-toggle"
+    type="button"
+    aria-expanded={smartViewsShown}
+    data-action="toggle-smart-views"
+    title={smartViewsShown ? 'Fold away smart views' : 'Show smart views'}
+    on:click={() => toggleSmartViewsSection()}
+  >
+    <span>Smart views</span>
+    <span class="folder-chevron" aria-hidden="true">{smartViewsShown ? '\u2304' : '\u203A'}</span>
+  </button>
+  <!-- The rail has no heading to fold from, so its dots stay whatever the fold
+       says; they are what the rail has instead of the words. -->
+  {#if smartViewsShown || railCollapsed}
+    <section class="smart-views">
+      {#each smartViews as view}
+        <button
+          class:is-active={selectedSmartView === view.id}
+          data-action={`smart-${view.id}`}
+          title={view.title}
+          on:click={() => selectSmartView(view.id, view.query)}
+        >
+          <span class={`smart-dot ${view.dot}`}></span><span>{view.label}</span>
+        </button>
+      {/each}
+    </section>
+  {/if}
 
   {#if folderSections.length}
     <p class="section-label">Folders</p>

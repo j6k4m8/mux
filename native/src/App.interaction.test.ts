@@ -1170,6 +1170,59 @@ describe('production mailbox interactions', () => {
     expect(within(heading).getByRole('heading').textContent).toBe('All mail');
   });
 
+  test('the smart views fold away, and the rail remembers that they did', async () => {
+    const { user } = await renderMailbox();
+    const navigation = screen.getByTestId('mailbox-navigation');
+    const heading = within(navigation).getByRole('button', { name: 'Smart views' });
+    expect(heading.getAttribute('aria-expanded')).toBe('true');
+    expect(heading.title).toBe('Fold away smart views');
+    expect(within(navigation).getByRole('button', { name: 'Unread' })).toBeTruthy();
+
+    await user.click(heading);
+    expect(heading.getAttribute('aria-expanded')).toBe('false');
+    expect(heading.title).toBe('Show smart views');
+    expect(within(navigation).queryByRole('button', { name: 'Unread' })).toBeNull();
+    expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).smartViewsOpen).toBe(false);
+    // The sections around it are not touched by the fold.
+    expect(within(navigation).getByRole('button', { name: /Inbox/u })).toBeTruthy();
+    expect(within(navigation).getByRole('button', { name: 'All accounts 1' })).toBeTruthy();
+
+    await user.click(heading);
+    expect(within(navigation).getByRole('button', { name: 'Unread' })).toBeTruthy();
+    expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).smartViewsOpen).toBe(true);
+  });
+
+  test('a smart view reached with g shows its folded section, with the fold kept for later', async () => {
+    const { calls, user } = await renderMailbox();
+    const navigation = screen.getByTestId('mailbox-navigation');
+    const heading = within(navigation).getByRole('button', { name: 'Smart views' });
+    await user.click(heading);
+    expect(within(navigation).queryByRole('button', { name: 'Unread' })).toBeNull();
+
+    blurActiveElement();
+    await fireEvent.keyDown(window, { key: 'g' });
+    const dialog = await screen.findByTestId('go-to-dialog');
+    await user.type(within(dialog).getByRole('textbox', { name: 'Go to filter' }), 'unread');
+    expect(within(dialog).getAllByRole('option')[0].textContent).toContain('Unread');
+    await user.keyboard('{Enter}');
+
+    // The rail shows where you are whether or not the section was folded away.
+    const unread = within(navigation).getByRole('button', { name: 'Unread' });
+    expect(unread.classList.contains('is-active')).toBe(true);
+    expect(heading.getAttribute('aria-expanded')).toBe('true');
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'search_threads').at(-1);
+      expect(request?.payload).toMatchObject({ input: { query: 'is:unread' } });
+    });
+    // Showing it was not a choice to keep it open: the fold is still what is stored.
+    expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).smartViewsOpen).toBe(false);
+
+    // Leaving the smart view folds the section back away.
+    await user.click(within(navigation).getByRole('button', { name: /Inbox/u }));
+    expect(within(navigation).queryByRole('button', { name: 'Unread' })).toBeNull();
+    expect(heading.getAttribute('aria-expanded')).toBe('false');
+  });
+
   test('jumps to a folder with g without leaving the keyboard', async () => {
     const { calls, user } = await renderMailbox();
     blurActiveElement();

@@ -41,6 +41,7 @@
     persistSidebarLayout,
     readSidebarLayout,
     toggleFolderAccount,
+    toggleSmartViews,
     DEFAULT_SIDEBAR_LAYOUT
   } from './sidebarLayout';
   import type { SidebarLayout } from './sidebarLayout';
@@ -391,6 +392,11 @@
 
   function toggleFolderSection(accountId: string) {
     sidebar = toggleFolderAccount(sidebar, accountId);
+    persistSidebarLayout(sidebar);
+  }
+
+  function toggleSmartViewsSection() {
+    sidebar = toggleSmartViews(sidebar);
     persistSidebarLayout(sidebar);
   }
 
@@ -1823,8 +1829,10 @@
           {selectedContainer}
           railCollapsed={railCollapsed}
           openFolderAccounts={sidebar.openFolderAccounts}
+          smartViewsOpen={sidebar.smartViewsOpen}
           {toggleRail}
           {toggleFolderSection}
+          {toggleSmartViewsSection}
           {openStats}
           {selectView}
           {selectSmartView}
