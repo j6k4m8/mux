@@ -400,10 +400,16 @@ fn persist_account_marker(
              WHERE account_id = ?1 AND state = 'authentication_blocked'",
             params![prepared.account_id, now_ms],
         )?;
+        // The mailbox was just reached and signed into, so whatever had stopped
+        // it syncing is over; a sync in flight, or one already waiting, is left
+        // to finish.
         transaction.execute(
             "UPDATE provider_accounts
              SET remote_account_id = ?2, auth_state = 'ready', credential_ref = ?3,
-                 auth_block_reason = NULL, last_error_code = NULL, updated_at = ?4
+                 auth_block_reason = NULL, last_error_code = NULL, updated_at = ?4,
+                 sync_state = CASE
+                   WHEN sync_state IN ('authentication_blocked', 'backoff', 'offline', 'failed')
+                   THEN 'idle' ELSE sync_state END
              WHERE account_id = ?1 AND provider_kind = 'imap'",
             params![
                 prepared.account_id,
@@ -703,7 +709,8 @@ mod tests {
             .execute(
                 "UPDATE provider_accounts
                  SET auth_state = 'reauthorization_required',
-                     auth_block_reason = 'provider_reauthorization'
+                     auth_block_reason = 'provider_reauthorization',
+                     sync_state = 'authentication_blocked'
                  WHERE account_id = ?1",
                 [&first.account_id],
             )
@@ -730,17 +737,25 @@ mod tests {
             .access_for_account(&second.account_id)
             .expect("grant after correction");
         assert_eq!(grant.password.as_str(), "new-secret");
-        let (auth, state): (String, String) = connection
+        let (auth, sync, state): (String, String, String) = connection
             .query_row(
-                "SELECT provider.auth_state, work.state
+                "SELECT provider.auth_state, provider.sync_state, work.state
                  FROM provider_accounts provider
                  JOIN provider_work_items work ON work.account_id = provider.account_id
                  WHERE provider.account_id = ?1",
                 [&second.account_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("rows after correction");
-        assert_eq!((auth.as_str(), state.as_str()), ("ready", "queued"));
+        assert_eq!(
+            (auth.as_str(), sync.as_str(), state.as_str()),
+            ("ready", "idle", "queued")
+        );
+        // Nothing is left holding the mailbox back: sync now takes it.
+        assert_eq!(
+            crate::imap::sync_account_now(&path, &second.account_id, 9_500).expect("schedule"),
+            1
+        );
         // One mailbox, not two.
         let accounts: i64 = connection
             .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
