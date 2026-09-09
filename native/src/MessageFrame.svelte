@@ -24,6 +24,9 @@
   let pendingMeasure = 0;
   /// Read from the document root rather than the element, so the frame's
   /// document is built once instead of being rebuilt when the element binds.
+  /// Colours and the typeface only: the root also carries the text-size scale
+  /// and its type steps, and none of them is read here on purpose — a message
+  /// renders at the sizes its sender wrote, whatever size the interface is.
   function currentTheme(): MessageFrameTheme {
     if (typeof getComputedStyle !== 'function') return FALLBACK_THEME;
     const root = getComputedStyle(document.documentElement);
@@ -34,8 +37,7 @@
       background: 'transparent',
       link: variable('--accent', FALLBACK_THEME.link),
       border: variable('--border', FALLBACK_THEME.border),
-      fontFamily: variable('--app-font', FALLBACK_THEME.fontFamily),
-      fontSize: FALLBACK_THEME.fontSize
+      fontFamily: variable('--app-font', FALLBACK_THEME.fontFamily)
     };
   }
 

@@ -5,8 +5,13 @@ import { MESSAGE_FRAME_SANDBOX, measuredFrameHeight, messageFrameDocument } from
 
 const theme = {
   text: '#111', muted: '#666', background: 'transparent', link: '#00f',
-  border: '#ccc', fontFamily: 'serif', fontSize: '13px'
+  border: '#ccc', fontFamily: 'serif'
 };
+
+/// The stylesheet the frame writes ahead of the message, without the message.
+function frameStylesheet(document: string): string {
+  return document.slice(document.indexOf('<style>'), document.indexOf('</style>'));
+}
 
 describe('the message reader frame', () => {
   test('withholds every capability a message could act through', () => {
@@ -39,6 +44,37 @@ describe('the message reader frame', () => {
     expect(document).toContain('<a href="https://example.com/plan">plan</a>');
     // The frame supplies the only styling context, so nothing leaks either way.
     expect(document).toContain('font-family: serif');
+  });
+
+  test('the interface text size and density stop at the frame', () => {
+    // The reader's setting scales the interface. A message is a document the
+    // sender laid out, so it gets no scale, no density, and no size of Mux's
+    // own: a body that names no size renders at the engine's default, and one
+    // that names sizes keeps them. The frame's stylesheet may still say how
+    // big a heading is relative to the body — that is a default any client
+    // supplies — but never in an absolute unit.
+    const styles = frameStylesheet(messageFrameDocument('<p>x</p>', {}, theme));
+    expect(styles).not.toContain('--ui-scale');
+    expect(styles).not.toContain('--text-');
+    expect(styles).not.toMatch(/density/u);
+    expect(styles).not.toMatch(/font-size\s*:\s*[\d.]+\s*(px|pt|rem)/u);
+    const body = /body\s*\{[^}]*\}/u.exec(styles)?.[0] ?? '';
+    expect(body).not.toContain('font-size');
+
+    // A message that sets its own size is passed through untouched.
+    const sized = messageFrameDocument('<p style="font-size: 9px">tiny by design</p>', {}, theme);
+    expect(sized).toContain('<p style="font-size: 9px">tiny by design</p>');
+
+    // The mounted frame reads colours and the typeface off the root and no
+    // more, so the same message builds the same document at any text size.
+    render(MessageFrame, { bodyHtml: '<p>Hello</p>', label: 'At one times' });
+    const before = (screen.getByTitle('At one times') as HTMLIFrameElement).getAttribute('srcdoc');
+    document.documentElement.style.setProperty('--ui-scale', '1.5');
+    render(MessageFrame, { bodyHtml: '<p>Hello</p>', label: 'At one and a half' });
+    const after = (screen.getByTitle('At one and a half') as HTMLIFrameElement).getAttribute('srcdoc');
+    document.documentElement.style.removeProperty('--ui-scale');
+    expect(after).toBe(before);
+    expect(after).not.toContain('--ui-scale');
   });
 
   test('markup a message supplies is never treated as application markup', () => {

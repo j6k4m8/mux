@@ -129,11 +129,20 @@ export type ChartPadding = { left: number; right: number; top: number; bottom: n
 
 export type ChartBox = { left: number; top: number; right: number; bottom: number; width: number; height: number };
 
+/// Chart labels are drawn in the chart's own units, so their size is geometry
+/// and lives here beside the gutters that make room for it rather than in the
+/// stylesheet: 11pt, the interface's smallest step, in CSS pixels. The heatmap
+/// is drawn one unit to the pixel and scaled with the text-size setting as a
+/// whole; the line chart is scaled to its card, so its labels are this size at
+/// 720px across and grow with the card from there.
+export const CHART_LABEL_PX = (11 * 96) / 72;
+
 /// A fixed viewBox scaled by CSS, so the line chart reflows with the window
-/// while the geometry stays a pure function of the data.
+/// while the geometry stays a pure function of the data. The left gutter fits
+/// a five-character count at label size; the bottom fits a line of day labels.
 export const LINE_CHART_WIDTH = 720;
 export const LINE_CHART_HEIGHT = 220;
-const LINE_CHART_PADDING: ChartPadding = { left: 40, right: 10, top: 12, bottom: 26 };
+const LINE_CHART_PADDING: ChartPadding = { left: 58, right: 10, top: 14, bottom: 32 };
 
 export function plotBox(
   width = LINE_CHART_WIDTH,
@@ -250,8 +259,11 @@ export type HeatmapLayout = {
 
 const HEATMAP_CELL = 11;
 const HEATMAP_GAP = 3;
-const HEATMAP_GUTTER = 26;
-const HEATMAP_HEADER = 14;
+/// The gutter fits a three-letter weekday at label size; the header fits a
+/// month label sitting on the baseline below, clear of the first row of cells.
+const HEATMAP_GUTTER = 38;
+const HEATMAP_HEADER = 20;
+export const HEATMAP_MONTH_BASELINE = 15;
 
 /// Five steps, matching the legend. Zero is its own step so an empty day never
 /// looks like a quiet one; the rest are quarters of the busiest day in view, so
@@ -315,12 +327,10 @@ export function heatmapLayout(days: DayVolume[], series: StatsSeries): HeatmapLa
   };
 }
 
-export const HEATMAP_LABEL_FONT_PX = 9;
-
 /// Close enough to measure against without a DOM. The labels are three to
 /// eight characters of the interface font, and the only question being asked is
 /// whether the next one would land on top of this one.
-export function approximateTextWidth(text: string, fontPx = HEATMAP_LABEL_FONT_PX): number {
+export function approximateTextWidth(text: string, fontPx = CHART_LABEL_PX): number {
   return text.length * fontPx * 0.62;
 }
 

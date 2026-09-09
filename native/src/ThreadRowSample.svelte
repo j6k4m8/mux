@@ -68,11 +68,11 @@
     position: sticky;
     top: 0;
     z-index: 1;
-    max-width: 520px;
-    margin: 0 0 18px;
+    max-width: var(--measure);
+    margin: 0 0 var(--gap-lg);
     /* Opaque, with a little air, so the cards scrolling underneath do not read
        as part of the sample. */
-    padding: 10px 0 14px;
+    padding: .6em 0 .9em;
     background: var(--bg);
   }
   .appearance-sample-rows {
@@ -83,8 +83,8 @@
     pointer-events: none;
   }
   .appearance-sample figcaption {
-    margin-top: 8px;
+    margin-top: .5em;
     color: var(--text-faint);
-    font-size: 10px;
+    font-size: var(--text-0);
   }
 </style>

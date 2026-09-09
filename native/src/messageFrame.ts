@@ -6,6 +6,10 @@ export const MESSAGE_FRAME_SANDBOX = 'allow-same-origin';
 
 import { safeRemoteImageDataUrl } from './richText';
 
+/// Colours and the typeface, and nothing about size: the frame shows a
+/// sender's document, and the text-size setting is for the interface around
+/// it. A message that names no size renders at the engine's default, the way
+/// it would in any other client; one that names sizes keeps them.
 export type MessageFrameTheme = {
   text: string;
   muted: string;
@@ -13,7 +17,6 @@ export type MessageFrameTheme = {
   link: string;
   border: string;
   fontFamily: string;
-  fontSize: string;
 };
 
 export type MessageFrameImage = { dataUrl: string | null; altText: string };
@@ -63,8 +66,7 @@ export const FALLBACK_THEME: MessageFrameTheme = {
   background: 'transparent',
   link: '#4c63ee',
   border: '#e4e7ee',
-  fontFamily: 'ui-sans-serif, -apple-system, sans-serif',
-  fontSize: '13px'
+  fontFamily: 'ui-sans-serif, -apple-system, sans-serif'
 };
 
 function cssValue(value: string, fallback: string): string {
@@ -84,8 +86,7 @@ function safeTheme(theme: MessageFrameTheme): MessageFrameTheme {
     background: cssValue(theme.background, FALLBACK_THEME.background),
     link: cssValue(theme.link, FALLBACK_THEME.link),
     border: cssValue(theme.border, FALLBACK_THEME.border),
-    fontFamily: cssValue(theme.fontFamily, FALLBACK_THEME.fontFamily),
-    fontSize: cssValue(theme.fontSize, FALLBACK_THEME.fontSize)
+    fontFamily: cssValue(theme.fontFamily, FALLBACK_THEME.fontFamily)
   };
 }
 
@@ -94,7 +95,11 @@ function frameStyles(raw: MessageFrameTheme): string {
   // Defaults only. A message's own stylesheet is written into the document
   // after this one, so a sender that states a rule wins it. Nothing here draws
   // table borders: mail uses tables for layout far more often than for data,
-  // and bordering them puts a grid over ordinary messages.
+  // and bordering them puts a grid over ordinary messages. Nothing here sets
+  // a text size either, in any unit: the interface's type scale and density
+  // stop at the frame's edge, and the only absolute sizes in a message are
+  // the sender's own. The few sizes below are relative to whatever the
+  // message establishes.
   return `
 /* The frame must not paint a canvas of its own: the reader's surface shows
    through wherever the message does not state a background. Declaring support
@@ -105,7 +110,6 @@ body {
   color: ${theme.text};
   background: ${theme.background};
   font-family: ${theme.fontFamily};
-  font-size: ${theme.fontSize};
   line-height: 1.72;
   overflow-x: auto;
   overflow-y: hidden;

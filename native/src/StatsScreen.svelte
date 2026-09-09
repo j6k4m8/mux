@@ -3,6 +3,8 @@
   import { onMount, tick } from 'svelte';
   import Icon from './Icon.svelte';
   import {
+    CHART_LABEL_PX,
+    HEATMAP_MONTH_BASELINE,
     LINE_CHART_HEIGHT,
     LINE_CHART_WIDTH,
     areaPath,
@@ -212,7 +214,7 @@
         >
           {#each gridlines as line (line.value)}
             <line class="stats-gridline" x1={box.left} x2={box.right} y1={line.y} y2={line.y} />
-            <text class="stats-axis-text" x={box.left - 6} y={line.y + 3} text-anchor="end">{formatCount(line.value)}</text>
+            <text class="stats-axis-text" font-size={CHART_LABEL_PX} x={box.left - 6} y={line.y + 5} text-anchor="end">{formatCount(line.value)}</text>
           {/each}
           {#if receivedPoints.length}
             <path class="stats-area is-received" d={areaPath(receivedPoints, box)} />
@@ -221,7 +223,7 @@
             <path class="stats-line is-sent" d={linePath(sentPoints)} />
           {/if}
           {#each dayLabels as label (label.day)}
-            <text class="stats-axis-text" x={label.x} y={LINE_CHART_HEIGHT - 8} text-anchor={label.anchor}>{label.text}</text>
+            <text class="stats-axis-text" font-size={CHART_LABEL_PX} x={label.x} y={LINE_CHART_HEIGHT - 8} text-anchor={label.anchor}>{label.text}</text>
           {/each}
         </svg>
       </section>
@@ -242,11 +244,15 @@
             {/each}
           </div>
         </header>
+        <!-- Drawn at one unit per pixel, then scaled with the text-size setting
+             as a whole, cells and labels together. -->
         <div class="stats-heatmap-scroller" bind:this={heatmapScroller}>
           <svg
             class="stats-heatmap"
             width={heatmap.width}
             height={heatmap.height}
+            style:width={`calc(${heatmap.width}px * var(--ui-scale))`}
+            style:height={`calc(${heatmap.height}px * var(--ui-scale))`}
             viewBox={`0 0 ${heatmap.width} ${heatmap.height}`}
             role="img"
             data-testid="stats-heatmap"
@@ -255,10 +261,10 @@
             aria-label={`${heatmapSeries === 'sent' ? 'Sent' : 'Received'} messages a day, one square per day, oldest on the left. Busiest day: ${formatCount(heatmap.maxCount)}.`}
           >
             {#each heatmap.monthLabels as label (label.x)}
-              <text class="stats-axis-text" x={label.x} y={9}>{label.text}</text>
+              <text class="stats-axis-text" font-size={CHART_LABEL_PX} x={label.x} y={HEATMAP_MONTH_BASELINE}>{label.text}</text>
             {/each}
             {#each heatmap.weekdayLabels as label (label.text)}
-              <text class="stats-axis-text" x={0} y={label.y}>{label.text}</text>
+              <text class="stats-axis-text" font-size={CHART_LABEL_PX} x={0} y={label.y}>{label.text}</text>
             {/each}
             {#each heatmap.cells as cell (cell.day)}
               <rect
@@ -318,10 +324,10 @@
   .stats-screen {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--gap-lg);
     height: 100%;
     overflow-y: auto;
-    padding: 22px 26px 34px;
+    padding: var(--gap-xl) 1.6em calc(var(--gap-xl) + var(--gap-sm));
     background: var(--surface);
     color: var(--text);
   }
@@ -329,14 +335,14 @@
   .stats-header {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: .75em;
   }
 
-  /* Type sizes are in px and in the same steps as the rest of the app, so a
-     screen with its own stylesheet still reads as the same application. */
+  /* Type sizes are the app's own steps, so a screen with its own stylesheet
+     still reads as the same application and follows the same setting. */
   .stats-header h1 {
     margin: 0;
-    font-size: 22px;
+    font-size: var(--text-4);
     font-weight: 700;
     letter-spacing: -0.03em;
   }
@@ -346,13 +352,13 @@
     align-items: center;
     gap: 4px;
     align-self: flex-start;
-    padding: 4px 8px 4px 2px;
+    padding: .25em .55em .25em .15em;
     border: 0;
     border-radius: 7px;
     background: none;
     color: var(--text-faint);
     font: inherit;
-    font-size: 11px;
+    font-size: var(--text-0);
     cursor: pointer;
   }
 
@@ -371,7 +377,7 @@
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    gap: .75em;
   }
 
   .stats-periods,
@@ -385,13 +391,13 @@
   }
 
   .stats-period {
-    padding: 5px 12px;
+    padding: .3em .75em;
     border: 0;
     border-radius: 7px;
     background: none;
     color: var(--text-soft);
     font: inherit;
-    font-size: 11px;
+    font-size: var(--text-1);
     font-weight: 620;
     cursor: pointer;
   }
@@ -410,25 +416,25 @@
   .stats-account {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: .4em;
     color: var(--text-faint);
-    font-size: 11px;
+    font-size: var(--text-1);
   }
 
   .stats-account select {
-    padding: 5px 8px;
+    padding: .3em .5em;
     border: 1px solid var(--border-strong);
     border-radius: 8px;
     background: var(--surface-raised);
     color: var(--text);
     font: inherit;
-    font-size: 11px;
+    font-size: var(--text-1);
   }
 
   .stats-body {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: var(--gap-lg);
     transition: opacity 120ms ease;
   }
 
@@ -441,17 +447,17 @@
   .stats-window {
     margin: 0;
     color: var(--text-faint);
-    font-size: 10px;
+    font-size: var(--text-0);
   }
 
   .stats-notice {
     margin: 0;
-    padding: 12px 14px;
+    padding: .75em .9em;
     border: 1px solid var(--border);
     border-radius: 10px;
     background: var(--surface-muted);
     color: var(--text-soft);
-    font-size: 11px;
+    font-size: var(--text-1);
     line-height: 1.55;
   }
 
@@ -462,8 +468,8 @@
 
   .stats-tiles {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(9em, 1fr));
+    gap: var(--gap-sm);
     margin: 0;
     padding: 0;
     list-style: none;
@@ -473,14 +479,14 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: 12px 14px;
+    padding: var(--gap-md) .9em;
     border: 1px solid var(--border);
     border-radius: 12px;
     background: var(--surface-raised);
   }
 
   .stats-tile-value {
-    font-size: 24px;
+    font-size: var(--text-4);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: -0.02em;
@@ -488,7 +494,7 @@
 
   .stats-tile-label {
     color: var(--text-faint);
-    font-size: 9px;
+    font-size: var(--text-0);
     font-weight: 750;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -497,8 +503,8 @@
   .stats-card {
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    padding: 16px 18px 18px;
+    gap: var(--gap-md);
+    padding: var(--gap-lg) 1.1em;
     border: 1px solid var(--border);
     border-radius: 14px;
     background: var(--surface-raised);
@@ -510,12 +516,12 @@
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: .5em;
   }
 
   .stats-card h2 {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--text-2);
     font-weight: 700;
     letter-spacing: -0.01em;
   }
@@ -523,28 +529,28 @@
   .stats-card > header p {
     margin: 0;
     color: var(--text-faint);
-    font-size: 10px;
+    font-size: var(--text-0);
   }
 
   .stats-legend {
     display: flex;
-    gap: 14px;
+    gap: .9em;
     margin: 0;
     padding: 0;
     color: var(--text-soft);
-    font-size: 10px;
+    font-size: var(--text-0);
     list-style: none;
   }
 
   .stats-legend li {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: .35em;
   }
 
   .stats-swatch {
-    width: 10px;
-    height: 10px;
+    width: .7em;
+    height: .7em;
     border-radius: 3px;
   }
 
@@ -568,9 +574,10 @@
     vector-effect: non-scaling-stroke;
   }
 
+  /* Sized by the chart, not here: a label's size is chart geometry, drawn in the
+     chart's own units beside the gutters that make room for it. */
   .stats-axis-text {
     fill: var(--text-faint);
-    font-size: 9px;
   }
 
   .stats-line {
@@ -652,9 +659,9 @@
   .stats-scale {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: .25em;
     color: var(--text-faint);
-    font-size: 10px;
+    font-size: var(--text-0);
   }
 
   .stats-scale span:first-child {
@@ -666,8 +673,8 @@
   }
 
   .stats-cell-key {
-    width: 10px;
-    height: 10px;
+    width: .7em;
+    height: .7em;
     border: 1px solid var(--border);
     border-radius: 2px;
   }
@@ -681,14 +688,14 @@
 
   .stats-rankings {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(calc(280px * var(--ui-scale)), 1fr));
+    gap: var(--gap-lg);
   }
 
   .stats-rank {
     display: flex;
     flex-direction: column;
-    gap: 7px;
+    gap: var(--gap-sm);
     margin: 0;
     padding: 0;
     list-style: none;
@@ -696,10 +703,10 @@
 
   .stats-rank li {
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) 72px auto;
+    grid-template-columns: 1.2em minmax(0, 1fr) 4.5em auto;
     align-items: center;
-    gap: 8px;
-    font-size: 11px;
+    gap: .5em;
+    font-size: var(--text-1);
   }
 
   .stats-rank-position {
@@ -716,7 +723,7 @@
   }
 
   .stats-rank-bar {
-    height: 6px;
+    height: .4em;
     border-radius: 3px;
     background: var(--surface-muted);
   }
@@ -735,11 +742,11 @@
 
   @media (max-width: 720px) {
     .stats-screen {
-      padding: 16px 14px 28px;
+      padding: var(--gap-lg) .9em var(--gap-xl);
     }
 
     .stats-rank li {
-      grid-template-columns: 16px minmax(0, 1fr) 40px auto;
+      grid-template-columns: 1em minmax(0, 1fr) 2.5em auto;
     }
   }
 </style>

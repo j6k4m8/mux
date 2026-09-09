@@ -445,7 +445,7 @@
 
         <section class="settings-card">
           <h3>Text and typeface</h3>
-          <p class="settings-hint">Scales the whole interface, not only message text.</p>
+          <p class="settings-hint">Sizes everything Mux draws, from headings down to the smallest label. A message's own HTML keeps the sizes its sender chose.</p>
           <div class="settings-choice-row" role="group" aria-label="Text size" data-testid="text-size">
           {#each textSizes as size}
             <button
@@ -527,6 +527,7 @@
 
         <section class="settings-card">
           <h3>Density</h3>
+          <p class="settings-hint">How tightly rows, cards, and the sidebar pack. Text keeps the size chosen above.</p>
           <div class="settings-choice-row" role="group" aria-label="Density" data-testid="density">
           {#each densityChoices as choice}
             <button
