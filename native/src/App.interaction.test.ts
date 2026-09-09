@@ -396,6 +396,8 @@ describe('production mailbox interactions', () => {
       return card!;
     });
     const firstFocusedId = focused.id;
+    // Nothing was open before Enter; stepping onto a message is what opens it.
+    expect(focused.classList.contains('is-collapsed')).toBe(false);
 
     await user.keyboard('k');
     await waitFor(() => {
@@ -634,8 +636,9 @@ describe('production mailbox interactions', () => {
   });
 
   test('a run of blank lines is one paragraph gap, not several', async () => {
-    await renderMailbox();
+    const { user } = await renderMailbox();
     await waitFor(() => expect(screen.getByTestId('reader-subject')).toBeTruthy());
+    await user.click(screen.getByRole('button', { name: 'Expand message from Alice Example' }));
     const body = document.querySelector('.message-body')!;
     // This fixture arrives without HTML, so it renders through the plain-text path.
     const paragraphs = [...body.querySelectorAll('p')];
@@ -782,6 +785,7 @@ describe('production mailbox interactions', () => {
     );
     // A message that does carry HTML is rendered by its own frame, so the
     // reader's copy of it lives in that document rather than in this one.
+    await user.click(screen.getByRole('button', { name: 'Expand message from Jordan Matelsky' }));
     const frame = document.querySelector('iframe.message-frame');
     expect(frame?.getAttribute('srcdoc')).toContain('Yes. The architecture decision is recorded.');
     expect(calls.some((call) => call.command === 'mailbox_bootstrap')).toBe(true);
@@ -1073,21 +1077,84 @@ describe('production mailbox interactions', () => {
   test('the sender shows who else was on the message, and only the caret closes it', async () => {
     const { user } = await renderMailbox();
     const reader = screen.getByTestId('reader');
-    const sender = within(reader).getAllByTitle('Show who this went to')[0];
+    await user.click(within(reader).getByRole('button', { name: 'Expand message from Alice Example' }));
+    const sender = within(reader).getByTitle('Show who this went to');
 
     // Reading the addresses must not cost you the message.
     await user.click(sender);
     const addresses = reader.querySelector('.message-addresses');
     expect(addresses?.textContent).toContain('alice@example.com');
-    expect(within(reader).getAllByRole('button', { name: /^Collapse message/u }).length).toBeGreaterThan(0);
+    expect(within(reader).getByRole('button', { name: /^Collapse message/u })).toBeTruthy();
 
     await user.click(sender);
     expect(reader.querySelector('.message-addresses')).toBeNull();
 
     // Collapsing is the caret's job alone.
-    const caret = within(reader).getAllByRole('button', { name: /^Collapse message/u })[0];
-    await user.click(caret);
-    expect(within(reader).getAllByRole('button', { name: /^Expand message/u }).length).toBeGreaterThan(0);
+    await user.click(within(reader).getByRole('button', { name: /^Collapse message/u }));
+    expect(within(reader).queryByRole('button', { name: /^Collapse message/u })).toBeNull();
+    expect(reader.querySelectorAll('.message-card.is-collapsed')).toHaveLength(2);
+  });
+
+  test('a conversation opens with every message folded', async () => {
+    await renderMailbox();
+    const stack = screen.getByTestId('reader').querySelector('.message-stack')!;
+    const cards = [...stack.querySelectorAll('.message-card')];
+    expect(cards).toHaveLength(2);
+    // The newest message gets no special treatment: neither age nor read
+    // state opens anything.
+    expect(cards.every((card) => card.classList.contains('is-collapsed'))).toBe(true);
+    expect(stack.querySelector('[aria-expanded="true"]')).toBeNull();
+    expect(stack.querySelector('.message-body')).toBeNull();
+    expect(document.querySelector('iframe.message-frame')).toBeNull();
+    // Folded, the newest message still says who wrote it, when, and what is new.
+    expect(cards[1].querySelector('.collapsed-heading strong')?.textContent).toBe('Jordan Matelsky');
+    expect(cards[1].querySelector('.collapsed-heading time')).toBeTruthy();
+    expect(cards[1].querySelector('.collapsed-preview')?.textContent).toContain('Yes. The architecture decision is recorded.');
+  });
+
+  test('unfolding one message leaves the rest folded', async () => {
+    const { user } = await renderMailbox();
+    const alice = document.getElementById('native-message-11')!;
+    const jordan = document.getElementById('native-message-12')!;
+
+    // The folded summary is the control that opens a message.
+    await user.click(alice.querySelector<HTMLButtonElement>('.message-open')!);
+    expect(alice.classList.contains('is-collapsed')).toBe(false);
+    expect(alice.querySelector('.message-body')).toBeTruthy();
+    expect(jordan.classList.contains('is-collapsed')).toBe(true);
+    expect(jordan.querySelector('.message-body')).toBeNull();
+
+    await user.click(within(alice).getByRole('button', { name: 'Collapse message from Alice Example' }));
+    expect(alice.classList.contains('is-collapsed')).toBe(true);
+    expect(alice.querySelector('.message-body')).toBeNull();
+  });
+
+  test('a message that arrives while the thread is open comes in unfolded', async () => {
+    await renderMailbox();
+    expect(document.querySelectorAll('.message-card.is-collapsed')).toHaveLength(2);
+    messages.push({
+      ...messages[0],
+      id: 13,
+      sentAt: Date.UTC(2026, 7, 22, 17),
+      bodyText: 'Recorded on my side too. Thanks.',
+      bodyHtml: '<p>Recorded on my side too. Thanks.</p>'
+    });
+    try {
+      await emit(MAILBOX_CHANGED_EVENT, { source: 'provider-ingest' });
+      const arrived = await waitFor(() => {
+        const card = document.getElementById('native-message-13');
+        expect(card).toBeTruthy();
+        return card!;
+      });
+      // The arrival is the one thing a reader with the thread open is waiting
+      // for, so it opens; what was already on screen stays as it was.
+      expect(arrived.classList.contains('is-collapsed')).toBe(false);
+      expect(arrived.querySelector('.message-body')).toBeTruthy();
+      expect(document.getElementById('native-message-11')?.classList.contains('is-collapsed')).toBe(true);
+      expect(document.getElementById('native-message-12')?.classList.contains('is-collapsed')).toBe(true);
+    } finally {
+      messages.pop();
+    }
   });
 
   test('the sidebar narrows to icons and remembers that it did', async () => {

@@ -24,6 +24,12 @@ function remoteImage(
   return { id, domain, altText, allowedByPolicy };
 }
 
+/// Every message opens folded, and the remote-content controls live in the
+/// body, so each test unfolds the one message it rendered before reaching for them.
+async function unfold(): Promise<void> {
+  await fireEvent.click(screen.getByRole('button', { name: /^Expand message/u }));
+}
+
 function message(remoteImages: RemoteImageSummary[]): MessageSummary {
   return {
     id: 11,
@@ -82,6 +88,7 @@ describe('remote image privacy controls', () => {
       messages: [fixture],
       attachments: []
     });
+    await unfold();
     const before = container.querySelector('iframe.message-frame');
     expect(before).toBeTruthy();
     const rendered = before!.getAttribute('srcdoc');
@@ -109,6 +116,7 @@ describe('remote image privacy controls', () => {
       messages: [message([remoteImage(7, 'images.example'), remoteImage(8, 'cdn.example')])],
       attachments: []
     });
+    await unfold();
 
     expect(screen.getByText('2 remote items blocked')).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Load images' }));
@@ -133,6 +141,7 @@ describe('remote image privacy controls', () => {
       remoteImage(8, 'tracker.example', false)
     ]);
     const { container } = render(ThreadConversation, { messages: [fixture], attachments: [] });
+    await unfold();
 
     await waitFor(() => expect(framedImages(container)).toHaveLength(1));
     expect(calls).toEqual([
@@ -160,6 +169,7 @@ describe('remote image privacy controls', () => {
       remoteImage(8, 'cdn.example')
     ]);
     const view = render(ThreadConversation, { messages: [fixture], attachments: [] });
+    await unfold();
 
     await fireEvent.click(screen.getByRole('button', { name: 'See blocked domains' }));
     expect(screen.getByRole('dialog', { name: 'Remote content domains' })).toBeTruthy();
@@ -175,6 +185,7 @@ describe('remote image privacy controls', () => {
     view.unmount();
     calls.length = 0;
     render(ThreadConversation, { messages: [fixture], attachments: [] });
+    await unfold();
     await fireEvent.click(screen.getByRole('button', { name: 'Always load from sender' }));
     await waitFor(() => expect(calls[0]).toEqual({
       command: 'allow_remote_content_sender',
