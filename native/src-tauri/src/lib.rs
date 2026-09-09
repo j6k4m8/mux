@@ -1255,7 +1255,7 @@ mod tests {
             "smtpPort": 587,
             "smtpTlsMode": "starttls",
             "smtpUsername": "reader@example.test",
-            "password": "must-not-cross-ipc"
+            "password": "unexpected-field"
         });
         assert!(serde_json::from_value::<ImapAccountInput>(input).is_err());
     }
