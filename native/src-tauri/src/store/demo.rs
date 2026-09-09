@@ -211,6 +211,17 @@ const DEMO_REMOTE_IMAGES: &[(i64, &[DemoRemoteImage])] = &[(
 pub(crate) const DEMO_FIXTURE_THREAD_ID: i64 = 5;
 
 pub(super) fn seed_demo_mailbox(connection: &mut Connection) -> Result<(), StoreError> {
+    let was_already_seeded = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'seed_complete'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if was_already_seeded.as_deref() == Some("1") {
+        return Ok(());
+    }
+
     let thread_count: i64 =
         connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
     if thread_count > 0 {

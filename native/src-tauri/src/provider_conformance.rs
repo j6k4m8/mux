@@ -352,16 +352,37 @@ fn replace_capabilities(
     account_id: &str,
     capabilities: &ProviderCapabilities,
 ) -> Result<(), WorkerError> {
-    transaction.execute(
-        "DELETE FROM provider_capabilities WHERE account_id = ?1",
+    // SMTP authorization is independent from IMAP authorization. A 535 marks
+    // this transport capability disabled until provisioning proves it again;
+    // an otherwise healthy IMAP discovery must not silently re-enable it.
+    let preserve_imap_outgoing = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM provider_accounts
+           WHERE account_id = ?1 AND provider_kind = 'imap'
+         )",
         [account_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    transaction.execute(
+        "DELETE FROM provider_capabilities
+         WHERE account_id = ?1 AND (?2 = 0 OR capability <> 'outgoing_mail')",
+        params![account_id, i64::from(preserve_imap_outgoing)],
     )?;
     for capability in &capabilities.supported {
-        transaction.execute(
-            "INSERT INTO provider_capabilities(account_id, capability, enabled)
-             VALUES(?1, ?2, 1)",
-            params![account_id, capability_key(*capability)],
-        )?;
+        let capability = capability_key(*capability);
+        if preserve_imap_outgoing && capability == "outgoing_mail" {
+            transaction.execute(
+                "INSERT INTO provider_capabilities(account_id, capability, enabled)
+                 VALUES(?1, ?2, 1) ON CONFLICT(account_id, capability) DO NOTHING",
+                params![account_id, capability],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO provider_capabilities(account_id, capability, enabled)
+                 VALUES(?1, ?2, 1)",
+                params![account_id, capability],
+            )?;
+        }
     }
     Ok(())
 }
@@ -487,6 +508,47 @@ pub(crate) mod test_support {
         drop(connection);
         let worker = DurableWorker::new(&path, test_config()).expect("durable worker");
         (directory, path, worker)
+    }
+
+    #[test]
+    fn imap_discovery_does_not_reenable_a_failed_smtp_transport() {
+        let (_directory, path, _worker) = configured_worker(&["imap-account"]);
+        let mut connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute_batch(
+                "UPDATE provider_accounts SET provider_kind = 'imap'
+                 WHERE account_id = 'imap-account';
+                 INSERT INTO provider_capabilities(account_id, capability, enabled)
+                 VALUES('imap-account', 'outgoing_mail', 0);",
+            )
+            .expect("disabled SMTP fixture");
+        let transaction = connection.transaction().expect("capability transaction");
+        replace_capabilities(
+            &transaction,
+            "imap-account",
+            &ProviderCapabilities::new([
+                ProviderCapability::DeltaSync,
+                ProviderCapability::OutgoingMail,
+            ]),
+        )
+        .expect("replace IMAP capabilities");
+        transaction.commit().expect("commit capabilities");
+        let values = connection
+            .prepare(
+                "SELECT capability, enabled FROM provider_capabilities
+                 WHERE account_id = 'imap-account' ORDER BY capability",
+            )
+            .expect("capability query")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("capability rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("capabilities");
+        assert_eq!(
+            values,
+            vec![("delta_sync".into(), 1), ("outgoing_mail".into(), 0)]
+        );
     }
 
     fn batch(

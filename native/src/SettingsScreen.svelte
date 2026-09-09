@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import Icon from './Icon.svelte';
   import ThreadRowSample from './ThreadRowSample.svelte';
   import { animationChoices } from './motion';
@@ -23,14 +23,40 @@
 
   type GmailOAuthResult = { state: 'connected'; accountId: string; email: string };
   type ImapAccountAdded = { accountId: string; email: string; folders: number };
+  type RemovedAccount = { accountId: string; keychainCleanupPending: boolean };
+  type AccountWizardStep = 'email' | 'mailbox-type' | 'gmail' | 'imap-incoming' | 'imap-outgoing' | 'imap-review';
+  type ImapForm = {
+    displayName: string;
+    email: string;
+    host: string;
+    port: number;
+    username: string;
+    smtpHost: string;
+    smtpPort: number;
+    smtpTlsMode: 'starttls' | 'implicit';
+    smtpUsername: string;
+  };
 
   /// Mux proves these details against the server before saving anything, so
   /// this form is where a typo gets caught rather than the sync queue.
-  let imapForm = { displayName: '', email: '', host: '', port: 993, username: '', password: '' };
+  const emptyImapForm = (): ImapForm => ({
+    displayName: '', email: '', host: '', port: 993, username: '',
+    smtpHost: '', smtpPort: 587, smtpTlsMode: 'starttls', smtpUsername: ''
+  });
+  let accountWizardStep: AccountWizardStep = 'email';
+  let accountEmail = '';
+  let accountEmailInput: HTMLInputElement | null = null;
+  let wizardStepHeading: HTMLElement | null = null;
+  let imapForm = emptyImapForm();
   let imapBusy = false;
-  $: imapReady = Boolean(
-    imapForm.email.trim() && imapForm.host.trim() && imapForm.username.trim() && imapForm.password
-      && Number.isInteger(imapForm.port) && imapForm.port > 0 && imapForm.port <= 65535
+  $: wizardEmailReady = validMailboxEmail(accountEmail);
+  $: imapIncomingReady = Boolean(
+    imapForm.host.trim() && imapForm.username.trim()
+      && validPort(imapForm.port)
+  );
+  $: imapOutgoingReady = Boolean(
+    imapForm.smtpHost.trim() && imapForm.smtpUsername.trim()
+      && validPort(imapForm.smtpPort)
   );
 
   export let mailbox: MailboxBootstrap;
@@ -66,18 +92,106 @@
   let resyncBusy = false;
   let gmailOAuthBusy = false;
   let syncingAccounts: string[] = [];
+  let settingAccountColors: string[] = [];
+  let removingAccountId = '';
+  let removeConfirmationId = '';
+  let removalCancelButton: HTMLButtonElement | null = null;
+  let removalTriggerButton: HTMLButtonElement | null = null;
   let customFont = fontChoices.some((choice) => choice.value === appearance.font)
     ? ''
     : appearance.font;
 
-  export function show(section: SettingsSection = 'accounts') {
+  export function show(section: SettingsSection = 'accounts', signInEmail = '') {
     settingsSection = section;
     clearSettingsFeedback();
+    if (section === 'accounts' && validMailboxEmail(signInEmail)) {
+      accountWizardStep = 'email';
+      accountEmail = signInEmail;
+      imapForm = emptyImapForm();
+      // Let the reactive validity flag observe the prefill before advancing.
+      void tick().then(startAccountWizard);
+    }
   }
 
   function clearSettingsFeedback() {
     settingsError = '';
     settingsMessage = '';
+  }
+
+  function validMailboxEmail(value: string): boolean {
+    const email = value.trim();
+    const at = email.indexOf('@');
+    return email.length > 2 && email.length <= 320 && at > 0 && at === email.lastIndexOf('@')
+      && at < email.length - 1 && !/\s|[\u0000-\u001f\u007f]/u.test(email);
+  }
+
+  function validPort(value: number): boolean {
+    return Number.isInteger(value) && value > 0 && value <= 65535;
+  }
+
+  function normalizedAccountEmail(): string {
+    const email = accountEmail.trim();
+    const at = email.lastIndexOf('@');
+    return `${email.slice(0, at)}@${email.slice(at + 1).toLowerCase()}`;
+  }
+
+  async function moveAccountWizard(step: AccountWizardStep) {
+    accountWizardStep = step;
+    clearSettingsFeedback();
+    await tick();
+    if (step === 'email') accountEmailInput?.focus();
+    else wizardStepHeading?.focus();
+  }
+
+  async function resetAccountWizard() {
+    accountWizardStep = 'email';
+    accountEmail = '';
+    imapForm = emptyImapForm();
+    await tick();
+    accountEmailInput?.focus();
+  }
+
+  async function startAccountWizard() {
+    if (!wizardEmailReady || gmailOAuthBusy || imapBusy || removingAccountId) return;
+    removeConfirmationId = '';
+    accountEmail = normalizedAccountEmail();
+    if (accountEmail.endsWith('@gmail.com')) {
+      await moveAccountWizard('gmail');
+      void connectGmail();
+    } else {
+      await moveAccountWizard('mailbox-type');
+    }
+  }
+
+  async function chooseImapMailbox() {
+    if (removingAccountId) return;
+    const email = normalizedAccountEmail();
+    imapForm = { ...emptyImapForm(), email, username: email, smtpUsername: email };
+    await moveAccountWizard('imap-incoming');
+  }
+
+  async function chooseGoogleMailbox() {
+    if (removingAccountId) return;
+    await moveAccountWizard('gmail');
+    void connectGmail();
+  }
+
+  async function advanceImapWizard() {
+    if (removingAccountId) return;
+    if (accountWizardStep === 'imap-incoming' && imapIncomingReady) {
+      await moveAccountWizard('imap-outgoing');
+    } else if (accountWizardStep === 'imap-outgoing' && imapOutgoingReady) {
+      await moveAccountWizard('imap-review');
+    } else if (accountWizardStep === 'imap-review') {
+      await addImapAccount();
+    }
+  }
+
+  async function backFromImapWizard() {
+    const step = accountWizardStep === 'imap-incoming'
+      ? 'mailbox-type'
+      : accountWizardStep === 'imap-outgoing' ? 'imap-incoming' : 'imap-outgoing';
+    await moveAccountWizard(step);
   }
 
   function settingsErrorText(cause: unknown): string {
@@ -101,7 +215,8 @@
     throw new Error('Mux returned an invalid Google authorization result.');
   }
 
-  function readImapAccountAdded(value: unknown): ImapAccountAdded {
+  function readImapAccountAdded(value: unknown): ImapAccountAdded | null {
+    if (value === null) return null;
     if (
       typeof value === 'object' && value !== null &&
       'accountId' in value && typeof value.accountId === 'string' && value.accountId.length > 0 &&
@@ -113,10 +228,21 @@
     throw new Error('Mux returned an invalid mailbox result.');
   }
 
+  function readRemovedAccount(value: unknown): RemovedAccount {
+    if (
+      typeof value === 'object' && value !== null &&
+      'accountId' in value && typeof value.accountId === 'string' && value.accountId.length > 0 &&
+      'keychainCleanupPending' in value && typeof value.keychainCleanupPending === 'boolean'
+    ) {
+      return { accountId: value.accountId, keychainCleanupPending: value.keychainCleanupPending };
+    }
+    throw new Error('Mux returned an invalid account-removal result.');
+  }
+
   async function addImapAccount() {
     // The submit button is disabled without these, but a form also submits on
     // Enter, and a half-filled credential is not worth sending anywhere.
-    if (imapBusy || !imapReady) return;
+    if (imapBusy || removingAccountId || accountWizardStep !== 'imap-review' || !imapIncomingReady || !imapOutgoingReady) return;
     settingsError = '';
     settingsMessage = '';
     imapBusy = true;
@@ -128,11 +254,14 @@
           host: imapForm.host.trim(),
           port: imapForm.port,
           username: imapForm.username.trim(),
-          password: imapForm.password
+          smtpHost: imapForm.smtpHost.trim(),
+          smtpPort: imapForm.smtpPort,
+          smtpTlsMode: imapForm.smtpTlsMode,
+          smtpUsername: imapForm.smtpUsername.trim()
         }
       }));
-      // The password is not kept around once the keychain has it.
-      imapForm = { displayName: '', email: '', host: '', port: 993, username: '', password: '' };
+      if (!result) return;
+      await resetAccountWizard();
       const folders = result.folders === 1 ? '1 folder' : `${result.folders} folders`;
       settingsMessage = `Connected ${result.email} — ${folders}.`;
       await refreshMailbox();
@@ -175,6 +304,7 @@
   }
 
   async function setAccountColor(accountId: string, name: string, value: string) {
+    if (settingAccountColors.includes(accountId) || removingAccountId) return;
     settingsError = '';
     settingsMessage = '';
     // Checked here as well as in the store: the colour is written into inline
@@ -184,22 +314,28 @@
       settingsError = 'Mux only takes a colour written as #rrggbb.';
       return;
     }
+    settingAccountColors = [...settingAccountColors, accountId];
     try {
       await invoke('set_account_color', { input: { accountId, color } });
       await refreshMailbox();
       settingsMessage = `${name} is now ${describeAccountColor(color)}.`;
     } catch (cause) {
       settingsError = settingsErrorText(cause);
+    } finally {
+      settingAccountColors = settingAccountColors.filter((id) => id !== accountId);
     }
   }
 
   async function connectGmail() {
+    if (gmailOAuthBusy || removingAccountId) return;
     settingsError = '';
     settingsMessage = '';
     gmailOAuthBusy = true;
     try {
       const result = readGmailOAuthResult(await invoke<unknown>('gmail_oauth_begin'));
       settingsMessage = `Connected ${result.email}.`;
+      await resetAccountWizard();
+      await refreshMailbox();
     } catch (cause) {
       settingsError = settingsErrorText(cause);
     } finally {
@@ -214,6 +350,43 @@
     } catch (cause) {
       settingsError = settingsErrorText(cause);
     }
+  }
+
+  async function removeAccount(accountId: string, accountName: string) {
+    if (gmailOAuthBusy || imapBusy || settingAccountColors.length || removingAccountId || removeConfirmationId !== accountId) return;
+    settingsError = '';
+    settingsMessage = '';
+    removingAccountId = accountId;
+    try {
+      const removed = readRemovedAccount(await invoke<unknown>('account_remove', {
+        input: { accountId }
+      }));
+      if (removed.accountId !== accountId) throw new Error('Mux removed a different account than requested.');
+      removeConfirmationId = '';
+      settingsMessage = removed.keychainCleanupPending
+        ? `Removed ${accountName}. Saved sign-in cleanup will finish when Mux can next reach the Keychain.`
+        : `Removed ${accountName} from this Mac. Mail on the server was not changed.`;
+      await refreshMailbox();
+    } catch (cause) {
+      settingsError = settingsErrorText(cause);
+    } finally {
+      removingAccountId = '';
+    }
+  }
+
+  async function requestAccountRemoval(accountId: string, trigger: HTMLButtonElement) {
+    if (gmailOAuthBusy || imapBusy || settingAccountColors.length || removingAccountId) return;
+    removalTriggerButton = trigger;
+    removeConfirmationId = accountId;
+    clearSettingsFeedback();
+    await tick();
+    removalCancelButton?.focus();
+  }
+
+  async function cancelAccountRemoval() {
+    removeConfirmationId = '';
+    await tick();
+    removalTriggerButton?.focus();
   }
 
   async function resyncAllMail() {
@@ -278,21 +451,34 @@
                   <em>{account.total} messages</em>
                 </div>
                 <div class="settings-account-refresh">
-                  <span>Check for new mail</span>
-                  <button
-                    class="settings-sync-now"
-                    type="button"
-                    data-action="sync-now"
-                    data-account-id={account.id}
-                    title={`Check ${account.name} for new mail right now`}
-                    disabled={syncingAccounts.includes(account.id)}
-                    on:click={() => syncAccountNow(account.id, account.name)}
-                  >{syncingAccounts.includes(account.id) ? 'Checking…' : 'Sync now'}</button>
+                  <div class="settings-account-control-head">
+                    <span>Check for new mail</span>
+                    <div class="settings-account-buttons">
+                      <button
+                        class="settings-sync-now"
+                        type="button"
+                        data-action="sync-now"
+                        data-account-id={account.id}
+                        title={`Check ${account.name} for new mail right now`}
+                        disabled={syncingAccounts.includes(account.id) || removingAccountId === account.id}
+                        on:click={() => syncAccountNow(account.id, account.name)}
+                      >{syncingAccounts.includes(account.id) ? 'Checking…' : 'Sync now'}</button>
+                      <button
+                        class="settings-remove-account"
+                        type="button"
+                        data-testid="remove-account"
+                        data-account-id={account.id}
+                        disabled={gmailOAuthBusy || imapBusy || settingAccountColors.length > 0 || Boolean(removingAccountId)}
+                        on:click={(event) => { void requestAccountRemoval(account.id, event.currentTarget); }}
+                      >Remove</button>
+                    </div>
+                  </div>
                   <div class="settings-choice-row" role="group" aria-label={`Refresh interval for ${account.name}`} data-testid="refresh-interval" data-account-id={account.id}>
                     {#each refreshChoices as choice}
                       <button
                         class:is-active={account.refreshSeconds === choice.value}
                         type="button"
+                        disabled={removingAccountId === account.id}
                         on:click={() => setAccountRefresh(account.id, choice.value)}
                       >{choice.label}</button>
                     {/each}
@@ -309,6 +495,7 @@
                         aria-pressed={currentColor === choice.value}
                         aria-label={`${choice.label} for ${account.name}`}
                         title={`Use ${choice.label.toLocaleLowerCase()} for ${account.name}`}
+                        disabled={settingAccountColors.includes(account.id) || Boolean(removingAccountId)}
                         on:click={() => setAccountColor(account.id, account.name, choice.value)}
                       >
                         <span class="accent-swatch" style:background={choice.value} aria-hidden="true"></span>{choice.label}
@@ -326,11 +513,33 @@
                         value={currentColor ?? '#000000'}
                         aria-label={`Custom colour for ${account.name}`}
                         data-testid="account-color-custom"
+                        disabled={settingAccountColors.includes(account.id) || Boolean(removingAccountId)}
                         on:change={(event) => setAccountColor(account.id, account.name, event.currentTarget.value)}
                       />Custom
                     </label>
                   </div>
                 </div>
+                {#if removeConfirmationId === account.id}
+                  <div
+                    class="settings-remove-confirmation"
+                    role="group"
+                    aria-labelledby={`remove-account-${account.id}`}
+                    aria-describedby={`remove-account-description-${account.id}`}
+                  >
+                    <strong id={`remove-account-${account.id}`}>Remove {account.name}?</strong>
+                    <p id={`remove-account-description-${account.id}`}>This removes its downloaded mail, drafts, pending changes, and saved sign-in from this Mac. Mail on the server is not changed.</p>
+                    <div class="settings-actions">
+                      <button bind:this={removalCancelButton} type="button" disabled={Boolean(removingAccountId)} on:click={() => { void cancelAccountRemoval(); }}>Cancel</button>
+                      <button
+                        class="danger-button"
+                        type="button"
+                        data-testid="confirm-remove-account"
+                        disabled={gmailOAuthBusy || imapBusy || settingAccountColors.length > 0 || Boolean(removingAccountId)}
+                        on:click={() => removeAccount(account.id, account.name)}
+                      >{removingAccountId === account.id ? 'Removing…' : 'Remove account'}</button>
+                    </div>
+                  </div>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -345,54 +554,128 @@
               ? 'Your account above is already connected and syncing. This adds a second mailbox.'
               : 'Connect an additional mailbox alongside the ones above.'}
           </p>
-          <div class="provider-card" aria-labelledby="gmail-connect-title">
-            <div>
-              <h3 id="gmail-connect-title">Gmail</h3>
-              <p>Sign in through your browser. Mux never sees your Google password.</p>
-            </div>
-            {#if gmailOAuthBusy}
-              <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
+          <div class="provider-wizard" data-testid="account-wizard" data-step={accountWizardStep}>
+            {#if accountWizardStep === 'email'}
+              <form on:submit|preventDefault={startAccountWizard}>
+                <h4>Type your email</h4>
+                <label class="provider-wizard-email">
+                  <span>Email address</span>
+                  <input bind:this={accountEmailInput} bind:value={accountEmail} type="email" autocomplete="email" spellcheck="false" placeholder="you@example.com" data-testid="account-email" />
+                </label>
+                <div class="settings-actions">
+                  <button class="primary-button" type="submit" data-testid="account-email-continue" disabled={!wizardEmailReady || Boolean(removingAccountId)}>Continue</button>
+                </div>
+              </form>
+            {:else if accountWizardStep === 'mailbox-type'}
+              <div class="provider-wizard-heading">
+                <button type="button" on:click={() => { void moveAccountWizard('email'); }}>Back</button>
+                <div><span>Mailbox type</span><strong>{accountEmail}</strong></div>
+              </div>
+              <h4 bind:this={wizardStepHeading} tabindex="-1">Where is this mailbox hosted?</h4>
+              <div class="provider-choice-list">
+                <button type="button" data-testid="choose-google" disabled={Boolean(removingAccountId)} on:click={chooseGoogleMailbox}>
+                  <strong>Google Workspace</strong>
+                  <span>Continue with Google in your browser.</span>
+                </button>
+                <button type="button" data-testid="choose-imap" disabled={Boolean(removingAccountId)} on:click={chooseImapMailbox}>
+                  <strong>Another mail provider</strong>
+                  <span>Connect using IMAP for incoming mail and SMTP for sending.</span>
+                </button>
+              </div>
+            {:else if accountWizardStep === 'gmail'}
+              <div class="provider-wizard-heading">
+                <button type="button" disabled={gmailOAuthBusy} on:click={() => { void moveAccountWizard('email'); }}>Back</button>
+                <div><span>Google sign-in</span><strong>{accountEmail}</strong></div>
+              </div>
+              <div class="provider-gmail-step">
+                <h4 bind:this={wizardStepHeading} tabindex="-1">{gmailOAuthBusy ? 'Opening Google sign-in…' : 'Continue with Google'}</h4>
+                <p>Mux never sees your Google password. The Google account you approve becomes the connected address.</p>
+                <div class="settings-actions">
+                  {#if gmailOAuthBusy}
+                    <button type="button" on:click={cancelGmailOAuth}>Cancel</button>
+                  {:else}
+                    <button class="primary-button" type="button" disabled={Boolean(removingAccountId)} on:click={connectGmail}>Try Google sign-in again</button>
+                  {/if}
+                </div>
+              </div>
             {:else}
-              <button class="primary-button" type="button" title="Authorize Gmail in your browser" on:click={connectGmail}>Add Gmail account</button>
+              <form class="provider-form provider-wizard-form" data-testid="imap-form" on:submit|preventDefault={advanceImapWizard}>
+                <div class="provider-wizard-heading">
+                  <button type="button" disabled={imapBusy} on:click={() => { void backFromImapWizard(); }}>Back</button>
+                  <div>
+                    <span>{accountWizardStep === 'imap-incoming' ? 'Step 1 of 3' : accountWizardStep === 'imap-outgoing' ? 'Step 2 of 3' : 'Step 3 of 3'}</span>
+                    <strong>{accountEmail}</strong>
+                  </div>
+                </div>
+
+                {#if accountWizardStep === 'imap-incoming'}
+                  <h3 bind:this={wizardStepHeading} tabindex="-1">Incoming mail</h3>
+                  <p>Enter the IMAP details from your mail provider.</p>
+                  <div class="provider-fields">
+                    <label>
+                      <span>Account name</span>
+                      <input bind:value={imapForm.displayName} type="text" autocomplete="off" placeholder="Optional" data-testid="imap-name" disabled={imapBusy} />
+                    </label>
+                    <label class="provider-server">
+                      <span>IMAP server</span>
+                      <input bind:value={imapForm.host} type="text" autocomplete="off" spellcheck="false" placeholder="imap.example.com" data-testid="imap-host" disabled={imapBusy} />
+                    </label>
+                    <label class="provider-port">
+                      <span>Port</span>
+                      <input bind:value={imapForm.port} type="number" min="1" max="65535" data-testid="imap-port" disabled={imapBusy} />
+                    </label>
+                    <label>
+                      <span>IMAP username</span>
+                      <input bind:value={imapForm.username} type="text" autocomplete="off" spellcheck="false" data-testid="imap-username" disabled={imapBusy} />
+                    </label>
+                  </div>
+                  <div class="settings-actions">
+                    <button class="primary-button" type="submit" data-testid="imap-incoming-continue" disabled={!imapIncomingReady || Boolean(removingAccountId)}>Continue</button>
+                  </div>
+                {:else if accountWizardStep === 'imap-outgoing'}
+                  <h3 bind:this={wizardStepHeading} tabindex="-1">Outgoing mail</h3>
+                  <p>Enter the SMTP details used to send mail.</p>
+                  <div class="provider-fields">
+                    <label class="provider-server">
+                      <span>SMTP server</span>
+                      <input bind:value={imapForm.smtpHost} type="text" autocomplete="off" spellcheck="false" placeholder="smtp.example.com" data-testid="smtp-host" disabled={imapBusy} />
+                    </label>
+                    <label class="provider-port">
+                      <span>Port</span>
+                      <input bind:value={imapForm.smtpPort} type="number" min="1" max="65535" data-testid="smtp-port" disabled={imapBusy} />
+                    </label>
+                    <label>
+                      <span>Security</span>
+                      <select bind:value={imapForm.smtpTlsMode} data-testid="smtp-tls-mode" disabled={imapBusy}>
+                        <option value="starttls">STARTTLS (usually port 587)</option>
+                        <option value="implicit">Implicit TLS (usually port 465)</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>SMTP username</span>
+                      <input bind:value={imapForm.smtpUsername} type="text" autocomplete="off" spellcheck="false" data-testid="smtp-username" disabled={imapBusy} />
+                    </label>
+                  </div>
+                  <div class="settings-actions">
+                    <button class="primary-button" type="submit" data-testid="imap-outgoing-continue" disabled={!imapOutgoingReady || Boolean(removingAccountId)}>Review</button>
+                  </div>
+                {:else}
+                  <h3 bind:this={wizardStepHeading} tabindex="-1">Ready to connect</h3>
+                  <p>Passwords are requested next in a native macOS dialog and never enter this interface.</p>
+                  <dl class="provider-review">
+                    <div><dt>Incoming</dt><dd>{imapForm.host}:{imapForm.port} · {imapForm.username}</dd></div>
+                    <div><dt>Outgoing</dt><dd>{imapForm.smtpHost}:{imapForm.smtpPort} · {imapForm.smtpUsername}</dd></div>
+                    <div><dt>Security</dt><dd>IMAP implicit TLS · SMTP {imapForm.smtpTlsMode === 'implicit' ? 'implicit TLS' : 'STARTTLS'}</dd></div>
+                  </dl>
+                  <div class="settings-actions">
+                    <button class="primary-button" type="submit" data-testid="imap-submit" disabled={imapBusy || Boolean(removingAccountId)}>
+                      {imapBusy ? 'Checking the servers…' : 'Connect account'}
+                    </button>
+                  </div>
+                {/if}
+              </form>
             {/if}
           </div>
-
-          <form class="provider-form" data-testid="imap-form" on:submit|preventDefault={addImapAccount}>
-            <h3 id="imap-connect-title">IMAP</h3>
-            <p>Any other mail server. Mux reads this mailbox; it cannot yet send from it or change it on the server.</p>
-            <div class="provider-fields">
-              <label>
-                <span>Server</span>
-                <input bind:value={imapForm.host} type="text" autocomplete="off" spellcheck="false" placeholder="imap.example.com" data-testid="imap-host" disabled={imapBusy} />
-              </label>
-              <label class="provider-port">
-                <span>Port</span>
-                <input bind:value={imapForm.port} type="number" min="1" max="65535" data-testid="imap-port" disabled={imapBusy} />
-              </label>
-              <label>
-                <span>Username</span>
-                <input bind:value={imapForm.username} type="text" autocomplete="off" spellcheck="false" data-testid="imap-username" disabled={imapBusy} />
-              </label>
-              <label>
-                <span>Password</span>
-                <input bind:value={imapForm.password} type="password" autocomplete="off" data-testid="imap-password" disabled={imapBusy} />
-              </label>
-              <label>
-                <span>Address</span>
-                <input bind:value={imapForm.email} type="email" autocomplete="off" spellcheck="false" placeholder="you@example.com" data-testid="imap-email" disabled={imapBusy} />
-              </label>
-              <label>
-                <span>Name</span>
-                <input bind:value={imapForm.displayName} type="text" autocomplete="off" placeholder="Optional" data-testid="imap-name" disabled={imapBusy} />
-              </label>
-            </div>
-            <div class="settings-actions">
-              <button class="primary-button" type="submit" data-testid="imap-submit" disabled={imapBusy || !imapReady}>
-                {imapBusy ? 'Checking the server…' : 'Add IMAP account'}
-              </button>
-              <span class="settings-hint">Implicit TLS only. Mux signs in before saving anything.</span>
-            </div>
-          </form>
         </section>
       {:else if settingsSection === 'appearance'}
         <header class="settings-heading">

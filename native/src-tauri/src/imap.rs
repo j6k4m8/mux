@@ -64,6 +64,7 @@ pub(crate) struct ImapAccessGrant {
     pub username: String,
     pub password: Zeroizing<String>,
     pub remote_account_id: String,
+    pub outgoing_mail: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1577,6 +1578,7 @@ where
             session.as_mut(),
             &work.account_id,
             &grant.remote_account_id,
+            grant.outgoing_mail,
             request,
             now_ms,
         ) {
@@ -1592,6 +1594,7 @@ fn execute_sync_page(
     session: &mut dyn ImapSession,
     account_id: &str,
     remote_account_id: &str,
+    outgoing_mail: bool,
     request: ImapSyncWork,
     now_ms: i64,
 ) -> Result<ProviderSyncPage, ImapError> {
@@ -1608,6 +1611,7 @@ fn execute_sync_page(
             request,
             generation_id,
             prior_folders,
+            outgoing_mail,
             now_ms,
         ),
         ImapSyncPhase::Select {
@@ -1903,6 +1907,7 @@ fn execute_discover(
     request: ImapSyncWork,
     generation_id: String,
     prior_folders: Vec<StoredFolderCursor>,
+    outgoing_mail: bool,
     now_ms: i64,
 ) -> Result<ProviderSyncPage, ImapError> {
     let mux_account_id = MuxAccountId::new(account_id.to_owned()).map_err(contract_error)?;
@@ -1978,6 +1983,9 @@ fn execute_discover(
     let mut capabilities = BTreeSet::new();
     if session.capabilities().supports_condstore() {
         capabilities.insert(ProviderCapability::DeltaSync);
+    }
+    if outgoing_mail {
+        capabilities.insert(ProviderCapability::OutgoingMail);
     }
     build_sync_page(
         account_id,
@@ -2238,6 +2246,7 @@ fn project_imap_message(
         internet_message_id,
         in_reply_to,
         references,
+        client_correlation_id,
         has_attachments,
         has_invite,
         has_links,
@@ -2250,6 +2259,7 @@ fn project_imap_message(
             internet_message_id,
             in_reply_to,
             references,
+            client_correlation_id,
             body_text,
             body_html,
             blocked_remote_resources,
@@ -2282,6 +2292,7 @@ fn project_imap_message(
                 internet_message_id,
                 in_reply_to,
                 references,
+                client_correlation_id,
                 has_attachments,
                 has_invite,
                 has_links,
@@ -2300,6 +2311,7 @@ fn project_imap_message(
             None,
             None,
             Vec::new(),
+            None,
             false,
             false,
             false,
@@ -2399,6 +2411,7 @@ fn project_imap_message(
         internet_message_id,
         in_reply_to,
         references: (!references.is_empty()).then_some(references),
+        client_correlation_id,
     };
     let participants = truncate_utf8(
         &if sender_name.is_empty() {
@@ -2914,6 +2927,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            true,
             initial_request("generation-full", Vec::new()),
             1_000,
         )
@@ -2924,6 +2938,10 @@ mod tests {
         ));
         assert_eq!(discover.batch.container_upserts.len(), 1);
         assert!(discover
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.contains(ProviderCapability::OutgoingMail)));
+        assert!(discover
             .reconciliation
             .as_ref()
             .is_some_and(|value| value.begin));
@@ -2932,6 +2950,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&discover),
             1_001,
         )
@@ -2960,6 +2979,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&select),
             1_002,
         )
@@ -2985,6 +3005,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&scan),
             1_003,
         )
@@ -3021,6 +3042,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&inventory),
             1_004,
         )
@@ -3067,6 +3089,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             initial_request(
                 "generation-delta",
                 vec![StoredFolderCursor {
@@ -3081,6 +3104,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&discover),
             2_001,
         )
@@ -3096,6 +3120,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&select),
             2_002,
         )
@@ -3112,6 +3137,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             continuation(&changed),
             2_003,
         )
@@ -3166,6 +3192,7 @@ mod tests {
             &mut session,
             "imap-account",
             "reader@example.test",
+            false,
             request,
             3_000,
         )
@@ -3368,6 +3395,7 @@ mod tests {
                 username: "reader@example.test".into(),
                 password: Zeroizing::new("fixture-secret".into()),
                 remote_account_id: "reader@example.test".into(),
+                outgoing_mail: false,
             })
         }
     }
@@ -3459,6 +3487,7 @@ mod tests {
             username: "reader@example.test".into(),
             password: Zeroizing::new("swordfish".into()),
             remote_account_id: "reader@example.test".into(),
+            outgoing_mail: false,
         }
     }
 

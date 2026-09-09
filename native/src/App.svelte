@@ -54,6 +54,7 @@
   } from './theme';
   import type { ThemePreference } from './theme';
   import { searchIsNarrowed, searchScopeView, searchViewFor, viewScopeTerm } from './searchQuery';
+  import { operationTitle, queueBadgeCount } from './syncStatus';
   import {
     confirmationNotice,
     failureNotice,
@@ -201,6 +202,9 @@
   let activityLoading = false;
   let activityError = '';
   let activityRows: OperationActivitySummary[] = [];
+  let queueBadge = 0;
+  let queueBadgeRequest = 0;
+  let topbarRefreshing = false;
   let clock = Date.now();
   let clockTimer: number | undefined;
   let unlistenMailbox: UnlistenFn | null = null;
@@ -230,6 +234,11 @@
     const query = filter.trim().toLocaleLowerCase();
     return !query || `${draft.subject} ${draft.recipients} ${draft.ccRecipients} ${draft.bccRecipients}`.toLocaleLowerCase().includes(query);
   });
+  $: visibleRefreshAccounts = (mailbox?.accounts ?? []).filter(
+    (account) => !hiddenAccounts.includes(account.id)
+      && account.syncState !== null
+      && account.syncState !== undefined
+  );
   $: renderedThreadWindow = mailboxRenderWindow(visibleThreads, threadRenderStart);
   $: renderedDraftWindow = mailboxRenderWindow(visibleDrafts, draftRenderStart);
   $: selectedThread = selectedView === 'drafts'
@@ -418,15 +427,33 @@
     hiddenAccounts = hiddenAccounts.includes(accountId)
       ? hiddenAccounts.filter((id) => id !== accountId)
       : [...hiddenAccounts, accountId];
+    persistHiddenAccounts();
+    // A visibility change re-scopes the cursor, so restart the page.
+    clearThreadPage();
+    resetSearch();
+    if (selectedView !== 'drafts') void loadThreads(false, true);
+  }
+
+  function persistHiddenAccounts() {
     try {
       window.localStorage.setItem(HIDDEN_ACCOUNTS_KEY, JSON.stringify(hiddenAccounts));
     } catch {
       // Visibility persistence is optional; the choice still applies this session.
     }
-    // A visibility change re-scopes the cursor, so restart the page.
-    clearThreadPage();
-    resetSearch();
-    if (selectedView !== 'drafts') void loadThreads(false, true);
+  }
+
+  function pruneRemovedAccountPreferences(accounts: AccountSummary[]) {
+    const connected = new Set(accounts.map((account) => account.id));
+    const retainedHiddenAccounts = hiddenAccounts.filter((id) => connected.has(id));
+    if (retainedHiddenAccounts.length !== hiddenAccounts.length) {
+      hiddenAccounts = retainedHiddenAccounts;
+      persistHiddenAccounts();
+    }
+    const retainedOpenFolderAccounts = sidebar.openFolderAccounts.filter((id) => connected.has(id));
+    if (retainedOpenFolderAccounts.length !== sidebar.openFolderAccounts.length) {
+      sidebar = { ...sidebar, openFolderAccounts: retainedOpenFolderAccounts };
+      persistSidebarLayout(sidebar);
+    }
   }
 
   function readHiddenAccounts(): string[] {
@@ -635,14 +662,14 @@
     document.querySelector<HTMLButtonElement>(`[data-thread-id="${selectedThreadId}"]`)?.focus();
   }
 
-  async function openSettings(section: SettingsSection = 'accounts') {
+  async function openSettings(section: SettingsSection = 'accounts', signInEmail = '') {
     navigationOpen = false;
     closeCommandPalette(false);
     statsOpen = false;
     syncOpen = false;
     settingsOpen = true;
     await tick();
-    settingsScreen?.show(section);
+    settingsScreen?.show(section, signInEmail);
   }
 
   function closeSettings() {
@@ -673,6 +700,40 @@
 
   function closeSync() {
     syncOpen = false;
+  }
+
+  async function refreshVisibleAccounts() {
+    if (topbarRefreshing) return;
+    const accounts = [...visibleRefreshAccounts];
+    if (!accounts.length) {
+      notice = confirmationNotice('No visible connected accounts to refresh');
+      return;
+    }
+    topbarRefreshing = true;
+    try {
+      const results = await Promise.allSettled(accounts.map((account) =>
+        invoke<number>('sync_account_now', { input: { accountId: account.id } })
+      ));
+      const failures = results.filter((result) => result.status === 'rejected');
+      const scheduled = results.reduce(
+        (count, result) => count + (result.status === 'fulfilled' ? result.value : 0),
+        0
+      );
+      await queueMailboxRefresh();
+      if (failures.length) {
+        notice = failureNotice(
+          `${failures.length} of ${accounts.length} visible accounts could not be refreshed`
+        );
+      } else if (scheduled > 0) {
+        notice = confirmationNotice(
+          `Refreshing ${accounts.length} visible ${accounts.length === 1 ? 'account' : 'accounts'}`
+        );
+      } else {
+        notice = confirmationNotice('Visible accounts are already refreshing');
+      }
+    } finally {
+      topbarRefreshing = false;
+    }
   }
 
   async function subscribeToMailboxChanges() {
@@ -737,7 +798,14 @@
     try {
       const nextMailbox = await invoke<MailboxBootstrap>('mailbox_bootstrap');
       if (request !== bootstrapRequest) return;
+      pruneRemovedAccountPreferences(nextMailbox.accounts);
+      if (selectedAccount !== null && !nextMailbox.accounts.some((account) => account.id === selectedAccount)) {
+        selectedAccount = null;
+        selectedContainer = null;
+        selectedSmartView = '';
+      }
       mailbox = nextMailbox;
+      void refreshQueueBadge();
       error = '';
       if (selectedView === 'drafts') {
         clearThreadPage();
@@ -1294,6 +1362,18 @@
     }
   }
 
+  async function refreshQueueBadge() {
+    const request = ++queueBadgeRequest;
+    try {
+      const rows = await invoke<OperationActivitySummary[]>('list_operations', {
+        input: { limit: 100 }
+      });
+      if (request === queueBadgeRequest) queueBadge = queueBadgeCount(rows);
+    } catch {
+      // The badge is supplementary. The Sync page carries the full error state.
+    }
+  }
+
   function closeActivity(restoreFocus = true) {
     activityDialogOpen = false;
     if (restoreFocus) restoreDialogFocus(activityReturnFocus);
@@ -1308,20 +1388,6 @@
     } catch (cause) {
       activityError = cause instanceof Error ? cause.message : String(cause);
     }
-  }
-
-  function operationTitle(operation: OperationActivitySummary): string {
-    return ({
-      archive: 'Archive conversation',
-      restore: 'Move to inbox',
-      read: 'Mark as read',
-      unread: 'Mark as unread',
-      star: 'Star conversation',
-      unstar: 'Remove star',
-      snooze: 'Snooze conversation',
-      rsvp: 'Invitation response',
-      send: 'Send message'
-    } as Record<string, string>)[operation.kind] ?? operation.kind.replaceAll('_', ' ');
   }
 
   function openComposer(draft: DraftSummary | null = null) {
@@ -1795,14 +1861,21 @@
     <div class="topbar-actions">
       <button
         class="topbar-icon-button"
+        class:is-refreshing={topbarRefreshing}
         type="button"
-        aria-label="Open sync status"
-        title="Sync status and queue"
-        data-action="open-sync"
+        aria-label={topbarRefreshing
+          ? 'Refreshing visible accounts'
+          : `Refresh ${visibleRefreshAccounts.length} visible ${visibleRefreshAccounts.length === 1 ? 'account' : 'accounts'}${queueBadge ? `; ${queueBadge} queued or unresolved` : ''}`}
+        title="Refresh every visible connected account"
+        data-action="refresh-visible-accounts"
         data-testid="sync-button"
-        on:click={openSync}
+        disabled={!visibleRefreshAccounts.length || topbarRefreshing}
+        on:click={refreshVisibleAccounts}
       >
         <Icon name="sync" size={19} />
+        {#if queueBadge > 0}
+          <span class="topbar-queue-badge" data-testid="queue-badge" aria-hidden="true">{queueBadge > 99 ? '99+' : queueBadge}</span>
+        {/if}
       </button>
       <button
         class="topbar-icon-button"
@@ -1847,6 +1920,7 @@
       <SyncScreen
         accounts={mailbox.accounts}
         refreshMailbox={() => refreshMailbox()}
+        signIn={(account) => { void openSettings('accounts', account.email); }}
         close={closeSync}
       />
     {:else}
@@ -1888,7 +1962,7 @@
           {selectContainer}
           {toggleAccountVisibility}
           openSettings={() => openSettings()}
-          {openActivity}
+          {openSync}
         />
 
         <section class="thread-pane" aria-label={viewTitle}>
@@ -2163,6 +2237,7 @@
       {#key composerKey}
         <Composer
           accounts={mailbox.accounts}
+          initialAccountId={selectedAccount}
           draft={composerDraft}
           replyThread={composerReply}
           replyRecipient={composerReplyAll ? allReplyRecipients : singleReplyRecipients}
@@ -2260,17 +2335,27 @@
           {:else if !activityRows.length}
             <div class="empty"><strong>No local activity yet</strong><span>Mailbox changes and sends will appear here.</span></div>
           {:else}
-            {#each activityRows as operation (operation.id)}
-              <article class="activity-row">
-                <div>
-                  <strong>{operationTitle(operation)}</strong>
-                  <span>{relativeTime(operation.createdAt)} · {operation.state.replaceAll('_', ' ')}</span>
-                </div>
-                {#if operation.field === 'send' && operation.state === 'outcome_unknown'}
-                  <button type="button" on:click={() => resolveUnknownSend(operation.id)}>Unlock draft</button>
-                {/if}
-              </article>
-            {/each}
+            <div class="activity-table-scroll">
+              <table class="activity-table" data-testid="activity-table">
+                <thead>
+                  <tr><th>Change</th><th>When</th><th>Status</th><th aria-label="Action"></th></tr>
+                </thead>
+                <tbody>
+                  {#each activityRows as operation (operation.id)}
+                    <tr data-testid="activity-row">
+                      <td><strong>{operationTitle(operation.kind)}</strong></td>
+                      <td><time datetime={new Date(operation.createdAt).toISOString()}>{relativeTime(operation.createdAt)}</time></td>
+                      <td><span class="activity-state" data-state={operation.state}>{operation.state.replaceAll('_', ' ')}</span></td>
+                      <td>
+                        {#if operation.field === 'send' && operation.state === 'outcome_unknown'}
+                          <button type="button" on:click={() => resolveUnknownSend(operation.id)}>Unlock draft</button>
+                        {/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
           {/if}
         </div>
       </div>

@@ -19,6 +19,7 @@ import {
   OPERATION_STATES,
   queueEntryAction,
   queueEntryStatus,
+  queueBadgeCount,
   queueLane,
   queueVerdict,
   relativeMoment,
@@ -201,6 +202,17 @@ test('the queue verdict puts a decision ahead of healthy traffic', () => {
     queueVerdict([row({ state: 'outcome_unknown' }), row({ state: 'failed' }), row({ state: 'pending' })]),
     { tone: 'attention', text: '1 change needs you' }
   );
+});
+
+test('the top-bar badge excludes history but includes work and unresolved states', () => {
+  assert.equal(queueBadgeCount([]), 0);
+  assert.equal(queueBadgeCount([
+    row({ id: 'pending', state: 'pending' }),
+    row({ id: 'unknown', state: 'outcome_unknown' }),
+    row({ id: 'failed', state: 'failed' }),
+    row({ id: 'confirmed', state: 'confirmed' }),
+    row({ id: 'cancelled', state: 'cancelled' })
+  ]), 3);
 });
 
 test('undo rows name what they are undoing', () => {

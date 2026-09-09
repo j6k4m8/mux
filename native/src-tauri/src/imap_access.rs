@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,9 +14,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::imap::{ImapAccessError, ImapAccessGrant, ImapAccessSource};
 use crate::keychain::{CredentialError, CredentialStore, CredentialStoreStatus};
+use crate::smtp::{SmtpAccessError, SmtpAccessGrant, SmtpAccessSource, SmtpTlsMode};
 use crate::worker::WorkerError;
 
-const RECORD_VERSION: u8 = 1;
+const IMAP_RECORD_VERSION: u8 = 1;
+const MAIL_RECORD_VERSION: u8 = 2;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_HOST_BYTES: usize = 253;
 const MAX_IDENTITY_BYTES: usize = 2_048;
@@ -50,6 +53,9 @@ impl ImapAccessSource for ImapKeychainAccess {
         let reference = configured
             .record_ref
             .ok_or(ImapAccessError::ReauthorizationRequired)?;
+        if !record_reference_matches_account(account_id, &reference) {
+            return Err(ImapAccessError::ReauthorizationRequired);
+        }
         let bytes = self
             .credentials
             .get(&reference)
@@ -57,12 +63,56 @@ impl ImapAccessSource for ImapKeychainAccess {
             .ok_or(ImapAccessError::ReauthorizationRequired)?;
         let record = ImapAuthorityRecord::decode(&bytes)?;
         record.validate_for_subject(&configured.remote_subject)?;
+        let outgoing_mail = record.smtp.is_some();
         Ok(ImapAccessGrant {
             host: record.host,
             port: record.port,
             username: record.username,
             password: record.password,
-            remote_account_id: record.remote_subject,
+            remote_account_id: configured.sender_email,
+            outgoing_mail,
+        })
+    }
+}
+
+impl SmtpAccessSource for ImapKeychainAccess {
+    fn smtp_access_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<SmtpAccessGrant, SmtpAccessError> {
+        let configured = read_configured_account(&self.database_path, account_id)
+            .map_err(map_imap_access_to_smtp)?;
+        match configured.auth_state.as_str() {
+            "credential_locked" => return Err(SmtpAccessError::CredentialUnavailable),
+            "reauthorization_required" | "signed_out" => {
+                return Err(SmtpAccessError::ReauthorizationRequired)
+            }
+            "ready" => {}
+            _ => return Err(SmtpAccessError::Permanent),
+        }
+        let reference = configured
+            .record_ref
+            .ok_or(SmtpAccessError::ReauthorizationRequired)?;
+        if !record_reference_matches_account(account_id, &reference) {
+            return Err(SmtpAccessError::ReauthorizationRequired);
+        }
+        let bytes = self
+            .credentials
+            .get(&reference)
+            .map_err(map_credential_error_to_smtp)?
+            .ok_or(SmtpAccessError::ReauthorizationRequired)?;
+        let record = ImapAuthorityRecord::decode(&bytes).map_err(map_imap_access_to_smtp)?;
+        record
+            .validate_for_subject(&configured.remote_subject)
+            .map_err(map_imap_access_to_smtp)?;
+        let smtp = record.smtp.ok_or(SmtpAccessError::Permanent)?;
+        Ok(SmtpAccessGrant {
+            host: smtp.host,
+            port: smtp.port,
+            tls_mode: smtp.tls_mode,
+            username: smtp.username,
+            password: smtp.password,
+            remote_account_id: configured.sender_email,
         })
     }
 }
@@ -103,18 +153,19 @@ pub(crate) fn reconcile_credential_records(
     };
     let mut invalid = 0;
     for (account_id, remote_subject, reference) in accounts {
-        let valid = match credentials.get(&reference) {
-            Ok(Some(bytes)) => ImapAuthorityRecord::decode(&bytes)
-                .and_then(|record| record.validate_for_subject(&remote_subject))
-                .is_ok(),
-            Ok(None) => false,
-            Err(CredentialError::Unavailable) => {
-                return Err(WorkerError::Conflict(
-                    "IMAP authority reconciliation could not read the keychain".into(),
-                ))
-            }
-            Err(_) => false,
-        };
+        let valid = record_reference_matches_account(&account_id, &reference)
+            && match credentials.get(&reference) {
+                Ok(Some(bytes)) => ImapAuthorityRecord::decode(&bytes)
+                    .and_then(|record| record.validate_for_subject(&remote_subject))
+                    .is_ok(),
+                Ok(None) => false,
+                Err(CredentialError::Unavailable) => {
+                    return Err(WorkerError::Conflict(
+                        "IMAP authority reconciliation could not read the keychain".into(),
+                    ))
+                }
+                Err(_) => false,
+            };
         if valid {
             continue;
         }
@@ -146,8 +197,39 @@ pub(crate) fn reconcile_credential_records(
     Ok(invalid)
 }
 
+/// Production IMAP account IDs and Keychain references carry the same
+/// lower-hex fingerprint of host, port, and login. Requiring that exact
+/// binding prevents a crossed SQLite marker from granting one account another
+/// server's authority, even when both servers use the same username.
+fn record_reference_matches_account(account_id: &str, reference: &str) -> bool {
+    let Some(account_fingerprint) = account_id.strip_prefix("imap:") else {
+        return false;
+    };
+    let Some(reference_fingerprint) = reference.strip_prefix("imap/account/") else {
+        return false;
+    };
+    let valid_hex = |value: &str| {
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    };
+    if !valid_hex(account_fingerprint) {
+        return false;
+    }
+    if reference_fingerprint == account_fingerprint {
+        // Read-only v1 accounts used the stable account-bound reference.
+        return true;
+    }
+    reference_fingerprint
+        .strip_prefix(account_fingerprint)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .is_some_and(valid_hex)
+}
+
 struct ConfiguredAccount {
     remote_subject: String,
+    sender_email: String,
     auth_state: String,
     record_ref: Option<String>,
 }
@@ -159,15 +241,18 @@ fn read_configured_account(
     let connection = Connection::open(database_path).map_err(|_| ImapAccessError::Retryable)?;
     connection
         .query_row(
-            "SELECT remote_account_id, auth_state, credential_ref
-             FROM provider_accounts
-             WHERE account_id = ?1 AND provider_kind = 'imap'",
+            "SELECT provider.remote_account_id, account.email,
+                    provider.auth_state, provider.credential_ref
+             FROM provider_accounts provider
+             JOIN accounts account ON account.id = provider.account_id
+             WHERE provider.account_id = ?1 AND provider.provider_kind = 'imap'",
             [account_id],
             |row| {
                 Ok(ConfiguredAccount {
                     remote_subject: row.get(0)?,
-                    auth_state: row.get(1)?,
-                    record_ref: row.get(2)?,
+                    sender_email: row.get(1)?,
+                    auth_state: row.get(2)?,
+                    record_ref: row.get(3)?,
                 })
             },
         )
@@ -182,6 +267,15 @@ struct ImapAuthorityRecord {
     username: String,
     password: Zeroizing<String>,
     remote_subject: String,
+    smtp: Option<SmtpAuthority>,
+}
+
+struct SmtpAuthority {
+    host: String,
+    port: u16,
+    tls_mode: SmtpTlsMode,
+    username: String,
+    password: Zeroizing<String>,
 }
 
 #[derive(Deserialize, Zeroize)]
@@ -195,6 +289,16 @@ struct ImapAuthorityRecordWire {
     username: String,
     password: String,
     remote_subject: String,
+    #[serde(default)]
+    smtp_tls_mode: Option<String>,
+    #[serde(default)]
+    smtp_host: Option<String>,
+    #[serde(default)]
+    smtp_port: Option<u16>,
+    #[serde(default)]
+    smtp_username: Option<String>,
+    #[serde(default)]
+    smtp_password: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -211,6 +315,25 @@ struct ImapAuthorityRecordWrite<'a> {
     remote_subject: &'a str,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MailAuthorityRecordWrite<'a> {
+    version: u8,
+    tls_mode: &'static str,
+    auth_mechanism: &'static str,
+    host: &'a str,
+    port: u16,
+    username: &'a str,
+    password: &'a str,
+    remote_subject: &'a str,
+    smtp_tls_mode: &'static str,
+    smtp_host: &'a str,
+    smtp_port: u16,
+    smtp_username: &'a str,
+    smtp_password: &'a str,
+}
+
 impl ImapAuthorityRecord {
     fn decode(bytes: &[u8]) -> Result<Self, ImapAccessError> {
         if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
@@ -220,7 +343,7 @@ impl ImapAuthorityRecord {
             serde_json::from_slice::<ImapAuthorityRecordWire>(bytes)
                 .map_err(|_| ImapAccessError::Permanent)?,
         );
-        if wire.version != RECORD_VERSION
+        if !matches!(wire.version, IMAP_RECORD_VERSION | MAIL_RECORD_VERSION)
             || wire.tls_mode != TLS_MODE
             || wire.auth_mechanism != AUTH_MECHANISM
             || wire.port == 0
@@ -231,12 +354,56 @@ impl ImapAuthorityRecord {
         validate_identity(&wire.username)?;
         validate_identity(&wire.remote_subject)?;
         validate_secret(&wire.password)?;
+        let smtp = if wire.version == MAIL_RECORD_VERSION {
+            let tls_mode = match wire.smtp_tls_mode.as_deref() {
+                Some("implicit") => SmtpTlsMode::Implicit,
+                Some("starttls") => SmtpTlsMode::StartTls,
+                _ => return Err(ImapAccessError::Permanent),
+            };
+            let host = normalize_hostname(
+                wire.smtp_host
+                    .as_deref()
+                    .ok_or(ImapAccessError::Permanent)?,
+            )?;
+            let port = wire
+                .smtp_port
+                .filter(|value| *value > 0)
+                .ok_or(ImapAccessError::Permanent)?;
+            let username = wire
+                .smtp_username
+                .as_deref()
+                .ok_or(ImapAccessError::Permanent)?;
+            let password = wire
+                .smtp_password
+                .as_deref()
+                .ok_or(ImapAccessError::Permanent)?;
+            validate_identity(username)?;
+            validate_secret(password)?;
+            Some(SmtpAuthority {
+                host,
+                port,
+                tls_mode,
+                username: username.to_owned(),
+                password: Zeroizing::new(password.to_owned()),
+            })
+        } else {
+            if wire.smtp_tls_mode.is_some()
+                || wire.smtp_host.is_some()
+                || wire.smtp_port.is_some()
+                || wire.smtp_username.is_some()
+                || wire.smtp_password.is_some()
+            {
+                return Err(ImapAccessError::Permanent);
+            }
+            None
+        };
         Ok(Self {
             host,
             port: wire.port,
             username: wire.username.clone(),
             password: Zeroizing::new(wire.password.clone()),
             remote_subject: wire.remote_subject.clone(),
+            smtp,
         })
     }
 
@@ -247,9 +414,10 @@ impl ImapAuthorityRecord {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, ImapAccessError> {
         serde_json::to_vec(&ImapAuthorityRecordWrite {
-            version: RECORD_VERSION,
+            version: IMAP_RECORD_VERSION,
             tls_mode: TLS_MODE,
             auth_mechanism: AUTH_MECHANISM,
             host: &self.host,
@@ -286,6 +454,21 @@ pub(crate) struct PreparedImapAccount {
     pub record_ref: String,
     pub display_name: String,
     pub email: String,
+}
+
+#[derive(Zeroize)]
+pub(crate) struct SmtpProvisionRequest {
+    pub host: String,
+    pub port: u16,
+    #[zeroize(skip)]
+    pub tls_mode: SmtpTlsMode,
+    pub username: String,
+    pub password: String,
+}
+
+pub(crate) struct PreparedMailAccount {
+    pub incoming: PreparedImapAccount,
+    pub outgoing: SmtpAccessGrant,
 }
 
 /// Colours for new mailboxes, so a second account does not arrive looking like
@@ -325,6 +508,8 @@ pub(crate) fn prepare_imap_account(
     // unambiguous.
     let digest = Sha256::digest(format!("{host}\0{}\0{username}", request.port).as_bytes());
     let fingerprint = hex_lower(&digest)[..32].to_owned();
+    let mut generation = [0_u8; 16];
+    OsRng.fill_bytes(&mut generation);
     Ok(PreparedImapAccount {
         grant: ImapAccessGrant {
             host,
@@ -332,18 +517,44 @@ pub(crate) fn prepare_imap_account(
             username: username.clone(),
             password: Zeroizing::new(request.password.clone()),
             remote_account_id: username,
+            outgoing_mail: false,
         },
         account_id: format!("imap:{fingerprint}"),
-        record_ref: format!("imap/account/{fingerprint}"),
+        record_ref: format!("imap/account/{fingerprint}/{}", hex_lower(&generation)),
         display_name,
         email,
     })
 }
 
-/// Writes the authority to the keychain and the marker to the database, in that
-/// order: a failed database write leaves a keychain item nothing points at,
-/// which the next attempt overwrites, while the reverse would leave a mailbox
-/// whose credentials do not exist.
+pub(crate) fn prepare_mail_account(
+    incoming: &ImapProvisionRequest,
+    outgoing: &SmtpProvisionRequest,
+) -> Result<PreparedMailAccount, ImapAccessError> {
+    let incoming = prepare_imap_account(incoming)?;
+    let host = normalize_hostname(&outgoing.host)?;
+    if outgoing.port == 0 {
+        return Err(ImapAccessError::Permanent);
+    }
+    let username = outgoing.username.trim().to_owned();
+    validate_identity(&username)?;
+    validate_secret(&outgoing.password)?;
+    Ok(PreparedMailAccount {
+        outgoing: SmtpAccessGrant {
+            host,
+            port: outgoing.port,
+            tls_mode: outgoing.tls_mode,
+            username,
+            password: Zeroizing::new(outgoing.password.clone()),
+            remote_account_id: incoming.email.clone(),
+        },
+        incoming,
+    })
+}
+
+/// Writes a new account-bound Keychain generation, atomically switches the
+/// SQLite marker, then removes the superseded generation. A failed marker
+/// transaction removes the unused new item and leaves the old authority live.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn persist_imap_account(
     database_path: &Path,
     credentials: &CredentialStore,
@@ -363,30 +574,74 @@ pub(crate) fn persist_imap_account(
     credentials
         .put(&prepared.record_ref, encoded)
         .map_err(map_credential_error)?;
-    persist_account_marker(database_path, prepared, now_ms).map_err(|_| ImapAccessError::Retryable)
+    let previous = match persist_account_marker(database_path, prepared, false, now_ms) {
+        Ok(previous) => previous,
+        Err(_) => {
+            let _ = credentials.remove(&prepared.record_ref);
+            return Err(ImapAccessError::Retryable);
+        }
+    };
+    if previous.as_deref() != Some(prepared.record_ref.as_str()) {
+        if let Some(previous) = previous {
+            if record_reference_matches_account(&prepared.account_id, &previous) {
+                let _ = credentials.remove(&previous);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_mail_account(
+    database_path: &Path,
+    credentials: &CredentialStore,
+    prepared: &PreparedMailAccount,
+    now_ms: i64,
+) -> Result<(), ImapAccessError> {
+    if credentials.status() != CredentialStoreStatus::Available || now_ms < 0 {
+        return Err(ImapAccessError::CredentialUnavailable);
+    }
+    let encoded = encode_imap_smtp_authority(&prepared.incoming.grant, &prepared.outgoing)?;
+    credentials
+        .put(&prepared.incoming.record_ref, encoded)
+        .map_err(map_credential_error)?;
+    let previous = match persist_account_marker(database_path, &prepared.incoming, true, now_ms) {
+        Ok(previous) => previous,
+        Err(_) => {
+            let _ = credentials.remove(&prepared.incoming.record_ref);
+            return Err(ImapAccessError::Retryable);
+        }
+    };
+    if previous.as_deref() != Some(prepared.incoming.record_ref.as_str()) {
+        if let Some(previous) = previous {
+            if record_reference_matches_account(&prepared.incoming.account_id, &previous) {
+                let _ = credentials.remove(&previous);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn persist_account_marker(
     database_path: &Path,
     prepared: &PreparedImapAccount,
+    outgoing_mail: bool,
     now_ms: i64,
-) -> Result<(), rusqlite::Error> {
+) -> Result<Option<String>, rusqlite::Error> {
     let mut connection = Connection::open(database_path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Scoped to the kind the update below writes: a row of another kind under
     // this id would otherwise take the update path and match nothing, leaving
     // the mailbox half-written.
-    let exists = transaction
+    let existing_reference = transaction
         .query_row(
-            "SELECT 1 FROM provider_accounts
+            "SELECT credential_ref FROM provider_accounts
              WHERE account_id = ?1 AND provider_kind = 'imap'",
             [&prepared.account_id],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, Option<String>>(0),
         )
-        .optional()?
-        .is_some();
-    if exists {
+        .optional()?;
+    if existing_reference.is_some() {
         transaction.execute(
             "UPDATE accounts SET name = ?2, email = ?3, provider = 'imap' WHERE id = ?1",
             params![prepared.account_id, prepared.display_name, prepared.email],
@@ -446,7 +701,23 @@ fn persist_account_marker(
             ],
         )?;
     }
-    transaction.commit()
+    if outgoing_mail {
+        transaction.execute(
+            "INSERT INTO provider_capabilities(account_id, capability, enabled)
+             VALUES(?1, 'outgoing_mail', 1)
+             ON CONFLICT(account_id, capability) DO UPDATE SET enabled = 1",
+            [&prepared.account_id],
+        )?;
+    } else {
+        transaction.execute(
+            "DELETE FROM provider_capabilities
+             WHERE account_id = ?1 AND capability = 'outgoing_mail'",
+            [&prepared.account_id],
+        )?;
+    }
+    let previous_reference = existing_reference.flatten();
+    transaction.commit()?;
+    Ok(previous_reference)
 }
 
 fn validate_bounded_text(value: &str, maximum: usize) -> Result<(), ImapAccessError> {
@@ -468,6 +739,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Writes one IMAP authority record. The returned bytes are secret-bearing and
 /// may only be written to the keychain.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_imap_authority(
     host: &str,
     port: u16,
@@ -481,6 +753,7 @@ pub(crate) fn encode_imap_authority(
         username: username.to_owned(),
         password,
         remote_subject: remote_subject.to_owned(),
+        smtp: None,
     };
     if record.port == 0 {
         return Err(ImapAccessError::Permanent);
@@ -489,6 +762,49 @@ pub(crate) fn encode_imap_authority(
     validate_identity(&record.remote_subject)?;
     validate_secret(&record.password)?;
     record.encode()
+}
+
+/// Encodes independent IMAP and SMTP endpoints into one subject-bound keychain
+/// record. Callers must write the returned bytes directly to `CredentialStore`;
+/// the record is never a SQLite or IPC value.
+pub(crate) fn encode_imap_smtp_authority(
+    imap: &ImapAccessGrant,
+    smtp: &SmtpAccessGrant,
+) -> Result<Zeroizing<Vec<u8>>, ImapAccessError> {
+    let imap_host = normalize_hostname(&imap.host)?;
+    let smtp_host = normalize_hostname(&smtp.host)?;
+    if imap.port == 0 || smtp.port == 0 {
+        return Err(ImapAccessError::Permanent);
+    }
+    for identity in [
+        imap.username.as_str(),
+        smtp.username.as_str(),
+        imap.remote_account_id.as_str(),
+    ] {
+        validate_identity(identity)?;
+    }
+    validate_secret(&imap.password)?;
+    validate_secret(&smtp.password)?;
+    serde_json::to_vec(&MailAuthorityRecordWrite {
+        version: MAIL_RECORD_VERSION,
+        tls_mode: TLS_MODE,
+        auth_mechanism: AUTH_MECHANISM,
+        host: &imap_host,
+        port: imap.port,
+        username: &imap.username,
+        password: &imap.password,
+        remote_subject: &imap.remote_account_id,
+        smtp_tls_mode: match smtp.tls_mode {
+            SmtpTlsMode::Implicit => "implicit",
+            SmtpTlsMode::StartTls => "starttls",
+        },
+        smtp_host: &smtp_host,
+        smtp_port: smtp.port,
+        smtp_username: &smtp.username,
+        smtp_password: &smtp.password,
+    })
+    .map(Zeroizing::new)
+    .map_err(|_| ImapAccessError::Permanent)
 }
 
 fn normalize_hostname(value: &str) -> Result<String, ImapAccessError> {
@@ -540,6 +856,24 @@ fn map_credential_error(error: CredentialError) -> ImapAccessError {
     }
 }
 
+fn map_credential_error_to_smtp(error: CredentialError) -> SmtpAccessError {
+    match error {
+        CredentialError::Unavailable => SmtpAccessError::CredentialUnavailable,
+        CredentialError::InvalidIdentifier | CredentialError::LimitExceeded(_) => {
+            SmtpAccessError::Permanent
+        }
+    }
+}
+
+fn map_imap_access_to_smtp(error: ImapAccessError) -> SmtpAccessError {
+    match error {
+        ImapAccessError::CredentialUnavailable => SmtpAccessError::CredentialUnavailable,
+        ImapAccessError::ReauthorizationRequired => SmtpAccessError::ReauthorizationRequired,
+        ImapAccessError::Retryable => SmtpAccessError::Retryable,
+        ImapAccessError::Permanent => SmtpAccessError::Permanent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,11 +906,20 @@ mod tests {
 
         let again = prepare_imap_account(&provision_request(993, "swordfish")).expect("prepare");
         assert_eq!(prepared.account_id, again.account_id);
-        assert_eq!(prepared.record_ref, again.record_ref);
-        // A different port is a different mailbox, and the identity says so.
+        assert_ne!(
+            prepared.record_ref, again.record_ref,
+            "each verified provisioning gets a fresh Keychain generation"
+        );
+        let fingerprint = prepared.account_id.strip_prefix("imap:").unwrap();
+        assert!(prepared
+            .record_ref
+            .starts_with(&format!("imap/account/{fingerprint}/")));
+        assert!(again
+            .record_ref
+            .starts_with(&format!("imap/account/{fingerprint}/")));
+        // A different port is a different mailbox, and the account identity says so.
         let other = prepare_imap_account(&provision_request(143, "swordfish")).expect("prepare");
         assert_ne!(prepared.account_id, other.account_id);
-        assert_ne!(prepared.record_ref, other.record_ref);
     }
 
     #[test]
@@ -694,6 +1037,70 @@ mod tests {
     }
 
     #[test]
+    fn combined_provisioning_round_trips_both_transports_without_sqlite_secrets() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("mail-provision.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let credentials =
+            CredentialStore::temporary(&directory.path().join("mail-provision.keychain-db"));
+        let mut incoming = provision_request(993, "imap-swordfish");
+        incoming.email = "sender@example.test".into();
+        let outgoing = SmtpProvisionRequest {
+            host: "Submit.Example.Test".into(),
+            port: 587,
+            tls_mode: SmtpTlsMode::StartTls,
+            username: "smtp-login@example.test".into(),
+            password: "smtp-swordfish".into(),
+        };
+        let prepared = prepare_mail_account(&incoming, &outgoing).expect("prepare both transports");
+        persist_mail_account(&path, &credentials, &prepared, 5_000).expect("persist both");
+
+        let access = ImapKeychainAccess::new(&path, credentials.clone());
+        let imap = access
+            .access_for_account(&prepared.incoming.account_id)
+            .expect("IMAP grant");
+        assert_eq!(imap.host, "mail.example.test");
+        assert_eq!(imap.password.as_str(), "imap-swordfish");
+        assert_eq!(imap.remote_account_id, "sender@example.test");
+        assert!(imap.outgoing_mail);
+        let smtp = access
+            .smtp_access_for_account(&prepared.incoming.account_id)
+            .expect("SMTP grant");
+        assert_eq!(smtp.host, "submit.example.test");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(smtp.tls_mode, SmtpTlsMode::StartTls);
+        assert_eq!(smtp.username, "smtp-login@example.test");
+        assert_eq!(smtp.password.as_str(), "smtp-swordfish");
+        assert_eq!(smtp.remote_account_id, "sender@example.test");
+
+        let connection = Connection::open(&path).expect("connection");
+        let outgoing_enabled: i64 = connection
+            .query_row(
+                "SELECT enabled FROM provider_capabilities
+                 WHERE account_id = ?1 AND capability = 'outgoing_mail'",
+                [&prepared.incoming.account_id],
+                |row| row.get(0),
+            )
+            .expect("outgoing capability");
+        assert_eq!(outgoing_enabled, 1);
+        let sqlite_bytes = std::fs::read(&path).expect("SQLite bytes");
+        let sqlite = String::from_utf8_lossy(&sqlite_bytes);
+        for secret_or_endpoint in [
+            "imap-swordfish",
+            "smtp-swordfish",
+            "mail.example.test",
+            "submit.example.test",
+            "smtp-login@example.test",
+        ] {
+            assert!(
+                !sqlite.contains(secret_or_endpoint),
+                "SQLite exposed {secret_or_endpoint}"
+            );
+        }
+        let _ = credentials.remove(&prepared.incoming.record_ref);
+    }
+
+    #[test]
     fn adding_the_same_mailbox_again_corrects_it_and_releases_blocked_work() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("reprovision.db");
@@ -803,10 +1210,69 @@ mod tests {
         // The schema retired it, so nothing reading auth_state needs an arm for it.
         let refused = connection.execute(
             "UPDATE provider_accounts SET auth_state = 'credential_locked'
-             WHERE account_id = 'imap-account'",
+             WHERE account_id = 'imap:0123456789abcdef0123456789abcdef'",
             [],
         );
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn failed_reprovision_keeps_the_old_authority_and_removes_the_new_generation() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("failed-reprovision.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let credentials =
+            CredentialStore::temporary(&directory.path().join("failed-reprovision.keychain-db"));
+        let first = prepare_imap_account(&provision_request(993, "old-secret")).expect("prepare");
+        persist_imap_account(&path, &credentials, &first, 1).expect("initial provisioning");
+        let second =
+            prepare_imap_account(&provision_request(993, "new-secret")).expect("reprovision");
+        assert_eq!(first.account_id, second.account_id);
+        assert_ne!(first.record_ref, second.record_ref);
+
+        let connection = Connection::open(&path).expect("failpoint connection");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_imap_reprovision
+                 BEFORE UPDATE ON provider_accounts
+                 BEGIN
+                   SELECT RAISE(ABORT, 'reprovision failpoint');
+                 END;",
+            )
+            .expect("install failpoint");
+        assert_eq!(
+            persist_imap_account(&path, &credentials, &second, 2),
+            Err(ImapAccessError::Retryable)
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_imap_reprovision;")
+            .expect("remove failpoint");
+        let durable_reference: String = connection
+            .query_row(
+                "SELECT credential_ref FROM provider_accounts WHERE account_id = ?1",
+                [&first.account_id],
+                |row| row.get(0),
+            )
+            .expect("durable old marker");
+        assert_eq!(durable_reference, first.record_ref);
+        assert!(credentials
+            .get(&first.record_ref)
+            .expect("read old generation")
+            .is_some());
+        assert!(credentials
+            .get(&second.record_ref)
+            .expect("read rolled-back generation")
+            .is_none());
+        let access = ImapKeychainAccess::new(&path, credentials.clone());
+        assert_eq!(
+            access
+                .access_for_account(&first.account_id)
+                .expect("old grant remains live")
+                .password
+                .as_str(),
+            "old-secret"
+        );
+        let _ = credentials.remove(&first.record_ref);
     }
 
     fn configured_fixture() -> (tempfile::TempDir, PathBuf, CredentialStore, String) {
@@ -814,7 +1280,7 @@ mod tests {
         let path = directory.path().join("imap-access.db");
         drop(MuxStore::open(&path, false).expect("native schema"));
         let credentials = CredentialStore::temporary(&directory.path().join("imap.keychain-db"));
-        let reference = "imap:v1:fixture-account".to_string();
+        let reference = "imap/account/0123456789abcdef0123456789abcdef".to_string();
         let encoded = encode_imap_authority(
             "mail.example.test",
             993,
@@ -830,7 +1296,8 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO accounts(id, name, email, color, provider)
-                 VALUES('imap-account', 'IMAP', 'reader@example.test', '#000000', 'imap')",
+                 VALUES('imap:0123456789abcdef0123456789abcdef', 'IMAP',
+                        'reader@example.test', '#000000', 'imap')",
                 [],
             )
             .expect("account fixture");
@@ -840,7 +1307,8 @@ mod tests {
                    account_id, provider_kind, remote_account_id, auth_state,
                    credential_ref, sync_state, created_at, updated_at
                  ) VALUES(
-                   'imap-account', 'imap', 'reader@example.test', 'ready', ?1,
+                   'imap:0123456789abcdef0123456789abcdef', 'imap',
+                   'reader@example.test', 'ready', ?1,
                    'never_synced', 0, 0
                  )",
                 [&reference],
@@ -894,11 +1362,63 @@ mod tests {
     }
 
     #[test]
+    fn combined_authority_keeps_independent_smtp_endpoint_and_tls_policy_in_keychain() {
+        let (_directory, path, credentials, reference) = configured_fixture();
+        assert!(matches!(
+            ImapKeychainAccess::new(&path, credentials.clone())
+                .smtp_access_for_account("imap:0123456789abcdef0123456789abcdef"),
+            Err(SmtpAccessError::Permanent)
+        ));
+        let encoded = encode_imap_smtp_authority(
+            &ImapAccessGrant {
+                host: "imap.example.test".into(),
+                port: 993,
+                username: "imap-reader@example.test".into(),
+                password: Zeroizing::new("imap-secret".into()),
+                remote_account_id: "reader@example.test".into(),
+                outgoing_mail: true,
+            },
+            &SmtpAccessGrant {
+                host: "submission.example.test".into(),
+                port: 587,
+                tls_mode: SmtpTlsMode::StartTls,
+                username: "smtp-reader@example.test".into(),
+                password: Zeroizing::new("smtp-secret".into()),
+                remote_account_id: "reader@example.test".into(),
+            },
+        )
+        .expect("combined authority");
+        credentials
+            .put(&reference, encoded)
+            .expect("replace keychain record");
+        let access = ImapKeychainAccess::new(&path, credentials);
+        let imap = access
+            .access_for_account("imap:0123456789abcdef0123456789abcdef")
+            .expect("IMAP grant");
+        assert_eq!(imap.host, "imap.example.test");
+        assert_eq!(imap.username, "imap-reader@example.test");
+        assert_eq!(imap.password.as_str(), "imap-secret");
+        let smtp = access
+            .smtp_access_for_account("imap:0123456789abcdef0123456789abcdef")
+            .expect("SMTP grant");
+        assert_eq!(smtp.host, "submission.example.test");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(smtp.tls_mode, SmtpTlsMode::StartTls);
+        assert_eq!(smtp.username, "smtp-reader@example.test");
+        assert_eq!(smtp.password.as_str(), "smtp-secret");
+
+        let sqlite_bytes = std::fs::read(&path).expect("SQLite bytes");
+        let sqlite = String::from_utf8_lossy(&sqlite_bytes);
+        assert!(!sqlite.contains("submission.example.test"));
+        assert!(!sqlite.contains("smtp-secret"));
+    }
+
+    #[test]
     fn imap_keychain_access_fails_closed_and_sqlite_contains_only_an_opaque_marker() {
         let (_directory, path, credentials, reference) = configured_fixture();
         let access = ImapKeychainAccess::new(&path, credentials);
         let grant = access
-            .access_for_account("imap-account")
+            .access_for_account("imap:0123456789abcdef0123456789abcdef")
             .expect("available grant");
         assert_eq!(grant.host, "mail.example.test");
         assert_eq!(grant.port, 993);
@@ -916,13 +1436,14 @@ mod tests {
         connection
             .execute(
                 "UPDATE provider_accounts SET credential_ref = 'imap:v1:missing',
-                   auth_state = 'ready' WHERE account_id = 'imap-account'",
+                   auth_state = 'ready'
+                 WHERE account_id = 'imap:0123456789abcdef0123456789abcdef'",
                 [],
             )
             .expect("replace marker");
         drop(connection);
         assert!(matches!(
-            access.access_for_account("imap-account"),
+            access.access_for_account("imap:0123456789abcdef0123456789abcdef"),
             Err(ImapAccessError::ReauthorizationRequired)
         ));
     }
@@ -934,7 +1455,7 @@ mod tests {
         connection
             .execute(
                 "UPDATE provider_accounts SET remote_account_id = 'other@example.test'
-                 WHERE account_id = 'imap-account'",
+                 WHERE account_id = 'imap:0123456789abcdef0123456789abcdef'",
                 [],
             )
             .expect("change subject");
@@ -948,7 +1469,8 @@ mod tests {
             connection
                 .query_row(
                     "SELECT auth_state || ':' || auth_block_reason || ':' || last_error_code
-                     FROM provider_accounts WHERE account_id = 'imap-account'",
+                     FROM provider_accounts
+                     WHERE account_id = 'imap:0123456789abcdef0123456789abcdef'",
                     [],
                     |row| row.get::<_, String>(0),
                 )
@@ -974,5 +1496,118 @@ mod tests {
             .filter(|literal| literal.starts_with('#'))
             .collect::<Vec<_>>();
         assert_eq!(offered, ACCOUNT_COLORS);
+    }
+
+    #[test]
+    fn crossed_refs_cannot_swap_authority_between_hosts_with_the_same_username() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("crossed-mail-authority.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let credentials =
+            CredentialStore::temporary(&directory.path().join("crossed-mail.keychain-db"));
+        let first_incoming = provision_request(993, "first-imap-secret");
+        let mut second_incoming = provision_request(993, "second-imap-secret");
+        second_incoming.host = "other-mail.example.test".into();
+        let first = prepare_mail_account(
+            &first_incoming,
+            &SmtpProvisionRequest {
+                host: "submit-one.example.test".into(),
+                port: 465,
+                tls_mode: SmtpTlsMode::Implicit,
+                username: "reader@example.test".into(),
+                password: "first-smtp-secret".into(),
+            },
+        )
+        .expect("first mail authority");
+        let second = prepare_mail_account(
+            &second_incoming,
+            &SmtpProvisionRequest {
+                host: "submit-two.example.test".into(),
+                port: 587,
+                tls_mode: SmtpTlsMode::StartTls,
+                username: "reader@example.test".into(),
+                password: "second-smtp-secret".into(),
+            },
+        )
+        .expect("second mail authority");
+        assert_eq!(
+            first.incoming.grant.remote_account_id, second.incoming.grant.remote_account_id,
+            "the regression requires the old subject check to collide"
+        );
+        persist_mail_account(&path, &credentials, &first, 1).expect("persist first account");
+        persist_mail_account(&path, &credentials, &second, 2).expect("persist second account");
+
+        let connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute(
+                "UPDATE provider_accounts SET credential_ref = ?2 WHERE account_id = ?1",
+                params![first.incoming.account_id, second.incoming.record_ref],
+            )
+            .expect("misbind first marker to second");
+        let replacement = prepare_mail_account(
+            &first_incoming,
+            &SmtpProvisionRequest {
+                host: "submit-one-new.example.test".into(),
+                port: 465,
+                tls_mode: SmtpTlsMode::Implicit,
+                username: "reader@example.test".into(),
+                password: "replacement-smtp-secret".into(),
+            },
+        )
+        .expect("replacement authority");
+        persist_mail_account(&path, &credentials, &replacement, 3)
+            .expect("repair first account without deleting second authority");
+        let intact_second = ImapKeychainAccess::new(&path, credentials.clone())
+            .smtp_access_for_account(&second.incoming.account_id)
+            .expect("second authority survives another account's repair");
+        assert_eq!(intact_second.host, "submit-two.example.test");
+        assert!(credentials
+            .get(&second.incoming.record_ref)
+            .expect("read second generation")
+            .is_some());
+
+        connection
+            .execute(
+                "UPDATE provider_accounts SET credential_ref = ?2 WHERE account_id = ?1",
+                params![first.incoming.account_id, second.incoming.record_ref],
+            )
+            .expect("cross first marker");
+        connection
+            .execute(
+                "UPDATE provider_accounts SET credential_ref = ?2 WHERE account_id = ?1",
+                params![second.incoming.account_id, first.incoming.record_ref],
+            )
+            .expect("cross second marker");
+        drop(connection);
+
+        let access = ImapKeychainAccess::new(&path, credentials.clone());
+        for account_id in [&first.incoming.account_id, &second.incoming.account_id] {
+            assert!(matches!(
+                access.access_for_account(account_id),
+                Err(ImapAccessError::ReauthorizationRequired)
+            ));
+            assert!(matches!(
+                access.smtp_access_for_account(account_id),
+                Err(SmtpAccessError::ReauthorizationRequired)
+            ));
+        }
+        assert_eq!(
+            reconcile_credential_records(&path, &credentials, 4).expect("startup reconciliation"),
+            2
+        );
+        let blocked = Connection::open(&path)
+            .expect("verification connection")
+            .query_row(
+                "SELECT COUNT(*) FROM provider_accounts
+                 WHERE auth_state = 'reauthorization_required'
+                   AND last_error_code = 'imap_authority_invalid'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("blocked crossed accounts");
+        assert_eq!(blocked, 2);
+        let _ = credentials.remove(&first.incoming.record_ref);
+        let _ = credentials.remove(&second.incoming.record_ref);
+        let _ = credentials.remove(&replacement.incoming.record_ref);
     }
 }
