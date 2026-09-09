@@ -840,8 +840,12 @@ fn persist_account_marker(
     if existing_account.is_none() {
         transaction.execute(
             "INSERT INTO accounts(id, name, email, color, provider)
-             VALUES(?1, ?2, ?2, '#5168f4', 'gmail')",
-            params![selected_id, email],
+             VALUES(?1, ?2, ?2, ?3, 'gmail')",
+            params![
+                selected_id,
+                email,
+                crate::account_color::account_color_for(selected_id)
+            ],
         )?;
         transaction.execute(
             "INSERT INTO provider_accounts(

@@ -74,24 +74,44 @@ test('saved searches are folded only by a stored false: a layout from before the
 });
 
 test('the smart views fold away and come back, leaving the rest alone', () => {
-  const folded = toggleSmartViews({ ...DEFAULT_SIDEBAR_LAYOUT, openFolderAccounts: ['acc_work'] });
+  const folded = toggleSmartViews({ ...DEFAULT_SIDEBAR_LAYOUT, openFolderAccounts: ['acc_work'] }, true);
   assert.deepEqual(folded, { collapsed: false, openFolderAccounts: ['acc_work'], smartViewsOpen: false, savedSearchesOpen: true });
-  assert.equal(toggleSmartViews(folded).smartViewsOpen, true);
+  assert.equal(toggleSmartViews(folded, false).smartViewsOpen, true);
 });
 
 test('the saved searches fold away and come back, leaving the rest alone', () => {
-  const folded = toggleSavedSearches({ ...DEFAULT_SIDEBAR_LAYOUT, smartViewsOpen: false });
+  const folded = toggleSavedSearches({ ...DEFAULT_SIDEBAR_LAYOUT, smartViewsOpen: false }, true);
   assert.deepEqual(folded, { collapsed: false, openFolderAccounts: [], smartViewsOpen: false, savedSearchesOpen: false });
-  assert.equal(toggleSavedSearches(folded).savedSearchesOpen, true);
+  assert.equal(toggleSavedSearches(folded, false).savedSearchesOpen, true);
+});
+
+test('a click always folds or shows what the reader can see, not the raw stored bit', () => {
+  // A section forced open by an active selection reads as shown even when the
+  // stored preference is folded — clicking it must fold the preference, not
+  // flip it further open just because the stored bit itself said "folded".
+  const forcedOpen = toggleSmartViews({ ...DEFAULT_SIDEBAR_LAYOUT, smartViewsOpen: false }, true);
+  assert.equal(forcedOpen.smartViewsOpen, false);
+  // Clicking again while it is still forced open is a no-op on the stored bit:
+  // there is nothing further to fold, so the preference does not oscillate.
+  assert.equal(toggleSmartViews(forcedOpen, true).smartViewsOpen, false);
+  const forcedSavedOpen = toggleSavedSearches({ ...DEFAULT_SIDEBAR_LAYOUT, savedSearchesOpen: false }, true);
+  assert.equal(forcedSavedOpen.savedSearchesOpen, false);
 });
 
 test('a section opens and folds back, and the rest are left alone', () => {
-  let layout = toggleFolderAccount(DEFAULT_SIDEBAR_LAYOUT, 'acc_work');
+  let layout = toggleFolderAccount(DEFAULT_SIDEBAR_LAYOUT, 'acc_work', false);
   assert.deepEqual(layout.openFolderAccounts, ['acc_work']);
-  layout = toggleFolderAccount(layout, 'acc_home');
+  layout = toggleFolderAccount(layout, 'acc_home', false);
   assert.deepEqual(layout.openFolderAccounts, ['acc_work', 'acc_home']);
-  layout = toggleFolderAccount(layout, 'acc_work');
+  layout = toggleFolderAccount(layout, 'acc_work', true);
   assert.deepEqual(layout.openFolderAccounts, ['acc_home']);
+});
+
+test('folding a section forced open by the folder being read stores the fold, not another open', () => {
+  // The section is shown (forced by openFolderAccountId elsewhere), but its
+  // own stored bit is already folded — clicking must not flip that bit open.
+  const layout = toggleFolderAccount(DEFAULT_SIDEBAR_LAYOUT, 'acc_work', true);
+  assert.deepEqual(layout.openFolderAccounts, []);
 });
 
 test('the section holding the folder being read is open regardless', () => {
@@ -99,7 +119,7 @@ test('the section holding the folder being read is open regardless', () => {
   assert.equal(folderSectionIsOpen(folded, 'acc_work', null), false);
   assert.equal(folderSectionIsOpen(folded, 'acc_work', 'acc_work'), true);
   assert.equal(folderSectionIsOpen(folded, 'acc_home', 'acc_work'), false);
-  const opened = toggleFolderAccount(DEFAULT_SIDEBAR_LAYOUT, 'acc_home').openFolderAccounts;
+  const opened = toggleFolderAccount(DEFAULT_SIDEBAR_LAYOUT, 'acc_home', false).openFolderAccounts;
   assert.equal(folderSectionIsOpen(opened, 'acc_home', null), true);
 });
 

@@ -408,18 +408,18 @@
     persistSidebarLayout(sidebar);
   }
 
-  function toggleFolderSection(accountId: string) {
-    sidebar = toggleFolderAccount(sidebar, accountId);
+  function toggleFolderSection(accountId: string, currentlyShown: boolean) {
+    sidebar = toggleFolderAccount(sidebar, accountId, currentlyShown);
     persistSidebarLayout(sidebar);
   }
 
-  function toggleSmartViewsSection() {
-    sidebar = toggleSmartViews(sidebar);
+  function toggleSmartViewsSection(currentlyShown: boolean) {
+    sidebar = toggleSmartViews(sidebar, currentlyShown);
     persistSidebarLayout(sidebar);
   }
 
-  function toggleSavedSearchesSection() {
-    sidebar = toggleSavedSearches(sidebar);
+  function toggleSavedSearchesSection(currentlyShown: boolean) {
+    sidebar = toggleSavedSearches(sidebar, currentlyShown);
     persistSidebarLayout(sidebar);
   }
 
@@ -1965,7 +1965,7 @@
           {openSync}
         />
 
-        <section class="thread-pane" aria-label={viewTitle}>
+        <section class="thread-pane" aria-label={headerTitle}>
           <header class="pane-heading" data-testid="thread-list-header">
             <div><small>{headerScope.email}</small><h1>{headerTitle}</h1></div>
             <span>{searching ? 'Searching…' : `${isSearching && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
@@ -2069,7 +2069,7 @@
                 {:else if searchError}
                   <div class="empty search-state has-error" role="alert"><strong>Search needs attention</strong><span>{searchError}</span></div>
                 {:else}
-                  <div class="empty"><strong>No {viewTitle.toLocaleLowerCase()} mail</strong><span>{filter ? 'Try a broader search.' : 'Choose another mailbox or account.'}</span></div>
+                  <div class="empty"><strong>No {headerTitle.toLocaleLowerCase()} mail</strong><span>{filter ? 'Try a broader search.' : 'Choose another mailbox or account.'}</span></div>
                 {/if}
               {/each}
               {/key}

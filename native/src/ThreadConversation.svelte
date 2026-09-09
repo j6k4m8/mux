@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { tick } from 'svelte';
   import AttachmentList from './AttachmentList.svelte';
+  import Icon from './Icon.svelte';
   import MessageFrame from './MessageFrame.svelte';
   import { newContentParagraphs, plainTextParagraphs, safeRemoteImageDataUrl } from './richText';
   import type { AttachmentSummary, MessageSummary, RemoteImageContent, RemoteImageSummary } from './types';
@@ -317,6 +318,7 @@
           </button>
         {:else}
           {@const collapsed = newContentParagraphs(message.bodyText)}
+          {@const attachmentCount = attachments.filter((attachment) => attachment.messageId === message.id && attachment.disposition === 'attachment').length}
           <button
             class="message-open"
             type="button"
@@ -326,7 +328,17 @@
           >
             <span class="avatar compact" style:--avatar-color={message.isFromMe ? '#6e75ff' : accountColor}>{initials(message.senderName)}</span>
             <span class="collapsed-summary">
-              <span class="collapsed-heading"><strong>{message.senderName}</strong><time>{fullTime(message.sentAt)}</time></span>
+              <span class="collapsed-heading">
+                <strong>{message.senderName}</strong>
+                {#if attachmentCount}
+                  <span
+                    class="collapsed-attachment-badge"
+                    title={attachmentCount === 1 ? '1 attachment' : `${attachmentCount} attachments`}
+                    aria-label={attachmentCount === 1 ? '1 attachment' : `${attachmentCount} attachments`}
+                  ><Icon name="attachment" size={11} />{attachmentCount > 1 ? attachmentCount : ''}</span>
+                {/if}
+                <time>{fullTime(message.sentAt)}</time>
+              </span>
               <span class="collapsed-preview">
                 {#each collapsed.paragraphs as lines}
                   <span class="collapsed-paragraph">{#each lines as line, index}{#if index > 0}<br />{/if}{line}{/each}</span>

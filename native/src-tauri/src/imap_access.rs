@@ -10,6 +10,8 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::account_color::account_color_for;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::imap::{ImapAccessError, ImapAccessGrant, ImapAccessSource};
@@ -471,14 +473,6 @@ pub(crate) struct PreparedMailAccount {
     pub outgoing: SmtpAccessGrant,
 }
 
-/// Colours for new mailboxes, so a second account does not arrive looking like
-/// the first. Indexed by how many accounts already exist. Settings offers the
-/// same six by name, from `accountColorChoices` in `native/src/accountColor.ts`;
-/// a test below holds the two lists together.
-const ACCOUNT_COLORS: [&str; 6] = [
-    "#5168f4", "#12a58c", "#b3730a", "#c93b63", "#7c4ddb", "#0a6fa8",
-];
-
 const MAX_DISPLAY_BYTES: usize = 200;
 const MAX_EMAIL_BYTES: usize = 320;
 
@@ -673,11 +667,7 @@ fn persist_account_marker(
             ],
         )?;
     } else {
-        let existing_accounts =
-            transaction.query_row("SELECT COUNT(*) FROM accounts", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-        let color = ACCOUNT_COLORS[(existing_accounts.max(0) as usize) % ACCOUNT_COLORS.len()];
+        let color = account_color_for(&prepared.account_id);
         transaction.execute(
             "INSERT INTO accounts(id, name, email, color, provider)
              VALUES(?1, ?2, ?3, ?4, 'imap')",
@@ -877,6 +867,7 @@ fn map_imap_access_to_smtp(error: ImapAccessError) -> SmtpAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_color::ACCOUNT_COLORS;
     use crate::store::MuxStore;
     use tempfile::tempdir;
 

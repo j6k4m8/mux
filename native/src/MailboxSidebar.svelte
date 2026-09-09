@@ -39,9 +39,9 @@
   export let selectAccount: (accountId: string | null) => void;
   export let selectContainer: (container: ContainerSummary) => void;
   export let toggleRail: () => void;
-  export let toggleFolderSection: (accountId: string) => void;
-  export let toggleSmartViewsSection: () => void;
-  export let toggleSavedSearchesSection: () => void;
+  export let toggleFolderSection: (accountId: string, currentlyShown: boolean) => void;
+  export let toggleSmartViewsSection: (currentlyShown: boolean) => void;
+  export let toggleSavedSearchesSection: (currentlyShown: boolean) => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openStats: () => void;
@@ -126,7 +126,7 @@
     aria-expanded={smartViewsShown}
     data-action="toggle-smart-views"
     title={smartViewsShown ? 'Fold away smart views' : 'Show smart views'}
-    on:click={() => toggleSmartViewsSection()}
+    on:click={() => toggleSmartViewsSection(smartViewsShown)}
   >
     <span>Smart views</span>
     <span class="folder-chevron" aria-hidden="true">{smartViewsShown ? '\u2304' : '\u203A'}</span>
@@ -155,7 +155,7 @@
       aria-expanded={savedSearchesShown}
       data-action="toggle-saved-searches"
       title={savedSearchesShown ? 'Fold away saved searches' : 'Show saved searches'}
-      on:click={() => toggleSavedSearchesSection()}
+      on:click={() => toggleSavedSearchesSection(savedSearchesShown)}
     >
       <span>Saved searches</span>
       <span class="folder-chevron" aria-hidden="true">{savedSearchesShown ? '\u2304' : '\u203A'}</span>
@@ -204,7 +204,7 @@
         data-action="toggle-folder-section"
         data-account-id={section.account.id}
         title={`${open ? 'Fold away' : 'Show'} ${section.account.name}'s folders`}
-        on:click={() => toggleFolderSection(section.account.id)}
+        on:click={() => toggleFolderSection(section.account.id, open)}
       >
         <span class="account-dot" style:background={section.account.color}></span>
         <strong>{section.account.name}</strong>

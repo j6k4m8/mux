@@ -1,3 +1,4 @@
+mod account_color;
 mod account_removal;
 pub mod content;
 mod css;
