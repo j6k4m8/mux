@@ -176,6 +176,9 @@
   let replyDraftLoading = false;
   let replyDraftError = '';
   let replyDraftRequest = 0;
+  /// The thread whose quick reply has been handed its stored draft. Set once
+  /// that read settles, cleared when the reader moves to another thread.
+  let replyDraftThreadId: number | null = null;
   let notice: Notice | null = null;
   let snoozeDialogOpen = false;
   let customSnoozeValue = '';
@@ -772,6 +775,7 @@
     replyDraft = null;
     replyDraftLoading = false;
     replyDraftError = '';
+    replyDraftThreadId = null;
   }
 
   function clearThreadPage() {
@@ -887,6 +891,7 @@
         selectedMessages = [];
         selectedAttachments = [];
         loadedThreadId = null;
+        replyDraftThreadId = null;
       }
       messageCursor = null;
       messageHasMore = false;
@@ -923,7 +928,10 @@
     } catch (cause) {
       if (request !== messageRequest) return;
       messageError = cause instanceof Error ? cause.message : String(cause);
-      if (!older) loadedThreadId = null;
+      if (!older) {
+        loadedThreadId = null;
+        replyDraftThreadId = null;
+      }
     } finally {
       if (request === messageRequest) messageLoading = false;
     }
@@ -932,16 +940,30 @@
   async function loadReplyDraft(threadId: number) {
     const header = mailbox?.drafts.find((draft) => draft.replyToThreadId === threadId && !draft.locked) ?? null;
     const request = ++replyDraftRequest;
-    replyDraft = null;
-    replyDraftError = '';
-    replyDraftLoading = Boolean(header);
-    if (!header) return;
+    /// A thread being opened waits for its stored reply, so the editor mounts
+    /// holding it. A thread already showing its quick reply must not wait: the
+    /// editor has the words being typed, and taking it down to show the
+    /// store's copy hands back the last save — whose own autosave is what
+    /// reloaded the mailbox, so the swap would repeat on every keystroke. For
+    /// an open thread the stored copy is read quietly, for the next mount.
+    const opening = replyDraftThreadId !== threadId;
+    if (opening) {
+      replyDraft = null;
+      replyDraftError = '';
+      replyDraftLoading = Boolean(header);
+    }
+    if (!header) {
+      replyDraft = null;
+      replyDraftThreadId = threadId;
+      return;
+    }
     try {
       const detail = await invoke<DraftSummary>('get_draft', { draftId: header.id });
       if (request !== replyDraftRequest || selectedThreadId !== threadId) return;
       replyDraft = detail;
+      replyDraftThreadId = threadId;
     } catch (cause) {
-      if (request !== replyDraftRequest || selectedThreadId !== threadId) return;
+      if (request !== replyDraftRequest || selectedThreadId !== threadId || !opening) return;
       replyDraftError = cause instanceof Error ? cause.message : String(cause);
     } finally {
       if (request === replyDraftRequest) replyDraftLoading = false;

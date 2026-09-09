@@ -1,13 +1,19 @@
+import { emit } from '@tauri-apps/api/event';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
+import { tick } from 'svelte';
 import { describe, expect, test } from 'vitest';
 import App from './App.svelte';
+import { MAILBOX_CHANGED_EVENT } from './mailboxEvents';
+import type { MailboxChangedPayload } from './mailboxEvents';
 import type {
   AccountSummary,
+  DraftHeaderSummary,
   MailboxBootstrap,
   MessagePage,
   MessageSummary,
+  SaveDraftInput,
   SearchPage,
   ThreadPage,
   ThreadSummary
@@ -227,6 +233,44 @@ async function renderMailbox(draftLoader?: DraftLoader) {
 
 function blurActiveElement() {
   if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+}
+
+/// The header the next bootstrap lists for a saved draft. The mocked save_draft
+/// always answers with this id, so a test can say what the store holds.
+function savedDraftHeader(overrides: Partial<DraftHeaderSummary> = {}): DraftHeaderSummary {
+  return {
+    id: 'draft-saved',
+    accountId: account.id,
+    accountName: account.name,
+    accountEmail: account.email,
+    accountColor: account.color,
+    recipients: '',
+    ccRecipients: '',
+    bccRecipients: '',
+    subject: '',
+    replyToThreadId: null,
+    updatedAt: Date.now(),
+    revision: 1,
+    locked: false,
+    ...overrides
+  };
+}
+
+function savedInputs(calls: IpcCall[]): SaveDraftInput[] {
+  return calls
+    .filter((call) => call.command === 'save_draft')
+    .map((call) => (call.payload as { input: SaveDraftInput }).input);
+}
+
+/// Delivers the event the backend sends once a save commits, then waits for the
+/// reload it starts to read the open conversation again and settle.
+async function reloadMailbox(calls: IpcCall[]) {
+  const messageReads = calls.filter((call) => call.command === 'get_thread_messages').length;
+  await emit(MAILBOX_CHANGED_EVENT, { source: 'operation-worker' } satisfies MailboxChangedPayload);
+  await waitFor(() => expect(calls.filter((call) => call.command === 'get_thread_messages').length).toBeGreaterThan(messageReads));
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await tick();
 }
 
 describe('production mailbox interactions', () => {
@@ -1691,6 +1735,81 @@ describe('production mailbox interactions', () => {
       await Promise.resolve();
       expect((within(composer).getByRole('textbox', { name: 'Subject' }) as HTMLInputElement).value).toBe('Second draft');
       expect(composer.textContent).not.toContain('First body');
+    } finally {
+      mailbox.drafts.length = 0;
+    }
+  });
+
+  test('the quick reply keeps every keystroke while its own autosave reloads the mailbox', async () => {
+    const header = savedDraftHeader({ recipients: 'alice@example.com', subject: 'Re: Architecture sync', replyToThreadId: 1 });
+    const { calls, user } = await renderMailbox(() => ({ ...header, body: 'Hello wor', bodyHtml: '<p>Hello wor</p>' }));
+    try {
+      const inlineReply = screen.getByTestId('inline-reply');
+      const editor = within(inlineReply).getByRole('textbox', { name: 'Message body' });
+      await user.click(editor);
+      await user.type(editor, 'Hello wor');
+      await waitFor(() => expect(savedInputs(calls)).toHaveLength(1), { timeout: 2000 });
+      expect(document.activeElement).toBe(editor);
+
+      // The store now lists the draft as of that save, and announces the change
+      // while the reader is still typing.
+      mailbox.drafts.push(header);
+      const reload = reloadMailbox(calls);
+      await user.type(editor, 'ld');
+      await reload;
+      await user.type(editor, '!');
+
+      expect(within(screen.getByTestId('inline-reply')).getByRole('textbox', { name: 'Message body' })).toBe(editor);
+      expect(document.activeElement).toBe(editor);
+      expect(editor.textContent).toBe('Hello world!');
+      await waitFor(() => expect(savedInputs(calls).at(-1)).toMatchObject({ id: 'draft-saved', body: 'Hello world!' }), { timeout: 2000 });
+    } finally {
+      mailbox.drafts.length = 0;
+    }
+  });
+
+  test('the composer keeps what was typed through its autosave reload, and only a reopen reads the store', async () => {
+    const header = savedDraftHeader({ subject: 'H' });
+    const { calls, user } = await renderMailbox(() => ({ ...header, body: 'Hello wor', bodyHtml: '<p>Hello wor</p>' }));
+    try {
+      await user.click(screen.getByTestId('compose-button'));
+      const composer = screen.getByTestId('composer');
+      const dialog = within(composer).getByRole('dialog');
+      const subject = within(composer).getByRole('textbox', { name: 'Subject' }) as HTMLInputElement;
+      const editor = within(composer).getByRole('textbox', { name: 'Message body' });
+      await user.type(within(composer).getByRole('textbox', { name: 'Add To recipient' }), 'alice@example.com{Enter}');
+      await user.type(subject, 'Hi');
+      await user.click(editor);
+      await user.type(editor, 'Hello wor');
+
+      // The first save gives the fresh draft its id, which is what offers Delete.
+      await waitFor(() => expect(within(composer).getByRole('button', { name: 'Delete' })).toBeTruthy(), { timeout: 2000 });
+      expect(savedInputs(calls)).toHaveLength(1);
+      expect(document.activeElement).toBe(editor);
+      expect(editor.textContent).toBe('Hello wor');
+
+      mailbox.drafts.push(header);
+      const reload = reloadMailbox(calls);
+      await user.type(editor, 'ld');
+      await reload;
+      await user.type(editor, '!');
+
+      expect(within(screen.getByTestId('composer')).getByRole('dialog')).toBe(dialog);
+      expect(within(composer).getByRole('textbox', { name: 'Message body' })).toBe(editor);
+      expect(document.activeElement).toBe(editor);
+      expect(editor.textContent).toBe('Hello world!');
+      expect(subject.value).toBe('Hi');
+      expect(within(composer).getByLabelText('To recipients').textContent).toContain('alice@example.com');
+      await waitFor(() => expect(savedInputs(calls).at(-1)).toMatchObject({ id: 'draft-saved', subject: 'Hi', body: 'Hello world!' }), { timeout: 2000 });
+
+      // Reopening from the list is the one time the stored copy replaces the editor.
+      await user.keyboard('{Escape}');
+      await waitFor(() => expect(screen.queryByTestId('composer')).toBeNull());
+      await user.click(screen.getByRole('button', { name: /Drafts/u }));
+      await user.click(await screen.findByTestId('thread-row'));
+      const reopened = await screen.findByTestId('composer');
+      await waitFor(() => expect((within(reopened).getByRole('textbox', { name: 'Subject' }) as HTMLInputElement).value).toBe('H'));
+      expect(within(reopened).getByRole('textbox', { name: 'Message body' }).textContent).toBe('Hello wor');
     } finally {
       mailbox.drafts.length = 0;
     }
