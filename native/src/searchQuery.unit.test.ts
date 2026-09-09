@@ -34,10 +34,10 @@ test('the lexer splits fields, operators, and grouping the way the native parser
   );
 });
 
-test('only the fields the query compiler knows are coloured as fields', () => {
+test('only the fields the query compiler knows are colored as fields', () => {
   assert.deepEqual(kinds('mystery:value'), ['text:mystery:value']);
   assert.deepEqual(kinds('domain:acme.example'), ['field:domain:', 'value:acme.example']);
-  // Half-typed is still a field, because colouring has to help while typing.
+  // Half-typed is still a field, because coloring has to help while typing.
   assert.deepEqual(kinds('from:'), ['field:from:']);
 });
 

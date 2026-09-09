@@ -299,7 +299,7 @@
   $: offersUndo = noticeOffersUndo(notice, clock);
   $: motion = motionTiming(appearance.animation);
   $: railCollapsed = sidebar.collapsed && !compactNavigation;
-  /// `mailbox` is named here so recolouring an account moves the accent at
+  /// `mailbox` is named here so recoloring an account moves the accent at
   /// once: a `$:` statement follows the variables it names, and accountFor()
   /// reads the mailbox out of its sight.
   $: applyAccentToRoot(

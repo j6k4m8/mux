@@ -11,7 +11,7 @@
   --text-soft: #5f6675;
   --text-faint: #8a91a0;
   /* Only --accent is ever set from the appearance setting; the other two are
-     derived from it, so any accent — including an account's own colour — works
+     derived from it, so any accent — including an account's own color — works
      without anyone having to pick three shades that go together. */
   --accent: #4c63ee;
   --accent-strong: color-mix(in srgb, var(--accent) 86%, #000);
@@ -198,8 +198,8 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .filter input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; font-size: var(--text-1); }
 .filter input::placeholder { color: var(--text-faint); }
 
-/* Search field: the coloured text is an overlay sitting on a transparent
-   input, so the caret, the selection, and every input behaviour stay real. */
+/* Search field: the colored text is an overlay sitting on a transparent
+   input, so the caret, the selection, and every input behavior stay real. */
 .search-field { position: relative; }
 .search-input { position: relative; flex: 1; min-width: 0; height: 1.5em; }
 .search-field input,
@@ -220,7 +220,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .search-field input::placeholder { color: var(--text-faint); -webkit-text-fill-color: var(--text-faint); }
 /* Above the input, so a selection highlight cannot hide the text it covers. */
 .search-highlight { z-index: 1; overflow: hidden; color: var(--text); pointer-events: none; }
-/* Colour only. Weight, size, and transforms all change glyph widths, and the
+/* Color only. Weight, size, and transforms all change glyph widths, and the
    caret is drawn from the input's own metrics: the moment the two disagree,
    the caret stops pointing at the character it is actually on. */
 .search-highlight .token { white-space: pre; }
@@ -332,7 +332,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .account-row .account-visibility { min-height: calc(1.3em + 2 * var(--gap-sm)); display: flex; align-items: center; justify-content: center; padding: 0; border-radius: 9px; background: transparent; cursor: pointer; }
 .account-row .account-visibility:hover { background: var(--surface-hover); }
 /* All accounts has no toggle; its dot cell is only the dot, centred where the
-   toggles centre theirs. */
+   toggles center theirs. */
 .account-row .account-mark { display: flex; justify-content: center; }
 .account-row .account-select { grid-template-columns: minmax(0, 1fr) auto; padding-left: 0; }
 .account-row .account-select > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -361,7 +361,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .section-toggle:hover { color: var(--text-soft); background: var(--surface-hover); }
 /* An account's own folders sit in the same rail as the fixed views, so they
    read as places to go rather than as a different kind of thing. Under All
-   accounts each row carries its account's colour, which is a fourth column the
+   accounts each row carries its account's color, which is a fourth column the
    fixed views do not have. */
 .folders > button { grid-template-columns: 1.4em minmax(0, 1fr) auto auto; }
 .folder-account { width: .4em; height: .4em; border-radius: 50%; }
@@ -585,7 +585,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .thread-row.is-swiping { transition: none; user-select: none; }
 .thread-row:not(.is-swiping) { transition: background var(--motion-quick) ease, transform var(--motion-base) ease; }
 /* Read mail settles back a shade. The tint is mixed out of --text rather than
-   named as a grey, so it darkens on the light theme and lightens on the dark
+   named as a gray, so it darkens on the light theme and lightens on the dark
    one without a second rule. */
 .thread-row:not(.is-unread) { background: color-mix(in srgb, var(--text) 5%, transparent); }
 .thread-row:hover { background: var(--surface-hover); }
@@ -596,13 +596,13 @@ html[data-theme="dark"] .filter { box-shadow: none; }
    a column of them reads as a column instead of dashes. */
 .thread-accent { position: absolute; inset: 0 auto 0 0; width: 1.5px; opacity: .85; }
 /* Read mail keeps the hairline; unread earns the full weight, so a column of
-   stripes ranks itself without spending a second colour on the distinction. */
+   stripes ranks itself without spending a second color on the distinction. */
 .is-unread .thread-accent { width: 3px; }
 .avatar { width: 2.4em; height: 2.4em; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; color: var(--avatar-color); background: color-mix(in srgb, var(--avatar-color) 15%, var(--surface)); font-size: var(--text-0); font-weight: 800; }
 .avatar.compact { width: 2.4em; height: 2.4em; flex: 0 0 auto; }
 .thread-copy { min-width: 0; display: flex; flex-direction: column; gap: var(--gap-xs); }
 .thread-line { display: flex; align-items: baseline; justify-content: space-between; gap: .6em; }
-/* Who and what share the body step, told apart by weight and colour; the
+/* Who and what share the body step, told apart by weight and color; the
    preview and the time sit one step under them, so three lines still read as a
    row and not as a paragraph. */
 .thread-line strong { overflow: hidden; color: var(--text-soft); font-size: var(--text-1); font-weight: 630; text-overflow: ellipsis; white-space: nowrap; }
@@ -643,7 +643,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .message-rail button { width: .45em; height: .45em; flex: 0 0 auto; padding: 0; border-radius: 50%; background: var(--border-strong); cursor: pointer; transition: background var(--motion-quick) ease, transform var(--motion-quick) ease; }
 .message-rail button:hover { background: var(--text-faint); transform: scale(1.35); }
 .message-rail button.is-unread { background: var(--accent); }
-/* My own messages read as a distinct colour down the rail. */
+/* My own messages read as a distinct color down the rail. */
 .message-rail button.is-mine { background: color-mix(in srgb, var(--success) 70%, var(--border-strong)); }
 .message-rail button.is-mine.is-unread { background: var(--success); }
 .message-rail button.is-focused { background: var(--accent-strong); transform: scale(1.5); }
@@ -720,7 +720,7 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 }
 .message-addresses dt { color: var(--text-faint); font-weight: 700; }
 .message-addresses dd { margin: 0; overflow-wrap: anywhere; color: var(--text-soft); }
-/* A plain-text body has no sender styling to honour, so it reads at the body
+/* A plain-text body has no sender styling to honor, so it reads at the body
    step and follows the text-size setting like the rest of the reader. An HTML
    body renders in its own frame below and takes nothing from here. */
 .message-body { margin: 1px 1.5em var(--gap-xl) 4em; color: var(--text-soft); font-size: var(--text-1); line-height: 1.72; overflow-wrap: anywhere; }

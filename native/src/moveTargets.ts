@@ -15,7 +15,7 @@ export type MoveDestination = {
   id: string;
   title: string;
   subtitle: string;
-  /// The account's own colour, so the row says whose folder this is the way
+  /// The account's own color, so the row says whose folder this is the way
   /// every other account-bound row in the app does.
   dot?: string;
   action: MoveAction;

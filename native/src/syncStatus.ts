@@ -5,7 +5,7 @@
 ///
 /// The journal's states are the store's vocabulary, not this screen's. Nothing
 /// below invents one, and nothing below calls a row finished while the worker
-/// still intends to pick it up again — mislabelling a retry as a failure is the
+/// still intends to pick it up again — mislabeling a retry as a failure is the
 /// one mistake that would make this screen worse than no screen.
 
 import type { AccountSummary, OperationActivitySummary } from './types';

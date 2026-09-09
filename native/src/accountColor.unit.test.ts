@@ -3,7 +3,7 @@ import { test } from 'vitest';
 
 import { accountColorChoices, describeAccountColor, normalizeAccountColor } from './accountColor';
 
-test('a six-digit hex colour is accepted and lowercased', () => {
+test('a six-digit hex color is accepted and lowercased', () => {
   assert.equal(normalizeAccountColor('#AbCdEf'), '#abcdef');
   assert.equal(normalizeAccountColor('#5168f4'), '#5168f4');
 });
@@ -16,12 +16,12 @@ test('anything that is not exactly #rrggbb is refused', () => {
   for (const value of refused) assert.equal(normalizeAccountColor(value), null, String(value));
 });
 
-test('the offered colours are valid, distinct, and named', () => {
+test('the offered colors are valid, distinct, and named', () => {
   assert.equal(new Set(accountColorChoices.map((choice) => choice.value)).size, 6);
   for (const choice of accountColorChoices) {
     assert.equal(normalizeAccountColor(choice.value), choice.value, choice.label);
     assert.equal(describeAccountColor(choice.value), choice.label.toLocaleLowerCase());
   }
-  // A colour Settings does not offer is described by its value.
+  // A color Settings does not offer is described by its value.
   assert.equal(describeAccountColor('#abcdef'), '#abcdef');
 });

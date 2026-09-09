@@ -6,7 +6,7 @@ export const MESSAGE_FRAME_SANDBOX = 'allow-same-origin';
 
 import { safeRemoteImageDataUrl } from './richText';
 
-/// Colours and the typeface, and nothing about size: the frame shows a
+/// Colors and the typeface, and nothing about size: the frame shows a
 /// sender's document, and the text-size setting is for the interface around
 /// it. A message that names no size renders at the engine's default, the way
 /// it would in any other client; one that names sizes keeps them.

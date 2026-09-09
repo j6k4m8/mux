@@ -16,7 +16,7 @@ Gmail and generic IMAP+SMTP can both be configured from the interface, but they 
 
 Removing an account deletes its local mail, drafts, queued work, and Keychain authority after confirmation; a non-secret marker resumes Keychain cleanup after a crash. It does not delete provider mail. For Google, local removal does not make a network revocation request for the already-issued OAuth grant.
 
-Permanent deletion is excluded everywhere. Moving a conversation offers only the destinations one flag change can reach — restore, archive, trash, untrash — because two journal entries for one gesture would leave the undo toast able to take back half of it; there is no picker for arbitrary labels. A partially labelled thread can be normalized to all or none, but a confirmed normalization has no exact undo, since the prior per-message distribution is not recoverable from a thread-level inverse. Cancelling before execution is safe.
+Permanent deletion is excluded everywhere. Moving a conversation offers only the destinations one flag change can reach — restore, archive, trash, untrash — because two journal entries for one gesture would leave the undo toast able to take back half of it; there is no picker for arbitrary labels. A partially labeled thread can be normalized to all or none, but a confirmed normalization has no exact undo, since the prior per-message distribution is not recoverable from a thread-level inverse. Cancelling before execution is safe.
 
 ## The MIME and HTML boundary is not a mail-security product
 

@@ -10,8 +10,8 @@
 
   export let appearance: Appearance;
   /// The stripe says which account a row belongs to, so the sample borrows a
-  /// real account's colour when the mailbox has one. A fresh install has none,
-  /// and the theme's own accent stands in better than a colour invented here.
+  /// real account's color when the mailbox has one. A fresh install has none,
+  /// and the theme's own accent stands in better than a color invented here.
   export let accountColor: string | null = null;
 
   /// Made up, and fixed. Reaching into the mailbox would leave the sample blank

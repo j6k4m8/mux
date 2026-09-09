@@ -26,7 +26,7 @@
   /// deliberately walked into the list.
   let index = -1;
 
-  /// Colouring reads the raw string, so it stays right mid-word and mid-quote.
+  /// Coloring reads the raw string, so it stays right mid-word and mid-quote.
   $: segments = searchSegments(value);
   $: suggestions = open ? searchSuggestions({ text: value, caret, accounts, saved }) : [];
   $: if (index >= suggestions.length) index = -1;
@@ -45,7 +45,7 @@
     input?.blur();
   }
 
-  /// The coloured text sits on top of the field, so it has to follow the input
+  /// The colored text sits on top of the field, so it has to follow the input
   /// when a long query scrolls sideways.
   function syncScroll() {
     if (overlay && input) overlay.scrollLeft = input.scrollLeft;

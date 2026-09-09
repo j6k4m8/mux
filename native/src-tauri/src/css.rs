@@ -1,7 +1,7 @@
 //! CSS filtering for message bodies.
 //!
 //! Message styles are rendered inside a sandboxed frame that cannot run script,
-//! so the danger left in a stylesheet is not behaviour but reach: a declaration
+//! so the danger left in a stylesheet is not behavior but reach: a declaration
 //! that fetches a remote resource turns a rendered message into a read receipt.
 //! Everything here exists to keep declarations descriptive and local.
 
@@ -11,7 +11,7 @@ const MAX_NESTING: usize = 8;
 
 /// Properties that only describe appearance. Anything able to position content
 /// over the surrounding interface, animate, inject generated content, or name a
-/// behaviour is absent by construction rather than by pattern match.
+/// behavior is absent by construction rather than by pattern match.
 const ALLOWED_PROPERTIES: &[&str] = &[
     "background",
     "background-color",

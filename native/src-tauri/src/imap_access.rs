@@ -1470,9 +1470,9 @@ mod tests {
         );
     }
 
-    /// Settings offers the six colours new mailboxes are dealt, and the
+    /// Settings offers the six colors new mailboxes are dealt, and the
     /// interface keeps its own copy of the list so it can name them. This holds
-    /// the two together: a colour changed on one side fails here until the
+    /// the two together: a color changed on one side fails here until the
     /// other follows.
     #[test]
     fn the_interface_offers_exactly_the_colours_new_mailboxes_are_dealt() {

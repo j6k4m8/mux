@@ -307,11 +307,11 @@
     if (settingAccountColors.includes(accountId) || removingAccountId) return;
     settingsError = '';
     settingsMessage = '';
-    // Checked here as well as in the store: the colour is written into inline
+    // Checked here as well as in the store: the color is written into inline
     // styles, and the interface should not offer one the store would refuse.
     const color = normalizeAccountColor(value);
     if (!color) {
-      settingsError = 'Mux only takes a colour written as #rrggbb.';
+      settingsError = 'Mux only takes a color written as #rrggbb.';
       return;
     }
     settingAccountColors = [...settingAccountColors, accountId];
@@ -485,8 +485,8 @@
                   </div>
                 </div>
                 <div class="settings-account-color">
-                  <span>Colour</span>
-                  <div class="settings-choice-row settings-accents" role="group" aria-label={`Colour for ${account.name}`} data-testid="account-color" data-account-id={account.id}>
+                  <span>Color</span>
+                  <div class="settings-choice-row settings-accents" role="group" aria-label={`Color for ${account.name}`} data-testid="account-color" data-account-id={account.id}>
                     {#each accountColorChoices as choice}
                       <button
                         class:is-active={currentColor === choice.value}
@@ -506,12 +506,12 @@
                     <label
                       class="settings-color-custom"
                       class:is-active={!accountColorChoices.some((choice) => choice.value === currentColor)}
-                      title={`Pick any colour for ${account.name}`}
+                      title={`Pick any color for ${account.name}`}
                     >
                       <input
                         type="color"
                         value={currentColor ?? '#000000'}
-                        aria-label={`Custom colour for ${account.name}`}
+                        aria-label={`Custom color for ${account.name}`}
                         data-testid="account-color-custom"
                         disabled={settingAccountColors.includes(account.id) || Boolean(removingAccountId)}
                         on:change={(event) => setAccountColor(account.id, account.name, event.currentTarget.value)}
@@ -683,7 +683,7 @@
           <p>Mux follows this choice on every launch.</p>
         </header>
         <!-- Answers every choice below it, so it comes first and stays put. The
-             account colour is borrowed rather than passed as a preference: the
+             account color is borrowed rather than passed as a preference: the
              stripe means "this account", and inventing one would misdescribe it. -->
         <ThreadRowSample {appearance} accountColor={mailbox.accounts[0]?.color ?? null} />
         <section class="settings-card">
@@ -710,7 +710,7 @@
 
         <section class="settings-card">
           <h3>Accent</h3>
-          <div class="settings-choice-row settings-accents" role="group" aria-label="Accent colour" data-testid="accent-choice">
+          <div class="settings-choice-row settings-accents" role="group" aria-label="Accent color" data-testid="accent-choice">
           {#each accentChoices as choice}
             <button
               class:is-active={appearance.accent === choice.value}

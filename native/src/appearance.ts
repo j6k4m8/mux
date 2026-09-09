@@ -9,8 +9,8 @@ import type { Theme } from './theme';
 
 export type { AnimationSpeed };
 
-/// Where the accent colour comes from. 'account' follows the conversation being
-/// read, so the colour says whose mail this is; the rest are fixed choices.
+/// Where the accent color comes from. 'account' follows the conversation being
+/// read, so the color says whose mail this is; the rest are fixed choices.
 export type AccentChoice = 'account' | 'indigo' | 'teal' | 'violet' | 'amber' | 'rose';
 
 export type Density = 'roomy' | 'default' | 'sardine';
@@ -93,7 +93,7 @@ export const densityChoices: Array<{ label: string; value: Density }> = [
 ];
 
 /// Each fixed accent has a light and a dark form. One hex cannot be both:
-/// what reads as a colour on white is nearly black on a dark ground.
+/// what reads as a color on white is nearly black on a dark ground.
 const ACCENT_COLORS: Record<Exclude<AccentChoice, 'account'>, { light: string; dark: string }> = {
   indigo: { light: '#4c63ee', dark: '#7d8cff' },
   teal: { light: '#0f8a76', dark: '#4fd1b5' },
@@ -112,7 +112,7 @@ export const accentChoices: Array<{ label: string; value: AccentChoice }> = [
 ];
 
 /// The dot beside a choice, in the theme it will actually be seen in. Following
-/// the message has no fixed colour to show.
+/// the message has no fixed color to show.
 export function accentSwatch(choice: AccentChoice, theme: Theme): string {
   return choice === 'account' ? '' : ACCENT_COLORS[choice][theme];
 }
@@ -123,7 +123,7 @@ export function isAccentChoice(value: unknown): value is AccentChoice {
 
 /// Null means "whatever the stylesheet already says", which is how following
 /// the message behaves before anything is selected: the theme's own accent is
-/// already right for the theme, and inventing a stand-in would make the colour
+/// already right for the theme, and inventing a stand-in would make the color
 /// jump on the first selection for no reason.
 export function accentColorFor(
   choice: AccentChoice,
@@ -135,7 +135,7 @@ export function accentColorFor(
 }
 
 /// Only the base accent is set. The stylesheet derives the hover and tint
-/// variants from it, so one colour is all any of this has to supply.
+/// variants from it, so one color is all any of this has to supply.
 export function applyAccentToRoot(
   choice: AccentChoice,
   theme: Theme,

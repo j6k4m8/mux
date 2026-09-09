@@ -65,7 +65,7 @@ describe('the message reader frame', () => {
     const sized = messageFrameDocument('<p style="font-size: 9px">tiny by design</p>', {}, theme);
     expect(sized).toContain('<p style="font-size: 9px">tiny by design</p>');
 
-    // The mounted frame reads colours and the typeface off the root and no
+    // The mounted frame reads colors and the typeface off the root and no
     // more, so the same message builds the same document at any text size.
     render(MessageFrame, { bodyHtml: '<p>Hello</p>', label: 'At one times' });
     const before = (screen.getByTitle('At one times') as HTMLIFrameElement).getAttribute('srcdoc');

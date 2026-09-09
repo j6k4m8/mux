@@ -9,7 +9,7 @@ export type RichTag =
   | 'hr' | 'pre' | 'code' | 'dl' | 'dt' | 'dd' | 'del' | 'sub' | 'sup';
 
 /// Structural and inline markup that survives rendering. Attributes never do,
-/// apart from a revalidated href, so nothing here can carry behaviour.
+/// apart from a revalidated href, so nothing here can carry behavior.
 const allowedTags = new Set<string>([
   'p', 'div', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'blockquote', 'br', 'a',
   'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption',

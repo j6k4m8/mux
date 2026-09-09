@@ -144,7 +144,7 @@ type MailboxIpcOptions = {
 
 function installMailboxIpc(draftLoader?: DraftLoader, options: MailboxIpcOptions = {}): IpcCall[] {
   const calls: IpcCall[] = [];
-  // Recolouring is the one setting whose effect the next bootstrap has to show.
+  // Recoloring is the one setting whose effect the next bootstrap has to show.
   const accountColors = new Map<string, string>();
   let accountRemoved = false;
   const fixtureMailbox = options.accounts
@@ -174,7 +174,7 @@ function installMailboxIpc(draftLoader?: DraftLoader, options: MailboxIpcOptions
         : completeRemoval();
     }
     if (command === 'mailbox_bootstrap') {
-      // Both a recolour and a removal have to show up on the very next
+      // Both a recolor and a removal have to show up on the very next
       // bootstrap: the interface refreshes after each and expects to see it.
       const accounts = fixtureMailbox.accounts
         .filter((entry) => !accountRemoved || entry.id !== account.id)
@@ -631,7 +631,7 @@ describe('production mailbox interactions', () => {
     );
   });
 
-  test('recolouring an account moves its dot, its rows, and the accent that follows it', async () => {
+  test('recoloring an account moves its dot, its rows, and the accent that follows it', async () => {
     const { calls, user } = await renderMailbox();
     // A conversation is open, so the accent is following its account.
     expect(document.documentElement.style.getPropertyValue('--accent')).toBe(account.color);
@@ -649,7 +649,7 @@ describe('production mailbox interactions', () => {
     await waitFor(() => expect(within(settings).getByRole('status').textContent).toBe('Work is now rose.'));
     expect(within(group).getByRole('button', { pressed: true }).getAttribute('aria-label')).toBe('Rose for Work');
 
-    // The picker takes a colour Settings does not offer.
+    // The picker takes a color Settings does not offer.
     const custom = within(group).getByTestId('account-color-custom') as HTMLInputElement;
     await fireEvent.change(custom, { target: { value: '#ABCDEF' } });
     await waitFor(() => {
@@ -662,7 +662,7 @@ describe('production mailbox interactions', () => {
     await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
     await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
     // Compared through an element so the assertion follows however the DOM
-    // spells a colour back, rather than a guess at it.
+    // spells a color back, rather than a guess at it.
     const swatch = document.createElement('span');
     swatch.style.background = '#abcdef';
     const dot = document.querySelector<HTMLElement>(
@@ -691,7 +691,7 @@ describe('production mailbox interactions', () => {
     rejectColor(new Error('The account color could not be saved'));
     await waitFor(() => expect(swatch.disabled).toBe(false));
     // Nothing was ever written, so the swatch that was pressed before the
-    // click is still the one the account's own colour picks out — there is
+    // click is still the one the account's own color picks out — there is
     // no separate value to roll back the way an input's would be.
     expect(within(group).getByRole('button', { pressed: true }).getAttribute('aria-label')).toBe('Indigo for Work');
     expect(within(settings).getByRole('alert').textContent).toBe('The account color could not be saved');
@@ -849,7 +849,7 @@ describe('production mailbox interactions', () => {
     await fireEvent.wheel(first, { deltaX: 60, deltaY: 0 });
 
     // The row has now translated away from the pointer, so the rest of the same
-    // physical gesture lands on its neighbour. Spread over longer than the idle
+    // physical gesture lands on its neighbor. Spread over longer than the idle
     // window, so a gesture that ignored these would have ended mid-swipe.
     for (let index = 0; index < 4; index += 1) {
       await new Promise((resolve) => setTimeout(resolve, 120));
@@ -1463,10 +1463,10 @@ describe('production mailbox interactions', () => {
     expect(JSON.parse(window.localStorage.getItem('mux-sidebar')!).collapsed).toBe(false);
   });
 
-  test('the accent follows the conversation being read, or a colour you pick', async () => {
+  test('the accent follows the conversation being read, or a color you pick', async () => {
     const { user } = await renderMailbox();
     const accent = () => document.documentElement.style.getPropertyValue('--accent');
-    // Following the message is the default, so the account's own colour wins.
+    // Following the message is the default, so the account's own color wins.
     expect(accent()).toBe(account.color);
 
     await user.keyboard('{Meta>},{/Meta}');
@@ -1747,7 +1747,7 @@ describe('production mailbox interactions', () => {
     expect(screen.queryByTestId('shortcut-sheet')).toBeNull();
   });
 
-  test('the search box colours the query and completes a field with Tab', async () => {
+  test('the search box colors the query and completes a field with Tab', async () => {
     const { calls, user } = await renderMailbox();
     const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
 

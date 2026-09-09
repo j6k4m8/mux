@@ -1,5 +1,5 @@
 /// Reading the search box the same way the native side does. The Rust compiler
-/// in search.rs owns the grammar; this mirrors it twice over — once to colour
+/// in search.rs owns the grammar; this mirrors it twice over — once to color
 /// what is typed, once to suggest what could come next — so the box never
 /// offers a term the query engine would reject.
 

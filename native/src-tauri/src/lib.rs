@@ -262,10 +262,10 @@ struct AccountColorInput {
     color: String,
 }
 
-/// Recolours one account. The colour comes back out as an inline style on the
+/// Recolors one account. The color comes back out as an inline style on the
 /// other side of the bridge, so the store keeps nothing but a literal `#rrggbb`.
-/// Serialized with removal and the other account-lifecycle changes: a colour
-/// change racing an account's removal could otherwise write a colour for an
+/// Serialized with removal and the other account-lifecycle changes: a color
+/// change racing an account's removal could otherwise write a color for an
 /// account whose row is mid-delete.
 #[tauri::command]
 fn set_account_color(state: State<'_, AppState>, input: AccountColorInput) -> Result<(), String> {

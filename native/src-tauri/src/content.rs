@@ -823,7 +823,7 @@ mod tests {
         }
         // Legacy strikethrough normalises onto one tag.
         assert_eq!(safe.html.matches("<del>").count(), 2);
-        // Presentation survives; behaviour and the document wrapper do not.
+        // Presentation survives; behavior and the document wrapper do not.
         for forbidden in [
             "onclick", "alert", "<s>", "<strike>", "<body", "<html", "<head",
         ] {

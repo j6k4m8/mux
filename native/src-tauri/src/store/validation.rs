@@ -409,7 +409,7 @@ pub(super) fn exact_account_id(value: Option<&str>) -> Result<Option<String>, St
 }
 
 /// Exactly `#rrggbb`, handed back lowercased. The interface writes an account's
-/// colour into inline styles, so nothing looser than a literal colour is kept:
+/// color into inline styles, so nothing looser than a literal color is kept:
 /// no names, no shorthand, and nothing that could carry a `url(` along.
 pub(super) fn account_color(value: &str) -> Result<String, StoreError> {
     let digits = value
@@ -418,7 +418,7 @@ pub(super) fn account_color(value: &str) -> Result<String, StoreError> {
     match digits {
         Some(digits) => Ok(format!("#{}", digits.to_ascii_lowercase())),
         None => Err(StoreError::Validation(
-            "Account colour must be a hex colour like #5168f4".into(),
+            "Account color must be a hex color like #5168f4".into(),
         )),
     }
 }

@@ -218,7 +218,7 @@ export function areaPath(points: ChartPoint[], box: ChartBox = plotBox()): strin
 export type AxisLabel = { day: number; x: number; text: string; anchor: 'start' | 'middle' | 'end' };
 
 /// At most `maximum` labels, always including both ends, always in order. A
-/// year of days cannot be labelled day by day, and an unlabelled axis is worse
+/// year of days cannot be labeled day by day, and an unlabelled axis is worse
 /// than a sparse one. The end labels anchor inwards, because a centred label on
 /// the last point hangs half of itself off the edge of the viewBox.
 export function xAxisLabels(points: ChartPoint[], maximum = 5): AxisLabel[] {

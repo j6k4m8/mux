@@ -730,9 +730,9 @@ impl MuxStore {
         Ok(())
     }
 
-    /// Recolours one account. Every account has a colour whether or not a
+    /// Recolors one account. Every account has a color whether or not a
     /// provider is attached, so this writes to the account itself and a
-    /// local-only mailbox can be recoloured like any other.
+    /// local-only mailbox can be recolored like any other.
     pub(crate) fn set_account_color(
         &mut self,
         account_id: &str,
@@ -2515,7 +2515,7 @@ impl MuxStore {
             .ok_or_else(|| StoreError::Conflict("Operation has no thread".into()))?;
         if operation.field == "provider_label" && operation.old_value.as_deref() == Some("2") {
             return Err(StoreError::Conflict(
-                "A partially labelled thread cannot be restored exactly after confirmation".into(),
+                "A partially labeled thread cannot be restored exactly after confirmation".into(),
             ));
         }
         let current = current_operation_value(&transaction, &operation, thread_id)?;
@@ -9228,7 +9228,7 @@ mod tests {
     #[test]
     fn recolouring_an_account_reads_back_lowercased_through_the_listing() {
         let directory = tempdir().expect("temporary directory");
-        let path = directory.path().join("account-colour.db");
+        let path = directory.path().join("account-color.db");
         let mut store = MuxStore::open(&path, true).expect("seeded store opens");
         let color_of = |store: &MuxStore, id: &str| {
             store
@@ -9244,7 +9244,7 @@ mod tests {
 
         store
             .set_account_color("acc_work", "#C93B63")
-            .expect("recolour");
+            .expect("recolor");
         // Kept the way it will be written into a style: lowercase, six digits.
         assert_eq!(color_of(&store, "acc_work"), "#c93b63");
         // The other account keeps its own.
@@ -9254,7 +9254,7 @@ mod tests {
     #[test]
     fn anything_but_a_six_digit_hex_colour_is_refused_and_changes_nothing() {
         let directory = tempdir().expect("temporary directory");
-        let path = directory.path().join("bad-account-colour.db");
+        let path = directory.path().join("bad-account-color.db");
         let mut store = MuxStore::open(&path, true).expect("seeded store opens");
         for bad in [
             "",
@@ -9286,20 +9286,20 @@ mod tests {
                 [],
                 |row| row.get(0),
             )
-            .expect("colour");
+            .expect("color");
         assert_eq!(color, "#3b82f6");
     }
 
     #[test]
     fn recolouring_an_unknown_account_is_refused() {
         let directory = tempdir().expect("temporary directory");
-        let path = directory.path().join("unknown-account-colour.db");
+        let path = directory.path().join("unknown-account-color.db");
         let mut store = MuxStore::open(&path, true).expect("seeded store opens");
         assert!(matches!(
             store.set_account_color("acc_nobody", "#c93b63"),
             Err(StoreError::NotFound(_))
         ));
-        let recoloured: i64 = store
+        let recolored: i64 = store
             .connection
             .query_row(
                 "SELECT COUNT(*) FROM accounts WHERE color = '#c93b63'",
@@ -9307,7 +9307,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count");
-        assert_eq!(recoloured, 0);
+        assert_eq!(recolored, 0);
     }
 
     #[test]

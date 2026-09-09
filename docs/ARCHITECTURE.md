@@ -35,7 +35,7 @@ Three layers, and they are not interchangeable.
 
 **Durable pending intent** is what the user asked for. Actions append an operation and a work item; effective SQLite views overlay pending operations on the confirmed projection, so archive, read, star, and send render immediately and survive a restart.
 
-Container membership is recorded per message, so a thread is in a folder or carries a label either entirely, not at all, or partially. A pending change overlays that aggregate with the desired end state. This lets a partially labelled thread be normalized without pretending its prior distribution was a boolean — and it is why a confirmed normalization has no exact inverse: the per-message distribution is not recoverable from a thread-level undo. Cancelling before execution is still safe.
+Container membership is recorded per message, so a thread is in a folder or carries a label either entirely, not at all, or partially. A pending change overlays that aggregate with the desired end state. This lets a partially labeled thread be normalized without pretending its prior distribution was a boolean — and it is why a confirmed normalization has no exact inverse: the per-message distribution is not recoverable from a thread-level undo. Cancelling before execution is still safe.
 
 **Mux-owned metadata** — drafts, snooze times, invitation responses, operation activity — belongs to Mux and does not pretend to be provider state.
 

@@ -319,7 +319,7 @@
 
 <style>
   /* Scoped to the component on purpose: this screen carries its own styles so
-     it can land without touching the shared stylesheet. Every colour is a
+     it can land without touching the shared stylesheet. Every color is a
      token, so light and dark both come out right. */
   .stats-screen {
     display: flex;

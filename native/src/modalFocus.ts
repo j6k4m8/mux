@@ -1,5 +1,5 @@
 /// Every dialog in Mux keeps Tab inside itself and closes on Escape. That is
-/// one behaviour, so it is written once here rather than in each dialog.
+/// one behavior, so it is written once here rather than in each dialog.
 
 const FOCUSABLE =
   'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])';

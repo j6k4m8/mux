@@ -1,14 +1,14 @@
-//! Which of the six palette colours a new account gets.
+//! Which of the six palette colors a new account gets.
 //!
-//! Assigning by creation order meant an IMAP account's colour shifted
+//! Assigning by creation order meant an IMAP account's color shifted
 //! whenever another account was added or removed before it, and Gmail never
-//! counted at all — every Gmail account landed on the same colour. Hashing the
+//! counted at all — every Gmail account landed on the same color. Hashing the
 //! account's own identity fixes both: the same account always lands on the
-//! same colour no matter what else exists, and two different accounts
-//! collide on a colour about as often as any hash does — one in six here,
+//! same color no matter what else exists, and two different accounts
+//! collide on a color about as often as any hash does — one in six here,
 //! which is not worse than picking at random and is a great deal more stable.
 
-/// The same six colours `native/src/accountColor.ts` offers in Settings, in
+/// The same six colors `native/src/accountColor.ts` offers in Settings, in
 /// the same order; a Rust test holds the two together.
 pub(crate) const ACCOUNT_COLORS: [&str; 6] = [
     "#5168f4", "#12a58c", "#b3730a", "#c93b63", "#7c4ddb", "#0a6fa8",
@@ -50,8 +50,8 @@ mod tests {
         // Regression: this is exactly the bug being fixed — every Gmail
         // account landed on '#5168f4' because nothing about the account fed
         // the choice. A handful of distinct identities should not collapse
-        // onto one colour.
-        let colours: std::collections::HashSet<&str> = [
+        // onto one color.
+        let colors: std::collections::HashSet<&str> = [
             "gmail:reader@one.example",
             "gmail:reader@two.example",
             "gmail:reader@three.example",
@@ -60,6 +60,6 @@ mod tests {
         .iter()
         .map(|identity| account_color_for(identity))
         .collect();
-        assert!(colours.len() > 1);
+        assert!(colors.len() > 1);
     }
 }

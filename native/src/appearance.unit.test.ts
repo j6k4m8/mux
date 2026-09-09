@@ -13,11 +13,11 @@ import {
   readSavedAppearance
 } from './appearance';
 
-test('following the message is the default, and takes the account colour', () => {
+test('following the message is the default, and takes the account color', () => {
   assert.equal(DEFAULT_APPEARANCE.accent, 'account');
   assert.equal(accentColorFor('account', 'light', '#12a58c'), '#12a58c');
   assert.equal(accentColorFor('account', 'dark', '#12a58c'), '#12a58c');
-  // With nothing selected there is no colour to follow, and the stylesheet's
+  // With nothing selected there is no color to follow, and the stylesheet's
   // own accent is already right for the theme.
   assert.equal(accentColorFor('account', 'light', null), null);
 });
