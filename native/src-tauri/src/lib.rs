@@ -1,3 +1,4 @@
+mod account_color;
 pub mod content;
 mod css;
 mod gmail;
