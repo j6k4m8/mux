@@ -39,7 +39,9 @@ Mux has no product HTTP API. Svelte calls the allowlisted Rust commands register
 | --- | --- |
 | `gmail_oauth_begin` | Start the installed-desktop authorization and resolve once an account is bound |
 | `gmail_oauth_cancel` | Abandon an in-flight authorization and release its loopback listener |
+| `imap_account_add` | Prove a server, port, username and password by opening a session, then bind the mailbox and put the credential in the keychain. The only command that accepts a credential, and the direction is inward only: nothing about it is returned |
 | `set_account_refresh` | Set one account's refresh cadence, and wake the worker so a shorter one takes effect now |
+| `set_account_color` | Recolour one account. Exactly one `#rrggbb` is accepted and stored lowercased: the value is rendered into inline styles, so nothing looser gets in |
 | `sync_account_now` | Schedule an immediate sync for one account, routed by its stored provider kind |
 | `resync_all_mail` | Rewind provider sync bookmarks so the next cycle re-downloads and re-projects every message in place; removes nothing |
 

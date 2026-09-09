@@ -12,9 +12,13 @@
   export let threadUnread = false;
   export let railPreview = true;
 
-  /// The two newest messages open with the thread. The component now outlives
-  /// each background refresh, so a message that arrives later opens on arrival,
-  /// while one the reader collapsed stays collapsed.
+  /// A conversation opens with every message folded, whatever its age or read
+  /// state: the collapsed summaries are the first impression, and the reader
+  /// chooses what to unfold. The component outlives each background refresh,
+  /// and a message that arrives while the thread is open is an event the reader
+  /// is watching rather than part of the opening state, so it opens on arrival.
+  /// History paged in on request is not an arrival and folds like the rest;
+  /// one the reader collapsed stays collapsed.
   const seen = { ids: new Set<number>(), primed: false };
   let expandedIds = new Set<number>();
 
@@ -22,14 +26,20 @@
     if (!seen.primed && messages.length) {
       seen.primed = true;
       seen.ids = new Set(messages.map((message) => message.id));
-      expandedIds = new Set(messages.slice(-2).map((message) => message.id));
-    } else if (seen.primed) {
-      const arrived = messages.filter((message) => !seen.ids.has(message.id));
-      if (arrived.length) {
-        seen.ids = new Set(messages.map((message) => message.id));
-        expandedIds = new Set([...expandedIds, ...arrived.map((message) => message.id)]);
-      }
+    } else if (seen.primed && messages.some((message) => !seen.ids.has(message.id))) {
+      const arrived = messages.slice(newestSeenIndex(messages) + 1).map((message) => message.id);
+      seen.ids = new Set(messages.map((message) => message.id));
+      if (arrived.length) expandedIds = new Set([...expandedIds, ...arrived]);
     }
+  }
+
+  /// Where the newest message already on screen sits now. Anything after it
+  /// arrived; anything unseen before it was paged in.
+  function newestSeenIndex(current: MessageSummary[]): number {
+    for (let index = current.length - 1; index >= 0; index -= 1) {
+      if (seen.ids.has(current[index].id)) return index;
+    }
+    return -1;
   }
   let bottomAnchor: HTMLDivElement;
   let loadedImageData = new Map<string, string>();
@@ -240,7 +250,11 @@
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
+  /// The jumps are things the reader asks for, so their target opens even
+  /// though nothing opened with the thread.
   export async function jumpToNewest() {
+    const newest = messages.at(-1)?.id;
+    if (newest !== undefined) expandedIds = new Set(expandedIds).add(newest);
     await tick();
     bottomAnchor?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }

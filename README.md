@@ -29,7 +29,7 @@ A fresh database seeds a demo mailbox so that the first launch has something to 
 
 Gmail is the one provider you can connect from the interface. Settings opens the system browser for an installed-desktop authorization, and from then on the account bootstraps, follows the history feed, reconciles labels, and applies archive/read/star/trash mutations through the durable journal.
 
-There is a complete read-only IMAP sync adapter — implicit TLS, capability re-read after login, UID-only search and fetch, resumable cursors, credentials in the keychain — wired into the worker alongside Gmail. No command creates an IMAP account, so in a normal build it only ever runs for accounts provisioned by its own tests.
+Any other IMAP server can be added from Settings: server, port, username, password. Mux opens a real session and lists the mailbox before it writes anything down, so a typo is caught in the form rather than surfacing later as a mailbox that never syncs. The sync is implicit TLS, capability re-read after login, UID-only search and fetch, resumable cursors, and the credentials go to the keychain — but it is read-only. Archiving or starring mail in an IMAP account changes your local copy and never the server, and without an SMTP client such an account can receive and never reply.
 
 Gmail is also the only account that can send. A queued send freezes a durable snapshot, waits out the undo window, and is then submitted to the Gmail API as raw MIME; delayed send, undo-send, and the uncertain-outcome recovery path all sit around that. There is no SMTP transport, so an IMAP account can receive and never reply. There is no JMAP, POP, Exchange, or Outlook adapter.
 

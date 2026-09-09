@@ -172,10 +172,6 @@ export function viewScopeTerm(view: MailboxView): string {
   return VIEW_SCOPES[view] ?? '';
 }
 
-/// Which mailbox the native side should search, given a query that carries its
-/// own scope. Everything except trash lives under "all", so the query's own
-/// terms do the narrowing; trash is the one view "all" excludes outright, so a
-/// query asking for it has to be run against trash instead.
 /// Whether the box has actually narrowed anything. A query that is only the
 /// scope the mailbox seeded describes the view the reader is already in, so it
 /// is not a search yet.
@@ -184,10 +180,26 @@ export function searchIsNarrowed(query: string, view: MailboxView): boolean {
   return Boolean(trimmed) && trimmed !== viewScopeTerm(view);
 }
 
+/// Which mailbox the native side should search, given a query that carries its
+/// own scope. Everything except trash lives under "all", so the query's own
+/// terms do the narrowing; trash is the one view "all" excludes outright, so a
+/// query asking for it has to be run against trash instead.
 export function searchViewFor(input: string): Extract<MailboxView, 'all' | 'trash'> {
   return searchTerms(input).some((term) => term.field === 'in' && term.value === 'trash')
     ? 'trash'
     : 'all';
+}
+
+/// The mailbox a search still covers, which is what a heading over the results
+/// has to name. The seeded scope is what keeps a search inside the view it
+/// started from, so that view holds only while the term is in the box; once it
+/// has been deleted the results are as wide as the native side runs them.
+/// Drafts are the exception: they are never searched, only filtered in place.
+export function searchScopeView(query: string, view: MailboxView): MailboxView {
+  if (view === 'drafts') return view;
+  const scope = viewScopeTerm(view);
+  if (scope && searchTerms(query).some((term) => `${term.field}:${term.value}` === scope)) return view;
+  return searchViewFor(query);
 }
 
 export type SearchSuggestionKind = 'saved' | 'field' | 'value' | 'account' | 'operator' | 'save';

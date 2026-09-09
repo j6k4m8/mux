@@ -41,6 +41,8 @@
     persistSidebarLayout,
     readSidebarLayout,
     toggleFolderAccount,
+    toggleSavedSearches,
+    toggleSmartViews,
     DEFAULT_SIDEBAR_LAYOUT
   } from './sidebarLayout';
   import type { SidebarLayout } from './sidebarLayout';
@@ -51,7 +53,7 @@
     watchSystemTheme
   } from './theme';
   import type { ThemePreference } from './theme';
-  import { searchIsNarrowed, searchViewFor, viewScopeTerm } from './searchQuery';
+  import { searchIsNarrowed, searchScopeView, searchViewFor, viewScopeTerm } from './searchQuery';
   import {
     confirmationNotice,
     failureNotice,
@@ -174,6 +176,9 @@
   let replyDraftLoading = false;
   let replyDraftError = '';
   let replyDraftRequest = 0;
+  /// The thread whose quick reply has been handed its stored draft. Set once
+  /// that read settles, cleared when the reader moves to another thread.
+  let replyDraftThreadId: number | null = null;
   let notice: Notice | null = null;
   let snoozeDialogOpen = false;
   let customSnoozeValue = '';
@@ -243,7 +248,7 @@
     invitations: 'Invitations',
     finance: 'Finance'
   } as const)[selectedSmartView];
-  $: viewTitle = selectedContainer?.name || smartViewTitle || ({
+  const VIEW_TITLES: Record<MailboxView, string> = {
     all: 'All mail',
     inbox: 'Inbox',
     archive: 'Archive',
@@ -252,7 +257,21 @@
     sent: 'Sent',
     trash: 'Trash',
     drafts: 'Drafts'
-  } as const)[selectedView];
+  };
+  $: viewTitle = selectedContainer?.name || smartViewTitle || VIEW_TITLES[selectedView];
+  /// Both headers read from these, so the topbar and the pane heading cannot
+  /// describe two different lists. A folder is only ever read inside its own
+  /// account, so its account is the scope whatever the account list says. A
+  /// smart view is a search the reader chose by name, so it keeps that name;
+  /// any other search is titled by the mailbox it still covers, which is the
+  /// view it started from only while the seeded scope is in the box.
+  $: headerAccountId = selectedContainer?.accountId ?? selectedAccount;
+  $: headerScope = headerAccountId === null
+    ? { name: 'All accounts', email: 'All accounts' }
+    : mailbox?.accounts.find((account) => account.id === headerAccountId) ?? { name: headerAccountId, email: headerAccountId };
+  $: headerTitle = isSearching && !selectedSmartView
+    ? `Search ${VIEW_TITLES[searchScopeView(filter, selectedView)].toLocaleLowerCase()}`
+    : viewTitle;
   $: selectedCounts = mailbox?.viewCounts.find((counts) =>
     counts.accountId === selectedAccount
   ) ?? {
@@ -271,10 +290,13 @@
   $: offersUndo = noticeOffersUndo(notice, clock);
   $: motion = motionTiming(appearance.animation);
   $: railCollapsed = sidebar.collapsed && !compactNavigation;
+  /// `mailbox` is named here so recolouring an account moves the accent at
+  /// once: a `$:` statement follows the variables it names, and accountFor()
+  /// reads the mailbox out of its sight.
   $: applyAccentToRoot(
     appearance.accent,
     theme,
-    selectedThread ? accountFor(selectedThread.accountId)?.color ?? null : null
+    selectedThread && mailbox ? accountFor(selectedThread.accountId)?.color ?? null : null
   );
   /// Swapping mailbox, account, search, or page replaces every row at once.
   /// That is a new list rather than mail coming and going, so it is keyed: the
@@ -308,6 +330,7 @@
     ? mailboxJumpRows({
         accounts: mailbox.accounts,
         containers: mailbox.containers,
+        saved: savedSearches,
         selectedAccount,
         scoped: goToScoped,
         scopeAccountId: selectedAccount
@@ -317,6 +340,7 @@
   onMount(() => {
     destroyed = false;
     sidebar = readSidebarLayout();
+    savedSearches = readSavedSearches();
     setTheme(readThemePreference(), false);
     const stopWatchingSystemTheme = watchSystemTheme(systemThemeChanged);
     themeWatchers.push(stopWatchingSystemTheme);
@@ -377,6 +401,16 @@
 
   function toggleFolderSection(accountId: string) {
     sidebar = toggleFolderAccount(sidebar, accountId);
+    persistSidebarLayout(sidebar);
+  }
+
+  function toggleSmartViewsSection() {
+    sidebar = toggleSmartViews(sidebar);
+    persistSidebarLayout(sidebar);
+  }
+
+  function toggleSavedSearchesSection() {
+    sidebar = toggleSavedSearches(sidebar);
     persistSidebarLayout(sidebar);
   }
 
@@ -514,7 +548,8 @@
     }
     selectedAccount = row.target.accountId;
     if (row.target.kind === 'view') selectView(row.target.view);
-    else selectSmartView(row.target.smart, row.target.query);
+    else if (row.target.kind === 'smart') selectSmartView(row.target.smart, row.target.query);
+    else selectSavedSearch(row.target);
   }
 
   function openMove() {
@@ -555,6 +590,15 @@
   function forgetSearch(query: string) {
     savedSearches = removeSavedSearch(savedSearches, query);
     persistSavedSearches(savedSearches);
+  }
+
+  /// A saved search is run by putting its query in the box and handing it to
+  /// `filterChanged`, which is what picking the ★ row in the dropdown does
+  /// through the box's binding and `oninput`. The sidebar row and the jump
+  /// dialog come here, so the three cannot come apart.
+  function selectSavedSearch(search: SavedSearch) {
+    filter = search.query;
+    filterChanged();
   }
 
   function restoreDialogFocus(target: HTMLElement | null) {
@@ -731,6 +775,7 @@
     replyDraft = null;
     replyDraftLoading = false;
     replyDraftError = '';
+    replyDraftThreadId = null;
   }
 
   function clearThreadPage() {
@@ -846,6 +891,7 @@
         selectedMessages = [];
         selectedAttachments = [];
         loadedThreadId = null;
+        replyDraftThreadId = null;
       }
       messageCursor = null;
       messageHasMore = false;
@@ -882,7 +928,10 @@
     } catch (cause) {
       if (request !== messageRequest) return;
       messageError = cause instanceof Error ? cause.message : String(cause);
-      if (!older) loadedThreadId = null;
+      if (!older) {
+        loadedThreadId = null;
+        replyDraftThreadId = null;
+      }
     } finally {
       if (request === messageRequest) messageLoading = false;
     }
@@ -891,16 +940,30 @@
   async function loadReplyDraft(threadId: number) {
     const header = mailbox?.drafts.find((draft) => draft.replyToThreadId === threadId && !draft.locked) ?? null;
     const request = ++replyDraftRequest;
-    replyDraft = null;
-    replyDraftError = '';
-    replyDraftLoading = Boolean(header);
-    if (!header) return;
+    /// A thread being opened waits for its stored reply, so the editor mounts
+    /// holding it. A thread already showing its quick reply must not wait: the
+    /// editor has the words being typed, and taking it down to show the
+    /// store's copy hands back the last save — whose own autosave is what
+    /// reloaded the mailbox, so the swap would repeat on every keystroke. For
+    /// an open thread the stored copy is read quietly, for the next mount.
+    const opening = replyDraftThreadId !== threadId;
+    if (opening) {
+      replyDraft = null;
+      replyDraftError = '';
+      replyDraftLoading = Boolean(header);
+    }
+    if (!header) {
+      replyDraft = null;
+      replyDraftThreadId = threadId;
+      return;
+    }
     try {
       const detail = await invoke<DraftSummary>('get_draft', { draftId: header.id });
       if (request !== replyDraftRequest || selectedThreadId !== threadId) return;
       replyDraft = detail;
+      replyDraftThreadId = threadId;
     } catch (cause) {
-      if (request !== replyDraftRequest || selectedThreadId !== threadId) return;
+      if (request !== replyDraftRequest || selectedThreadId !== threadId || !opening) return;
       replyDraftError = cause instanceof Error ? cause.message : String(cause);
     } finally {
       if (request === replyDraftRequest) replyDraftLoading = false;
@@ -1713,9 +1776,9 @@
       <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
       <strong>mux</strong>
     </div>
-    <div class="workspace">
-      <span>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.name}</span>
-      <small>{viewTitle}</small>
+    <div class="workspace" data-testid="topbar-workspace">
+      <span>{headerScope.name}</span>
+      <small>{headerTitle}</small>
     </div>
     <SearchField
       bind:this={searchField}
@@ -1809,11 +1872,18 @@
           {selectedContainer}
           railCollapsed={railCollapsed}
           openFolderAccounts={sidebar.openFolderAccounts}
+          smartViewsOpen={sidebar.smartViewsOpen}
+          savedSearchesOpen={sidebar.savedSearchesOpen}
+          {savedSearches}
           {toggleRail}
           {toggleFolderSection}
+          {toggleSmartViewsSection}
+          {toggleSavedSearchesSection}
           {openStats}
           {selectView}
           {selectSmartView}
+          {selectSavedSearch}
+          {forgetSearch}
           {selectAccount}
           {selectContainer}
           {toggleAccountVisibility}
@@ -1823,7 +1893,7 @@
 
         <section class="thread-pane" aria-label={viewTitle}>
           <header class="pane-heading" data-testid="thread-list-header">
-            <div><small>{selectedAccount === null ? 'All accounts' : accountFor(selectedAccount)?.email}</small><h1>{filter ? `Search ${viewTitle.toLocaleLowerCase()}` : viewTitle}</h1></div>
+            <div><small>{headerScope.email}</small><h1>{headerTitle}</h1></div>
             <span>{searching ? 'Searching…' : `${isSearching && selectedView !== 'drafts' ? visibleThreads.length : selectedThreadTotal} ${selectedView === 'drafts' ? 'drafts' : 'threads'}`}</span>
           </header>
 
@@ -2123,7 +2193,7 @@
   {#if goToOpen}
     <JumpDialog
       title={goToScoped ? 'Go to folder in this account' : 'Go to'}
-      placeholder="Folder, smart view, or account…"
+      placeholder="Folder, smart view, saved search, or account…"
       rows={goToRows}
       emptyLabel="No matching folder"
       testid="go-to-dialog"

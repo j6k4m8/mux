@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use store::{
     AttachmentContent, DraftSummary, ListOperationsInput, MailStats, MailStatsInput,
     MailboxBootstrap, MessagePage, MessagePageInput, MuxStore, OperationActivitySummary,
@@ -40,6 +40,7 @@ use worker::{
     ClaimedWork, DurableWorker, WorkerAdapter, WorkerConfig, WorkerController, WorkerCycleResult,
     WorkerExecutionContext, WorkerOutcome, WorkerProjection,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 const MAILBOX_CHANGED_EVENT: &str = "mux://mailbox-changed";
 /// How often the refresh timer asks which accounts are due. Individual accounts
@@ -212,8 +213,99 @@ fn set_account_refresh(
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountColorInput {
+    account_id: String,
+    color: String,
+}
+
+/// Recolours one account. The colour comes back out as an inline style on the
+/// other side of the bridge, so the store keeps nothing but a literal `#rrggbb`.
+#[tauri::command]
+fn set_account_color(state: State<'_, AppState>, input: AccountColorInput) -> Result<(), String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Native mailbox state is unavailable".to_string())?;
+    store
+        .set_account_color(&input.account_id, &input.color)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AccountIdInput {
     account_id: String,
+}
+
+/// What the interface sends to add an IMAP mailbox. Secret bearing, so every
+/// copy of it below is held in `Zeroizing`: the derive only supplies the wipe,
+/// and something has to call it.
+#[derive(Deserialize, Zeroize)]
+#[serde(rename_all = "camelCase")]
+struct ImapAccountInput {
+    #[serde(default)]
+    display_name: String,
+    email: String,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImapAccountAdded {
+    account_id: String,
+    email: String,
+    /// What the server actually showed us, so the interface can say the
+    /// mailbox was reached rather than merely accepted.
+    folders: usize,
+}
+
+/// Adds an IMAP mailbox, but only after opening a real session with the details
+/// given. Verifying first is the whole point: an unverified account looks added
+/// and then fails inside the worker, where no one is looking.
+#[tauri::command]
+fn imap_account_add(
+    state: State<'_, AppState>,
+    input: ImapAccountInput,
+) -> Result<ImapAccountAdded, String> {
+    let input = Zeroizing::new(input);
+    let request = Zeroizing::new(imap_access::ImapProvisionRequest {
+        display_name: input.display_name.clone(),
+        email: input.email.clone(),
+        host: input.host.clone(),
+        port: input.port,
+        username: input.username.clone(),
+        password: input.password.clone(),
+    });
+    let prepared = imap_access::prepare_imap_account(&request)
+        .map_err(|_| "Those mailbox details are not usable".to_string())?;
+    let folders = imap::verify_authority(&prepared.grant).map_err(|error| match error {
+        imap::ImapError::Authentication => {
+            "The server refused that username and password".to_string()
+        }
+        imap::ImapError::Transient => {
+            "Mux could not reach that server. Check the host and port, then try again".to_string()
+        }
+        _ => "That server did not answer in a way Mux can use".to_string(),
+    })?;
+    imap_access::persist_imap_account(
+        &state.database_path,
+        &state.credentials,
+        &prepared,
+        now_ms(),
+    )
+    .map_err(|_| "Mux could not save that mailbox".to_string())?;
+    let scheduled = imap::sync_account_now(&state.database_path, &prepared.account_id, now_ms());
+    if scheduled.is_ok() {
+        wake_worker(&state);
+    }
+    Ok(ImapAccountAdded {
+        account_id: prepared.account_id.clone(),
+        email: prepared.email.clone(),
+        folders,
+    })
 }
 
 /// Asks one account for new mail immediately rather than waiting for its cadence.
@@ -715,8 +807,10 @@ pub fn run() {
             resolve_outcome_unknown_send,
             gmail_oauth_begin,
             gmail_oauth_cancel,
+            imap_account_add,
             resync_all_mail,
             set_account_refresh,
+            set_account_color,
             sync_account_now
         ])
         .build(tauri::generate_context!())
@@ -857,8 +951,13 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("])").next())
             .expect("invoke handler source");
-        // Credentials live in the keychain and are read only inside Rust. No
-        // command may read, write, or unlock them, and none may ask for a password.
+        // Credentials live in the keychain and are read only inside Rust. The
+        // invariant is about direction: nothing may flow outward. No command
+        // may read, write, or unlock stored credentials, and none may be named
+        // for one. Adding an IMAP mailbox does accept a password inward —
+        // there is no browser flow to borrow, so it has to be typed somewhere —
+        // and it goes straight to the keychain without being stored, logged, or
+        // returned. The response-shape test below holds that line.
         for forbidden in [
             "vault",
             "credential_value",
@@ -912,11 +1011,44 @@ mod tests {
                 "resolve_outcome_unknown_send",
                 "gmail_oauth_begin",
                 "gmail_oauth_cancel",
+                "imap_account_add",
                 "resync_all_mail",
                 "set_account_refresh",
+                "set_account_color",
                 "sync_account_now",
             ]
         );
+    }
+
+    /// The one command that accepts a credential must not hand any of it back.
+    #[test]
+    fn adding_a_mailbox_returns_no_credential_material() {
+        let source = include_str!("lib.rs");
+        let response = source
+            .split("struct ImapAccountAdded {")
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("response struct source");
+        for forbidden in [
+            "password",
+            "secret",
+            "token",
+            "credential",
+            "host",
+            "username",
+        ] {
+            assert!(!response.contains(forbidden), "returned {forbidden}");
+        }
+        let command = source
+            .split("fn imap_account_add(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}").next())
+            .expect("command source");
+        // The password reaches the keychain through the provisioning boundary
+        // and nowhere else: no println, no error text carrying it.
+        assert!(!command.contains("println"));
+        assert!(!command.contains("eprintln"));
+        assert!(command.contains("persist_imap_account"));
     }
 
     #[test]

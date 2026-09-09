@@ -33,6 +33,7 @@
   viewBox="0 0 24 24"
   width={size}
   height={size}
+  style="--icon-size: {size}px"
   fill={filled ? 'currentColor' : 'none'}
   stroke="currentColor"
   stroke-width="1.75"
@@ -107,8 +108,14 @@
 </svg>
 
 <style>
+  /* `size` is the icon's size at 1×. An icon sits beside a label, and a label
+     that grows with the text-size setting needs its icon to grow with it, so
+     the drawn size is the requested one times the scale. The attributes stay
+     as the fallback for anywhere the stylesheet has not loaded. */
   svg {
     display: block;
     flex: 0 0 auto;
+    width: calc(var(--icon-size) * var(--ui-scale, 1));
+    height: calc(var(--icon-size) * var(--ui-scale, 1));
   }
 </style>

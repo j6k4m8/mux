@@ -1,7 +1,8 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import { mailboxViews, smartViews } from './mailboxViews';
-  import { folderSectionIsOpen } from './sidebarLayout';
+  import { folderSectionIsOpen, savedSearchesSectionIsOpen, smartViewsSectionIsOpen } from './sidebarLayout';
+  import type { SavedSearch } from './savedSearches';
   import type {
     AccountSummary,
     ContainerSummary,
@@ -20,6 +21,9 @@
   /// The narrow rail: icons only, no labels, no counts.
   export let railCollapsed = false;
   export let openFolderAccounts: string[] = [];
+  export let smartViewsOpen = true;
+  export let savedSearchesOpen = true;
+  export let savedSearches: SavedSearch[] = [];
   export let hiddenAccounts: string[] = [];
   export let filter = '';
   export let collapsed = false;
@@ -30,10 +34,14 @@
   export let compose: () => void;
   export let selectView: (view: MailboxView) => void;
   export let selectSmartView: (view: Exclude<SmartView, ''>, query: string) => void;
+  export let selectSavedSearch: (search: SavedSearch) => void;
+  export let forgetSearch: (query: string) => void;
   export let selectAccount: (accountId: string | null) => void;
   export let selectContainer: (container: ContainerSummary) => void;
   export let toggleRail: () => void;
   export let toggleFolderSection: (accountId: string) => void;
+  export let toggleSmartViewsSection: () => void;
+  export let toggleSavedSearchesSection: () => void;
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openStats: () => void;
@@ -49,6 +57,11 @@
     }))
     .filter((section) => section.folders.length > 0);
   $: openFolderAccountId = selectedContainer?.accountId ?? null;
+  $: smartViewsShown = smartViewsSectionIsOpen(smartViewsOpen, selectedSmartView);
+  /// The saved search being run, if the box holds one of them. Queries are
+  /// stored trimmed, so the box is compared trimmed.
+  $: activeSavedQuery = savedSearches.find((search) => search.query === filter.trim())?.query ?? '';
+  $: savedSearchesShown = savedSearchesSectionIsOpen(savedSearchesOpen, activeSavedQuery);
 
   $: draftCount = mailbox.drafts.filter(
     (draft) => selectedAccount === null || draft.accountId === selectedAccount
@@ -107,19 +120,76 @@
     {/each}
   </section>
 
-  <p class="section-label">Smart views</p>
-  <section class="smart-views">
-    {#each smartViews as view}
-      <button
-        class:is-active={selectedSmartView === view.id}
-        data-action={`smart-${view.id}`}
-        title={view.title}
-        on:click={() => selectSmartView(view.id, view.query)}
-      >
-        <span class={`smart-dot ${view.dot}`}></span><span>{view.label}</span>
-      </button>
-    {/each}
-  </section>
+  <button
+    class="section-label section-toggle"
+    type="button"
+    aria-expanded={smartViewsShown}
+    data-action="toggle-smart-views"
+    title={smartViewsShown ? 'Fold away smart views' : 'Show smart views'}
+    on:click={() => toggleSmartViewsSection()}
+  >
+    <span>Smart views</span>
+    <span class="folder-chevron" aria-hidden="true">{smartViewsShown ? '\u2304' : '\u203A'}</span>
+  </button>
+  <!-- The rail has no heading to fold from, so its dots stay whatever the fold
+       says; they are what the rail has instead of the words. -->
+  {#if smartViewsShown || railCollapsed}
+    <section class="smart-views">
+      {#each smartViews as view}
+        <button
+          class:is-active={selectedSmartView === view.id}
+          data-action={`smart-${view.id}`}
+          title={view.title}
+          on:click={() => selectSmartView(view.id, view.query)}
+        >
+          <span class={`smart-dot ${view.dot}`}></span><span>{view.label}</span>
+        </button>
+      {/each}
+    </section>
+  {/if}
+
+  {#if savedSearches.length}
+    <button
+      class="section-label section-toggle"
+      type="button"
+      aria-expanded={savedSearchesShown}
+      data-action="toggle-saved-searches"
+      title={savedSearchesShown ? 'Fold away saved searches' : 'Show saved searches'}
+      on:click={() => toggleSavedSearchesSection()}
+    >
+      <span>Saved searches</span>
+      <span class="folder-chevron" aria-hidden="true">{savedSearchesShown ? '\u2304' : '\u203A'}</span>
+    </button>
+    {#if savedSearchesShown || railCollapsed}
+      <section class="nav-section saved-searches">
+        <!-- The forget control cannot live inside the row's own button, so the
+             two sit side by side on one grid row, as an account's dot and name
+             do. Rows are keyed by query, the one thing the list is unique on. -->
+        {#each savedSearches as search (search.query)}
+          <div class="saved-search-row">
+            <button
+              class:is-active={activeSavedQuery === search.query}
+              data-action="select-saved-search"
+              data-query={search.query}
+              title={search.query}
+              on:click={() => selectSavedSearch(search)}
+            >
+              <span class="nav-icon"><Icon name="search" size={15} /></span><strong>{search.name}</strong>
+            </button>
+            <button
+              class="saved-search-forget"
+              type="button"
+              aria-label={`Forget “${search.name}”`}
+              title="Forget this search"
+              data-action="forget-saved-search"
+              data-query={search.query}
+              on:click={() => forgetSearch(search.query)}
+            >✕</button>
+          </div>
+        {/each}
+      </section>
+    {/if}
+  {/if}
 
   {#if folderSections.length}
     <p class="section-label">Folders</p>
@@ -164,10 +234,23 @@
 
   <p class="section-label">Accounts</p>
   <section class="accounts">
-    <button class:is-active={selectedAccount === null} data-action="account-all" title="Show every account together" on:click={() => selectAccount(null)}>
-      <span class="account-dot all"></span><span>All accounts</span>
-      <em>{totalUnread}</em>
-    </button>
+    <!-- All accounts is one more account row, so its dot and name sit in the
+         same columns as the accounts under it. Nothing is shown or hidden for
+         all of them at once, so its dot cell is only the dot. -->
+    <div class="account-row all">
+      <span class="account-mark" aria-hidden="true"><span class="account-dot all"></span></span>
+      <button
+        class="account-select"
+        class:is-active={selectedAccount === null}
+        type="button"
+        data-action="account-all"
+        title="Show every account together"
+        on:click={() => selectAccount(null)}
+      >
+        <span>All accounts</span>
+        <em>{totalUnread}</em>
+      </button>
+    </div>
     {#each mailbox.accounts as account}
       {@const hidden = hiddenAccounts.includes(account.id)}
       <div class="account-row" class:is-hidden={hidden}>

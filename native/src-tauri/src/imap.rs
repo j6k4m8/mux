@@ -1341,6 +1341,27 @@ impl ImapSyncWork {
     }
 }
 
+/// Proves a set of connection details against the server before anything is
+/// written down, and reports how many folders it could see. Without this an
+/// account looks added and then fails much later inside the worker, where
+/// nobody is watching — a typed mistake would read as a broken mailbox.
+pub(crate) fn verify_authority(grant: &ImapAccessGrant) -> Result<usize, ImapError> {
+    let factory = NativeImapSessionFactory::new().map_err(|_| ImapError::Permanent)?;
+    verify_authority_with(&factory, grant)
+}
+
+/// Split out so the tests can prove the order — connect, log in, then list —
+/// without a server.
+fn verify_authority_with<F: ImapSessionFactory>(
+    factory: &F,
+    grant: &ImapAccessGrant,
+) -> Result<usize, ImapError> {
+    let mut session = factory.open(grant)?;
+    // LIST proves more than a login does: it is the first thing a sync needs,
+    // and a mailbox that cannot be listed cannot be synchronized.
+    Ok(session.list_folders()?.len())
+}
+
 pub(crate) fn is_imap_sync_work(work: &ClaimedWork) -> bool {
     work.kind == WorkKind::Sync && work.scope == IMAP_ACCOUNT_SCOPE
 }
@@ -1385,8 +1406,15 @@ fn schedule_syncs(
     }
     let mut connection = Connection::open(database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Launch schedules the first sync of every mailbox that has never had one;
+    // the timer and the resume path leave those alone. "Sync now" names one
+    // mailbox and means it whatever its history — a mailbox that has never
+    // synced is exactly the one someone presses it for, and the one a fresh
+    // provisioning hands here.
     let state = if initial_only {
         "account.sync_state = 'never_synced'"
+    } else if only_account.is_some() {
+        "account.sync_state IN ('never_synced', 'idle', 'scheduled')"
     } else {
         "account.sync_state IN ('idle', 'scheduled')"
     };
@@ -3410,6 +3438,55 @@ mod tests {
 
     struct MailboxFactory {
         uids: Vec<u32>,
+    }
+
+    /// A factory that fails the way a real server does when the details are
+    /// wrong, so verification can be proved without one.
+    struct RefusingFactory {
+        error: ImapError,
+    }
+
+    impl ImapSessionFactory for RefusingFactory {
+        fn open(&self, _grant: &ImapAccessGrant) -> Result<Box<dyn ImapSession>, ImapError> {
+            Err(self.error)
+        }
+    }
+
+    fn verification_grant() -> ImapAccessGrant {
+        ImapAccessGrant {
+            host: "mail.example.test".into(),
+            port: 993,
+            username: "reader@example.test".into(),
+            password: Zeroizing::new("swordfish".into()),
+            remote_account_id: "reader@example.test".into(),
+        }
+    }
+
+    #[test]
+    fn verifying_a_mailbox_reports_what_the_server_showed() {
+        let folders =
+            verify_authority_with(&MailboxFactory { uids: vec![1, 2] }, &verification_grant())
+                .expect("verified");
+        // MailboxFactory lists one folder, and a listable mailbox is the least
+        // a sync needs.
+        assert_eq!(folders, 1);
+    }
+
+    #[test]
+    fn verification_passes_the_refusal_through_rather_than_flattening_it() {
+        // The interface says different things for a wrong password and an
+        // unreachable host, so these must not collapse into one error.
+        for error in [
+            ImapError::Authentication,
+            ImapError::Transient,
+            ImapError::Permanent,
+            ImapError::Protocol,
+        ] {
+            assert_eq!(
+                verify_authority_with(&RefusingFactory { error }, &verification_grant()),
+                Err(error)
+            );
+        }
     }
 
     impl ImapSessionFactory for MailboxFactory {

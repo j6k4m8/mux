@@ -10,7 +10,7 @@ Draft attachments are not persisted at all — the `drafts` table has no column 
 
 ## Provider coverage is uneven
 
-Gmail is the only provider you can connect from the interface. The IMAP adapter syncs read-only and no command creates an IMAP account, so it runs only for accounts its own tests provision. There is no JMAP, POP, Exchange, or Outlook adapter.
+Gmail and IMAP can both be connected from the interface, but they are not equals. IMAP is read-only: nothing is pushed back, so a thread archived or starred in an IMAP account diverges from the server silently and permanently. Only implicit TLS on a port of your choosing is supported — no STARTTLS, no OAuth, no PREAUTH — and the password is the only mechanism. There is no JMAP, POP, Exchange, or Outlook adapter.
 
 Permanent deletion is excluded everywhere. Moving a conversation offers only the destinations one flag change can reach — restore, archive, trash, untrash — because two journal entries for one gesture would leave the undo toast able to take back half of it; there is no picker for arbitrary labels. A partially labelled thread can be normalized to all or none, but a confirmed normalization has no exact undo, since the prior per-message distribution is not recoverable from a thread-level inverse. Cancelling before execution is safe.
 
