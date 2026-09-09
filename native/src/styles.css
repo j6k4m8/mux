@@ -656,6 +656,11 @@ html[data-theme="dark"] .filter { box-shadow: none; }
 .collapsed-heading strong { min-width: 0; overflow: hidden; color: var(--text); font-size: var(--text-1); font-weight: 760; text-overflow: ellipsis; white-space: nowrap; }
 .message-open .collapsed-heading time { align-self: auto; margin-left: auto; }
 .collapsed-preview { min-width: 0; display: flex; flex-direction: column; gap: .55em; color: var(--text-soft); font-size: var(--text-1); line-height: 1.6; overflow-wrap: anywhere; }
+/* A folded message shows nothing of its body, so an attachment is
+   otherwise invisible until it is opened; the badge is the one thing the
+   fold keeps of it. Inline images the message displays itself do not
+   count — only disposition: attachment does. */
+.collapsed-attachment-badge { display: inline-flex; align-items: center; gap: .3em; flex: 0 0 auto; color: var(--text-faint); font-size: var(--text-0); font-variant-numeric: tabular-nums; }
 .collapsed-paragraph { display: block; }
 .collapsed-trimmed { color: var(--text-faint); font-size: var(--text-0); font-style: italic; }
 /* The caret is a control of its own now, so it needs somewhere to be clicked

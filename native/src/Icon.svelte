@@ -24,7 +24,8 @@
     | 'sun'
     | 'chevron'
     | 'sync'
-    | 'stats';
+    | 'stats'
+    | 'attachment';
   export let size = 18;
   export let filled = false;
 </script>
@@ -102,6 +103,8 @@
   {:else if name === 'sun'}
     <circle cx="12" cy="12" r="4" />
     <path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" />
+  {:else if name === 'attachment'}
+    <path d="M21 11.5 12.4 20a4.5 4.5 0 0 1-6.37-6.36l8.6-8.6a3 3 0 0 1 4.25 4.25l-8.6 8.6a1.5 1.5 0 0 1-2.12-2.13l7.1-7.1" />
   {:else}
     <path d="m9 18 6-6-6-6" />
   {/if}

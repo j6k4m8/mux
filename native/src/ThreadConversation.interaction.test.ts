@@ -1,7 +1,7 @@
 import { render } from '@testing-library/svelte';
 import { describe, expect, test } from 'vitest';
 import ThreadConversation from './ThreadConversation.svelte';
-import type { MessageSummary } from './types';
+import type { AttachmentSummary, MessageSummary } from './types';
 
 /// Messages are numbered in the order they were sent, so a higher id is a
 /// newer message and the ids read as positions in the conversation.
@@ -25,6 +25,18 @@ function message(id: number, isFromMe = false): MessageSummary {
 
 function folded(container: HTMLElement, id: number): boolean {
   return container.querySelector(`#native-message-${id}`)!.classList.contains('is-collapsed');
+}
+
+function attachment(messageId: number, disposition: AttachmentSummary['disposition'] = 'attachment'): AttachmentSummary {
+  return {
+    id: `att-${messageId}-${disposition}-${Math.random()}`,
+    messageId,
+    filename: 'invoice.pdf',
+    mediaType: 'application/pdf',
+    byteLength: 1024,
+    contentId: '',
+    disposition
+  };
 }
 
 describe('how a conversation opens', () => {
@@ -52,6 +64,21 @@ describe('how a conversation opens', () => {
     expect(newest.querySelector('.collapsed-heading strong')?.textContent).toBe('Alice Example');
     expect(newest.querySelector('.collapsed-heading time')).toBeTruthy();
     expect(newest.querySelector('.collapsed-preview')?.textContent?.trim()).toBe('Message 3 in full.');
+  });
+
+  test('a folded message with a real attachment says so; an inline image does not count', () => {
+    const { container } = render(ThreadConversation, {
+      messages: [message(1), message(2)],
+      attachments: [attachment(1, 'inline'), attachment(2, 'attachment'), attachment(2, 'attachment')]
+    });
+
+    // Message 1 carries only an inline image the body already shows — no badge.
+    expect(container.querySelector('#native-message-1 .collapsed-attachment-badge')).toBeNull();
+
+    // Message 2 carries two real attachments, invisible while folded but for this.
+    const badge = container.querySelector('#native-message-2 .collapsed-attachment-badge');
+    expect(badge?.textContent?.trim()).toBe('2');
+    expect(badge?.getAttribute('title')).toBe('2 attachments');
   });
 
   test('jumping to the newest message unfolds it, and only it', async () => {
