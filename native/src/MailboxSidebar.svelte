@@ -45,7 +45,7 @@
   export let toggleAccountVisibility: (accountId: string) => void;
   export let openSettings: () => void;
   export let openStats: () => void;
-  export let openActivity: () => void;
+  export let openSync: () => void;
 
   /// Folders belong to one account each, so they are listed under the account
   /// they belong to — one foldable section per visible account that has any.
@@ -290,7 +290,7 @@
     <kbd>⌘,</kbd>
   </button>
 
-  <button class="projection-status" type="button" data-action="open-activity" title="Open the local operation journal" on:click={openActivity} aria-haspopup="dialog">
+  <button class="projection-status" type="button" data-action="open-sync" title="Open sync status and queue" on:click={openSync}>
     <span class:has-error={Boolean(statusError) || !liveUpdates}></span>
     <div>
       <strong>{statusError ? 'Mailbox needs attention' : liveUpdates ? 'Up to date' : 'Refreshes on focus'}</strong>

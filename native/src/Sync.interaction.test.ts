@@ -84,10 +84,11 @@ async function renderSync(accounts: AccountSummary[], handlers: Handlers = {}) {
   const calls = installSyncIpc(handlers);
   const close = vi.fn();
   const refreshMailbox = vi.fn(() => Promise.resolve());
+  const signIn = vi.fn();
   const user = userEvent.setup();
-  render(SyncScreen, { close, accounts, refreshMailbox });
+  render(SyncScreen, { close, accounts, refreshMailbox, signIn });
   await waitFor(() => expect(screen.queryByTestId('queue-loading')).toBeNull());
-  return { calls, close, refreshMailbox, user };
+  return { calls, close, refreshMailbox, signIn, user };
 }
 
 function queueEntry(operationId: string): HTMLElement {
@@ -138,8 +139,9 @@ describe('sync status screen', () => {
   });
 
   test('an erroring account says so on its own row', async () => {
-    await renderSync([
-      { ...work, syncState: 'authentication_blocked', lastErrorCode: 'imap_reauthorization_required' }
+    const blocked = { ...work, syncState: 'authentication_blocked', lastErrorCode: 'imap_reauthorization_required' };
+    const { calls, signIn, user } = await renderSync([
+      blocked
     ], { operations: [] });
 
     const account = screen.getByTestId('sync-account');
@@ -148,6 +150,10 @@ describe('sync status screen', () => {
     expect(within(account).getByTestId('sync-account-headline').textContent).toBe('Needs you to sign in again');
     expect(within(account).getByText(/The IMAP server wants you to sign in again/u)).toBeTruthy();
     expect(screen.getByTestId('sync-verdict').textContent).toBe('1 account needs attention');
+    expect(within(account).queryByRole('button', { name: 'Sync now' })).toBeNull();
+    await user.click(within(account).getByRole('button', { name: 'Sign in' }));
+    expect(signIn).toHaveBeenCalledWith(blocked);
+    expect(calls.some((call) => call.command === 'sync_account_now')).toBe(false);
   });
 
   test('an account with no provider is not reported as behind', async () => {
@@ -160,6 +166,8 @@ describe('sync status screen', () => {
     expect(account.dataset.syncState).toBe('none');
     expect(within(account).getByTestId('sync-account-headline').textContent)
       .toBe('No provider is syncing this mailbox');
+    expect(within(account).queryByRole('button', { name: 'Sync now' })).toBeNull();
+    expect(screen.getByTestId<HTMLButtonElement>('sync-all').disabled).toBe(true);
     expect(screen.getByTestId('sync-verdict').textContent).toBe('Nothing here is syncing yet');
   });
 
@@ -202,6 +210,19 @@ describe('sync status screen', () => {
     const asks = calls.filter((call) => call.command === 'sync_account_now');
     expect(asks.map((call) => (call.payload as { input: { accountId: string } }).input.accountId))
       .toEqual(['acc_work', 'acc_home']);
+  });
+
+  test('syncing everything skips local mailboxes and accounts waiting for sign-in', async () => {
+    const local = { ...home, id: 'acc_local', lastSyncAt: null, syncState: null, lastErrorCode: null };
+    const blocked = { ...home, id: 'acc_blocked', syncState: 'authentication_blocked' };
+    const { calls, refreshMailbox, user } = await renderSync([work, local, blocked], { operations: [] });
+
+    await user.click(screen.getByTestId('sync-all'));
+
+    await waitFor(() => expect(refreshMailbox).toHaveBeenCalledTimes(1));
+    const asks = calls.filter((call) => call.command === 'sync_account_now');
+    expect(asks.map((call) => (call.payload as { input: { accountId: string } }).input.accountId))
+      .toEqual(['acc_work']);
   });
 
   test('an account that was already syncing is not reported as a refusal', async () => {

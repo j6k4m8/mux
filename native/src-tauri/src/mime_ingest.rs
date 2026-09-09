@@ -134,6 +134,7 @@ struct ThreadingHeaders {
     internet_message_id: Option<String>,
     in_reply_to: Option<String>,
     references: Vec<String>,
+    client_correlation_id: Option<String>,
 }
 
 pub(crate) struct IngestedMime {
@@ -145,6 +146,7 @@ pub(crate) struct IngestedMime {
     pub(crate) internet_message_id: Option<String>,
     pub(crate) in_reply_to: Option<String>,
     pub(crate) references: Vec<String>,
+    pub(crate) client_correlation_id: Option<String>,
     pub(crate) plain: Option<String>,
     pub(crate) html: Option<String>,
     pub(crate) attachments: Vec<IngestedAttachment>,
@@ -446,6 +448,7 @@ fn project_message(
         internet_message_id,
         in_reply_to,
         references,
+        client_correlation_id,
     } = project_threading_headers(message)?;
     let attachment_ids = message
         .attachments
@@ -505,6 +508,7 @@ fn project_message(
         internet_message_id,
         in_reply_to,
         references,
+        client_correlation_id,
         plain,
         html,
         attachments,
@@ -542,10 +546,25 @@ fn project_threading_headers(message: &Message<'_>) -> Result<ThreadingHeaders, 
         }
         references.reverse();
     }
+    let mut correlations = message
+        .headers_raw()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("X-Mux-Client-Correlation"));
+    let client_correlation_id = correlations.next().and_then(|(_, value)| {
+        let value = value.trim();
+        (correlations.next().is_none()
+            && !value.is_empty()
+            && value.len() <= 256
+            && value.is_ascii()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+            }))
+        .then(|| value.to_owned())
+    });
     Ok(ThreadingHeaders {
         internet_message_id,
         in_reply_to,
         references,
+        client_correlation_id,
     })
 }
 

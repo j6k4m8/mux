@@ -40,6 +40,7 @@ pub struct SafeMessageContent {
     pub internet_message_id: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    pub client_correlation_id: Option<String>,
     pub body_text: String,
     pub body_html: String,
     pub blocked_remote_resources: i64,
@@ -111,6 +112,7 @@ pub fn parse_mime(raw: &[u8]) -> Result<SafeMessageContent, String> {
         internet_message_id: ingested.internet_message_id,
         in_reply_to: ingested.in_reply_to,
         references: ingested.references,
+        client_correlation_id: ingested.client_correlation_id,
         body_text,
         body_html: sanitized.html,
         blocked_remote_resources: sanitized.blocked_remote_resources,
@@ -984,6 +986,7 @@ mod tests {
             "Message-ID: <design-3@example.test>\r\n",
             "In-Reply-To: <design-2@example.test>\r\n",
             "References: <design-1@example.test> <design-2@example.test>\r\n",
+            "X-Mux-Client-Correlation: mux-design-3\r\n",
             "Content-Type: multipart/related; boundary=outer\r\n\r\n",
             "--outer\r\n",
             "Content-Type: multipart/alternative; boundary=inner\r\n\r\n",
@@ -1012,6 +1015,10 @@ mod tests {
         assert_eq!(
             parsed.references,
             ["<design-1@example.test>", "<design-2@example.test>"]
+        );
+        assert_eq!(
+            parsed.client_correlation_id.as_deref(),
+            Some("mux-design-3")
         );
         assert_eq!(parsed.body_text.trim(), "Hello from plain text.");
         assert!(parsed.body_html.contains("<strong>Hello</strong>"));

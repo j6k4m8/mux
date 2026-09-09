@@ -148,8 +148,11 @@ pub(crate) fn apply_provider_batch_with_options_in_transaction(
         )? {
             affected_thread_ids.insert(thread_id);
         }
-        let (_, thread_id) = upsert_message(transaction, message)?;
+        let (_, thread_id, moved_from_thread_id) = upsert_message(transaction, message)?;
         affected_thread_ids.insert(thread_id);
+        if let Some(thread_id) = moved_from_thread_id {
+            affected_thread_ids.insert(thread_id);
+        }
     }
     if replace_memberships_for_upserted_messages {
         for message in &batch.message_upserts {
@@ -845,7 +848,7 @@ fn upsert_thread(
 fn upsert_message(
     transaction: &Transaction<'_>,
     message: &ProviderMessageUpsert,
-) -> Result<(i64, i64), StoreError> {
+) -> Result<(i64, i64, Option<i64>), StoreError> {
     let account_id = message.identity.mux_account_id.as_str();
     let remote_message_id = message.identity.remote_message_id.as_str();
     let requested_remote_thread = message
@@ -853,7 +856,7 @@ fn upsert_message(
         .remote_thread_id
         .as_ref()
         .map(|identity| identity.as_str());
-    let existing = transaction
+    let mut existing = transaction
         .query_row(
             "SELECT provider_message_refs.message_id, messages.thread_id,
                     provider_message_refs.remote_thread_id,
@@ -876,12 +879,30 @@ fn upsert_message(
         )
         .optional()?;
 
+    let adoption = local_sent_adoption(transaction, message)?;
+    // A first IMAP pass may have projected metadata before bounded MIME
+    // parsing exposed the correlation header. Once the exact Sent identity is
+    // available, replace that provider-only duplicate with the confirmed local
+    // send instead of making the early observation permanent.
+    if let (Some((existing_message_id, _, _, _, _)), Some((adopted_message_id, _))) =
+        (existing.as_ref(), adoption)
+    {
+        if *existing_message_id != adopted_message_id {
+            transaction.execute(
+                "DELETE FROM provider_message_refs
+                 WHERE account_id = ?1 AND remote_message_id = ?2",
+                params![account_id, remote_message_id],
+            )?;
+            transaction.execute("DELETE FROM messages WHERE id = ?1", [existing_message_id])?;
+            existing = None;
+        }
+    }
     let effective_remote_thread = requested_remote_thread.or_else(|| {
         existing
             .as_ref()
             .and_then(|(_, _, remote_thread_id, _, _)| remote_thread_id.as_deref())
     });
-    let mapped_thread_id = match effective_remote_thread {
+    let mut mapped_thread_id = match effective_remote_thread {
         Some(remote_thread_id) => Some(
             transaction
                 .query_row(
@@ -899,10 +920,28 @@ fn upsert_message(
         ),
         None => existing.as_ref().map(|(_, thread_id, _, _, _)| *thread_id),
     };
+    if let (Some((_, adoption_thread_id)), Some(provider_thread_id), Some(remote_thread_id)) =
+        (adoption, mapped_thread_id, effective_remote_thread)
+    {
+        if provider_thread_id != adoption_thread_id
+            && rebind_empty_provider_thread_for_adoption(
+                transaction,
+                account_id,
+                remote_thread_id,
+                provider_thread_id,
+                adoption_thread_id,
+            )?
+        {
+            mapped_thread_id = Some(adoption_thread_id);
+        }
+    }
 
     let local_thread_id = match mapped_thread_id {
         Some(local_thread_id) => local_thread_id,
-        None => create_standalone_thread(transaction, message)?,
+        None => match adoption {
+            Some((_, thread_id)) => thread_id,
+            None => create_standalone_thread(transaction, message)?,
+        },
     };
     let should_replace_body =
         existing
@@ -917,6 +956,10 @@ fn upsert_message(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    let confirmed_bcc = confirmed_smtp_bcc(transaction, message)?;
+    let bcc_recipients = confirmed_bcc
+        .as_deref()
+        .unwrap_or_else(|| message.bcc_recipients.as_str());
 
     let local_message_id = if let Some((local_message_id, existing_thread_id, _, _, _)) = existing {
         if existing_thread_id != local_thread_id {
@@ -943,7 +986,7 @@ fn upsert_message(
                 message.sender_email.as_str(),
                 message.recipients.as_str(),
                 message.cc_recipients.as_str(),
-                message.bcc_recipients.as_str(),
+                bcc_recipients,
                 message.sent_at.get(),
                 message.body_text.as_str(),
                 bool_i64(should_replace_body),
@@ -961,7 +1004,8 @@ fn upsert_message(
                revision = ?4,
                body_state = CASE WHEN ?6 = 1 THEN ?5 ELSE body_state END,
                body_is_truncated = CASE
-                 WHEN ?6 = 1 THEN ?7 ELSE body_is_truncated END
+                 WHEN ?6 = 1 THEN ?7 ELSE body_is_truncated END,
+               client_correlation_id = COALESCE(?8, client_correlation_id)
              WHERE account_id = ?1 AND remote_message_id = ?2",
             params![
                 account_id,
@@ -970,7 +1014,55 @@ fn upsert_message(
                 message.revision.as_ref().map(|value| value.as_str()),
                 body_state,
                 bool_i64(should_replace_body),
-                body_is_truncated
+                body_is_truncated,
+                message.client_correlation_id.as_deref(),
+            ],
+        )?;
+        local_message_id
+    } else if let Some((local_message_id, _adoption_thread_id)) = adoption {
+        transaction.execute(
+            "UPDATE messages SET
+               thread_id = ?1, sender_name = ?2, sender_email = ?3, recipients = ?4,
+               cc_recipients = ?5, bcc_recipients = ?6, sent_at = ?7,
+               body_text = CASE WHEN ?9 = 1 THEN ?8 ELSE body_text END,
+               is_from_me = ?10, remote_deleted = 0,
+               internet_message_id = COALESCE(?12, internet_message_id),
+               in_reply_to = COALESCE(?13, in_reply_to),
+               references_json = COALESCE(?14, references_json),
+               provider_subject = ?15
+             WHERE id = ?11",
+            params![
+                local_thread_id,
+                message.sender_name.as_str(),
+                message.sender_email.as_str(),
+                message.recipients.as_str(),
+                message.cc_recipients.as_str(),
+                bcc_recipients,
+                message.sent_at.get(),
+                message.body_text.as_str(),
+                bool_i64(should_replace_body),
+                bool_i64(message.is_from_me),
+                local_message_id,
+                message.internet_message_id.as_deref(),
+                message.in_reply_to.as_deref(),
+                references_json.as_deref(),
+                message.subject.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO provider_message_refs(
+               account_id, remote_message_id, message_id, remote_thread_id,
+               revision, body_state, body_is_truncated, client_correlation_id
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                account_id,
+                remote_message_id,
+                local_message_id,
+                requested_remote_thread,
+                message.revision.as_ref().map(|value| value.as_str()),
+                body_state,
+                body_is_truncated,
+                message.client_correlation_id.as_deref(),
             ],
         )?;
         local_message_id
@@ -990,7 +1082,7 @@ fn upsert_message(
                 message.sender_email.as_str(),
                 message.recipients.as_str(),
                 message.cc_recipients.as_str(),
-                message.bcc_recipients.as_str(),
+                bcc_recipients,
                 message.sent_at.get(),
                 message.body_text.as_str(),
                 bool_i64(message.is_from_me),
@@ -1004,8 +1096,8 @@ fn upsert_message(
         transaction.execute(
             "INSERT INTO provider_message_refs(
                account_id, remote_message_id, message_id, remote_thread_id,
-               revision, body_state, body_is_truncated
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               revision, body_state, body_is_truncated, client_correlation_id
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 account_id,
                 remote_message_id,
@@ -1013,7 +1105,8 @@ fn upsert_message(
                 requested_remote_thread,
                 message.revision.as_ref().map(|value| value.as_str()),
                 body_state,
-                body_is_truncated
+                body_is_truncated,
+                message.client_correlation_id.as_deref(),
             ],
         )?;
         local_message_id
@@ -1037,7 +1130,276 @@ fn upsert_message(
            AND remote_id = ?2 AND related_remote_id = ''",
         params![account_id, remote_message_id],
     )?;
-    Ok((local_message_id, local_thread_id))
+    let moved_from_thread_id = adoption
+        .map(|(_, thread_id)| thread_id)
+        .filter(|thread_id| *thread_id != local_thread_id);
+    Ok((local_message_id, local_thread_id, moved_from_thread_id))
+}
+
+/// A first Sent observation creates its provider thread placeholder before its
+/// message is projected. If the exact local SMTP row is then adopted, bind that
+/// genuinely empty placeholder to the local thread instead of moving the
+/// message away from Mux-owned snooze/invitation state. A thread with any prior
+/// mail, metadata, draft, or operation is not a placeholder and remains the
+/// canonical provider thread.
+fn rebind_empty_provider_thread_for_adoption(
+    transaction: &Transaction<'_>,
+    account_id: &str,
+    remote_thread_id: &str,
+    provider_thread_id: i64,
+    adoption_thread_id: i64,
+) -> Result<bool, StoreError> {
+    let eligible = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM threads provider_thread
+           JOIN threads adoption_thread ON adoption_thread.id = ?4
+           WHERE provider_thread.id = ?3
+             AND provider_thread.account_id = ?1
+             AND adoption_thread.account_id = ?1
+             AND EXISTS(
+               SELECT 1 FROM provider_thread_refs reference
+               WHERE reference.account_id = ?1
+                 AND reference.remote_thread_id = ?2
+                 AND reference.thread_id = ?3
+             )
+             AND NOT EXISTS(SELECT 1 FROM messages WHERE thread_id = ?3)
+             AND NOT EXISTS(SELECT 1 FROM snoozes WHERE thread_id = ?3)
+             AND NOT EXISTS(SELECT 1 FROM invitations WHERE thread_id = ?3)
+             AND NOT EXISTS(SELECT 1 FROM drafts WHERE reply_to_thread_id = ?3)
+             AND NOT EXISTS(SELECT 1 FROM operations WHERE thread_id = ?3)
+             AND NOT EXISTS(
+               SELECT 1 FROM provider_thread_refs target_reference
+               WHERE target_reference.account_id = ?1
+                 AND target_reference.thread_id = ?4
+             )
+         )",
+        params![
+            account_id,
+            remote_thread_id,
+            provider_thread_id,
+            adoption_thread_id
+        ],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !eligible {
+        return Ok(false);
+    }
+    transaction.execute(
+        "UPDATE threads AS adoption_thread SET
+           subject = provider_thread.subject,
+           participants = provider_thread.participants,
+           snippet = provider_thread.snippet,
+           latest_at = provider_thread.latest_at,
+           message_count = provider_thread.message_count,
+           remote_in_inbox = provider_thread.remote_in_inbox,
+           remote_unread = provider_thread.remote_unread,
+           remote_starred = provider_thread.remote_starred,
+           has_attachment = provider_thread.has_attachment,
+           has_invite = provider_thread.has_invite,
+           has_link = provider_thread.has_link,
+           has_from_me = provider_thread.has_from_me,
+           category = provider_thread.category,
+           attachment_names = provider_thread.attachment_names,
+           remote_deleted = provider_thread.remote_deleted
+         FROM threads AS provider_thread
+         WHERE adoption_thread.id = ?1 AND provider_thread.id = ?2",
+        params![adoption_thread_id, provider_thread_id],
+    )?;
+    let rebound = transaction.execute(
+        "UPDATE provider_thread_refs SET thread_id = ?4
+         WHERE account_id = ?1 AND remote_thread_id = ?2 AND thread_id = ?3",
+        params![
+            account_id,
+            remote_thread_id,
+            provider_thread_id,
+            adoption_thread_id
+        ],
+    )?;
+    let deleted = transaction.execute(
+        "DELETE FROM threads WHERE id = ?1 AND account_id = ?2",
+        params![provider_thread_id, account_id],
+    )?;
+    if rebound != 1 || deleted != 1 {
+        return Err(StoreError::Conflict(
+            "Provider Sent thread changed during local adoption".into(),
+        ));
+    }
+    Ok(true)
+}
+
+/// Bcc is envelope-only and correctly absent from SMTP MIME. Once the exact
+/// correlated send is confirmed, retain that local supplement on adoption and
+/// every later IMAP refresh of the same Sent UID.
+fn confirmed_smtp_bcc(
+    transaction: &Transaction<'_>,
+    message: &ProviderMessageUpsert,
+) -> Result<Option<String>, StoreError> {
+    let Some(internet_message_id) = message.internet_message_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(correlation) = message.client_correlation_id.as_deref() else {
+        return Ok(None);
+    };
+    if !is_imap_sent_message(transaction, message)? {
+        return Ok(None);
+    }
+    let account_id = message.identity.mux_account_id.as_str();
+    let mut statement = transaction.prepare(
+        "SELECT json_extract(operation.payload_json, '$.bccRecipients')
+         FROM operations operation
+         WHERE operation.field = 'send' AND operation.kind = 'send'
+           AND operation.state = 'confirmed'
+           AND json_valid(operation.payload_json)
+           AND json_extract(operation.payload_json, '$.snapshotVersion') = 3
+           AND json_extract(operation.payload_json, '$.providerKind') = 'imap'
+           AND json_extract(operation.payload_json, '$.accountId') = ?1
+           AND json_extract(operation.payload_json, '$.submissionMessageId') = ?2
+           AND json_extract(operation.payload_json, '$.clientCorrelationId') = ?3
+           AND json_type(operation.payload_json, '$.bccRecipients') = 'text'
+         ORDER BY operation.rowid LIMIT 2",
+    )?;
+    let candidates = statement
+        .query_map(
+            params![account_id, internet_message_id, correlation],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [bcc] => crate::provider::ProviderRecipients::new(bcc.clone())
+            .map(|value| Some(value.into_inner()))
+            .map_err(|error| StoreError::Validation(error.to_string())),
+        _ => Err(StoreError::Conflict(
+            "SMTP sent-message Bcc supplement is ambiguous".into(),
+        )),
+    }
+}
+
+/// Adopts a locally projected SMTP send only when an IMAP Sent-folder message
+/// carries both exact frozen identities. Message-ID alone is intentionally not
+/// enough: arbitrary mail can forge it, while the per-send correlation is
+/// generated in the durable snapshot and retained in the confirmed operation.
+fn local_sent_adoption(
+    transaction: &Transaction<'_>,
+    message: &ProviderMessageUpsert,
+) -> Result<Option<(i64, i64)>, StoreError> {
+    let Some(internet_message_id) = message.internet_message_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(correlation) = message.client_correlation_id.as_deref() else {
+        return Ok(None);
+    };
+    if !is_imap_sent_message(transaction, message)? {
+        return Ok(None);
+    }
+    let account_id = message.identity.mux_account_id.as_str();
+    let mut statement = transaction.prepare(
+        "SELECT message.id, message.thread_id
+         FROM messages message
+         JOIN threads thread ON thread.id = message.thread_id
+         WHERE thread.account_id = ?1
+           AND message.internet_message_id = ?2
+           AND message.is_from_me = 1 AND message.remote_deleted = 0
+           AND NOT EXISTS(
+             SELECT 1 FROM provider_message_refs reference
+             WHERE reference.message_id = message.id
+           )
+           AND EXISTS(
+             SELECT 1 FROM operations operation
+             WHERE operation.field = 'send' AND operation.kind = 'send'
+               AND operation.state = 'confirmed'
+               AND json_extract(
+                     CASE WHEN json_valid(operation.payload_json)
+                          THEN operation.payload_json ELSE '{}' END,
+                     '$.snapshotVersion'
+                   ) = 3
+               AND json_extract(
+                     CASE WHEN json_valid(operation.payload_json)
+                          THEN operation.payload_json ELSE '{}' END,
+                     '$.providerKind'
+                   ) = 'imap'
+               AND json_extract(
+                     CASE WHEN json_valid(operation.payload_json)
+                          THEN operation.payload_json ELSE '{}' END,
+                     '$.accountId'
+                   ) = ?1
+               AND json_extract(
+                     CASE WHEN json_valid(operation.payload_json)
+                          THEN operation.payload_json ELSE '{}' END,
+                     '$.submissionMessageId'
+                   ) = ?2
+               AND json_extract(
+                     CASE WHEN json_valid(operation.payload_json)
+                          THEN operation.payload_json ELSE '{}' END,
+                     '$.clientCorrelationId'
+                   ) = ?3
+           )
+         ORDER BY message.id LIMIT 2",
+    )?;
+    let candidates = statement
+        .query_map(
+            params![account_id, internet_message_id, correlation],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(*candidate)),
+        _ => Err(StoreError::Conflict(
+            "SMTP sent-message adoption is ambiguous".into(),
+        )),
+    }
+}
+
+fn is_imap_sent_message(
+    transaction: &Transaction<'_>,
+    message: &ProviderMessageUpsert,
+) -> Result<bool, StoreError> {
+    if !message.is_from_me {
+        return Ok(false);
+    }
+    let remote_id = message.identity.remote_message_id.as_str();
+    let Some(folder_and_validity) = remote_id.strip_prefix("imap:") else {
+        return Ok(false);
+    };
+    let Some((folder_and_validity, uid)) = folder_and_validity.rsplit_once(':') else {
+        return Ok(false);
+    };
+    let Some((container_id, uid_validity)) = folder_and_validity.rsplit_once(':') else {
+        return Ok(false);
+    };
+    if uid.parse::<u32>().ok().filter(|value| *value > 0).is_none()
+        || uid_validity
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .is_none()
+    {
+        return Ok(false);
+    }
+    let account_id = message.identity.mux_account_id.as_str();
+    let imap_account = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM provider_accounts
+           WHERE account_id = ?1 AND provider_kind = 'imap'
+         )",
+        [account_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !imap_account {
+        return Ok(false);
+    }
+    let sent_container = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM provider_containers
+           WHERE account_id = ?1 AND remote_id = ?2
+             AND role = 'sent' AND is_deleted = 0
+         )",
+        params![account_id, container_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    Ok(sent_container)
 }
 
 fn local_thread_for_message(
@@ -1675,6 +2037,10 @@ fn hash_batch_collections(hash: &mut Sha256, batch: &ProviderBatch) {
             hash_text(hash, "internet-message-id");
             hash_text(hash, message_id);
         }
+        if let Some(correlation) = message.client_correlation_id.as_deref() {
+            hash_text(hash, "client-correlation-id");
+            hash_text(hash, correlation);
+        }
         if let Some(in_reply_to) = message.in_reply_to.as_deref() {
             hash_text(hash, "in-reply-to");
             hash_text(hash, in_reply_to);
@@ -1835,6 +2201,163 @@ mod reconciliation_tests {
         .expect("empty provider batch")
     }
 
+    fn first_imap_sent_batch() -> ProviderBatch {
+        serde_json::from_value(serde_json::json!({
+            "muxAccountId": "account-a",
+            "batchId": "first-imap-sent",
+            "cursor": {
+                "muxAccountId": "account-a",
+                "scope": { "kind": "container", "remoteContainerId": "sent-folder" },
+                "value": "sent-cursor"
+            },
+            "observedAt": 20,
+            "threadUpserts": [{
+                "identity": { "muxAccountId": "account-a", "remoteThreadId": "sent-thread" },
+                "subject": "Sent subject",
+                "participants": "recipient@example.test",
+                "snippet": "provider body",
+                "latestAt": 20,
+                "messageCount": 1,
+                "inInbox": false,
+                "unread": false,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": true,
+                "category": "sent",
+                "revision": "thread-r1"
+            }],
+            "messageUpserts": [{
+                "identity": {
+                    "muxAccountId": "account-a",
+                    "remoteMessageId": "imap:sent-folder:9:42",
+                    "remoteThreadId": "sent-thread"
+                },
+                "subject": "Sent subject",
+                "senderName": "Me",
+                "senderEmail": "a@example.test",
+                "recipients": "recipient@example.test",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 20,
+                "bodyText": "provider body",
+                "bodyState": "complete",
+                "isFromMe": true,
+                "revision": "message-r1",
+                "keywords": [],
+                "internetMessageId": "<sent@mux.invalid>",
+                "clientCorrelationId": "mux-sent-correlation"
+            }],
+            "containerUpserts": [{
+                "identity": { "muxAccountId": "account-a", "remoteContainerId": "sent-folder" },
+                "displayName": "Sent",
+                "kind": "folder",
+                "role": "sent",
+                "selectable": true
+            }],
+            "membershipChanges": [{
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "account-a",
+                        "remoteMessageId": "imap:sent-folder:9:42",
+                        "remoteThreadId": "sent-thread"
+                    },
+                    "container": {
+                        "muxAccountId": "account-a",
+                        "remoteContainerId": "sent-folder"
+                    }
+                }
+            }],
+            "tombstones": []
+        }))
+        .expect("first IMAP Sent batch")
+    }
+
+    #[test]
+    fn first_imap_sent_adoption_keeps_mux_metadata_on_the_local_thread() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("smtp-adoption-local-metadata.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let mut connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute_batch(
+                "INSERT INTO accounts(id, name, email, color, provider)
+                 VALUES('account-a', 'Account A', 'a@example.test', '#000000', 'imap');
+                 INSERT INTO provider_accounts(
+                   account_id, provider_kind, remote_account_id, auth_state,
+                   credential_ref, sync_state, created_at, updated_at
+                 ) VALUES(
+                   'account-a', 'imap', 'login@example.test', 'ready',
+                   'imap/account-a', 'scheduled', 0, 0
+                 );
+                 INSERT INTO threads(
+                   id, account_id, subject, participants, snippet, latest_at,
+                   message_count, remote_in_inbox, remote_unread, remote_starred,
+                   has_attachment, has_invite, has_link, has_from_me
+                 ) VALUES(
+                   1, 'account-a', 'Sent subject', 'recipient@example.test',
+                   'local body', 10, 1, 0, 0, 0, 0, 0, 0, 1
+                 );
+                 INSERT INTO messages(
+                   id, thread_id, sender_name, sender_email, recipients,
+                   bcc_recipients, sent_at, body_text, is_from_me,
+                   internet_message_id, provider_subject
+                 ) VALUES(
+                   1, 1, 'Me', 'a@example.test', 'recipient@example.test',
+                   'blind@example.test', 10, 'local body', 1,
+                   '<sent@mux.invalid>', 'Sent subject'
+                 );
+                 INSERT INTO operations(
+                   id, thread_id, field, kind, old_value, new_value, payload_json,
+                   state, created_at, not_before, confirmed_at
+                 ) VALUES(
+                   'smtp-operation', NULL, 'send', 'send', 'draft', 'submitted',
+                   '{\"snapshotVersion\":3,\"providerKind\":\"imap\",\"accountId\":\"account-a\",\"submissionMessageId\":\"<sent@mux.invalid>\",\"clientCorrelationId\":\"mux-sent-correlation\",\"bccRecipients\":\"blind@example.test\"}',
+                   'confirmed', 10, 10, 11
+                 );
+                 INSERT INTO snoozes(thread_id, wake_at, created_at, previous_location)
+                 VALUES(1, 5000, 12, 'sent');",
+            )
+            .expect("confirmed local send with Mux metadata");
+        let transaction = connection.transaction().expect("projection transaction");
+        apply_provider_batch_with_options_in_transaction(
+            &transaction,
+            first_imap_sent_batch(),
+            ProviderBatchFailpoint::None,
+            true,
+            true,
+        )
+        .expect("first Sent observation");
+        transaction.commit().expect("commit adoption");
+
+        let result: (i64, i64, i64, i64, String) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM threads),
+                   (SELECT thread_id FROM provider_thread_refs
+                    WHERE account_id = 'account-a' AND remote_thread_id = 'sent-thread'),
+                   (SELECT messages.thread_id FROM provider_message_refs
+                    JOIN messages ON messages.id = provider_message_refs.message_id
+                    WHERE provider_message_refs.account_id = 'account-a'),
+                   (SELECT COUNT(*) FROM snoozes WHERE thread_id = 1 AND wake_at = 5000),
+                   (SELECT bcc_recipients FROM messages WHERE id = 1)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("adopted thread state");
+        assert_eq!(result, (1, 1, 1, 1, "blind@example.test".into()));
+    }
+
     #[test]
     fn gmail_provider_conformance_reconciliation_sweeps_more_than_one_thousand_in_two_passes() {
         let directory = tempdir().expect("temporary directory");
@@ -1954,5 +2477,400 @@ mod reconciliation_tests {
             )
             .expect("final reconciliation state");
         assert_eq!(result, (1_001, 0));
+    }
+
+    #[test]
+    fn imap_sent_observation_adopts_exact_smtp_projection_without_duplicate_message() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("smtp-adoption.db");
+        drop(MuxStore::open(&path, false).expect("native schema"));
+        let mut connection = Connection::open(&path).expect("fixture connection");
+        connection
+            .execute_batch(
+                "INSERT INTO accounts(id, name, email, color, provider)
+                 VALUES('account-a', 'Account A', 'a@example.test', '#000000', 'imap');
+                 INSERT INTO provider_accounts(
+                   account_id, provider_kind, remote_account_id, auth_state,
+                   credential_ref, sync_state, created_at, updated_at
+                 ) VALUES(
+                   'account-a', 'imap', 'a@example.test', 'ready',
+                   'imap/account-a', 'scheduled', 0, 0
+                 );
+                 INSERT INTO threads(
+                   id, account_id, subject, participants, snippet, latest_at,
+                   message_count, remote_in_inbox, remote_unread, remote_starred,
+                   has_attachment, has_invite, has_link, has_from_me
+                 ) VALUES(
+                   1, 'account-a', 'Sent subject', 'b@example.test', 'body', 10,
+                   1, 0, 0, 0, 0, 0, 0, 1
+                 );
+                 INSERT INTO messages(
+                   id, thread_id, sender_name, sender_email, recipients,
+                   bcc_recipients, sent_at, body_text, is_from_me,
+                   internet_message_id, provider_subject
+                 ) VALUES(
+                   1, 1, '', 'a@example.test', 'b@example.test',
+                   'blind@example.test', 10,
+                   'body', 1, '<smtp-message@mux.invalid>', 'Sent subject'
+                 );
+                 INSERT INTO operations(
+                   id, thread_id, field, kind, old_value, new_value, payload_json,
+                   state, created_at, not_before, confirmed_at
+                 ) VALUES(
+                   'smtp-operation', NULL, 'send', 'send', 'draft', 'submitted',
+                   '{\"snapshotVersion\":3,\"providerKind\":\"imap\",\"accountId\":\"account-a\",\"submissionMessageId\":\"<smtp-message@mux.invalid>\",\"clientCorrelationId\":\"mux-smtp-correlation\",\"bccRecipients\":\"blind@example.test\"}',
+                   'confirmed', 10, 10, 11
+                 );
+                 INSERT INTO threads(
+                   id, account_id, subject, participants, snippet, latest_at,
+                   message_count, remote_in_inbox, remote_unread, remote_starred,
+                   has_attachment, has_invite, has_link, has_from_me
+                 ) VALUES(
+                   2, 'account-a', 'Early metadata', 'b@example.test', '', 10,
+                   1, 0, 0, 0, 0, 0, 0, 1
+                 );
+                 INSERT INTO messages(
+                   id, thread_id, sender_name, sender_email, recipients, sent_at,
+                   body_text, is_from_me, internet_message_id, provider_subject
+                 ) VALUES(
+                   2, 2, '', 'a@example.test', 'b@example.test', 10,
+                   '', 1, '', 'Early metadata'
+                 );
+                 INSERT INTO provider_thread_refs(
+                   account_id, remote_thread_id, thread_id, revision
+                 ) VALUES('account-a', 'imap-thread-sent', 2, 'early-thread');
+                 INSERT INTO provider_message_refs(
+                   account_id, remote_message_id, message_id, remote_thread_id,
+                   revision, body_state
+                 ) VALUES(
+                   'account-a', 'imap:imap-folder-sent:9:42', 2,
+                   'imap-thread-sent', 'early-message', 'unavailable'
+                 );
+                 INSERT INTO snoozes(thread_id, wake_at, created_at, previous_location)
+                 VALUES(2, 5000, 5, 'sent');",
+            )
+            .expect("local SMTP projection");
+        let batch: ProviderBatch = serde_json::from_value(serde_json::json!({
+            "muxAccountId": "account-a",
+            "batchId": "imap-sent-adoption",
+            "cursor": {
+                "muxAccountId": "account-a",
+                "scope": { "kind": "container", "remoteContainerId": "imap-folder-sent" },
+                "value": "imap-sent-cursor"
+            },
+            "observedAt": 20,
+            "threadUpserts": [{
+                "identity": { "muxAccountId": "account-a", "remoteThreadId": "imap-thread-sent" },
+                "subject": "Sent subject",
+                "participants": "b@example.test",
+                "snippet": "body",
+                "latestAt": 10,
+                "messageCount": 1,
+                "inInbox": false,
+                "unread": false,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": true,
+                "category": "",
+                "revision": "imap-derived-v1"
+            }],
+            "messageUpserts": [{
+                "identity": {
+                    "muxAccountId": "account-a",
+                    "remoteMessageId": "imap:imap-folder-sent:9:42",
+                    "remoteThreadId": "imap-thread-sent"
+                },
+                "subject": "Sent subject",
+                "senderName": "",
+                "senderEmail": "a@example.test",
+                "recipients": "b@example.test",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 10,
+                "bodyText": "body",
+                "bodyState": "complete",
+                "isFromMe": true,
+                "revision": "imap-revision-sent",
+                "keywords": [],
+                "internetMessageId": "<smtp-message@mux.invalid>",
+                "clientCorrelationId": "mux-smtp-correlation"
+            }],
+            "containerUpserts": [{
+                "identity": { "muxAccountId": "account-a", "remoteContainerId": "imap-folder-sent" },
+                "displayName": "Sent",
+                "kind": "folder",
+                "role": "sent",
+                "selectable": true
+            }],
+            "membershipChanges": [{
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "account-a",
+                        "remoteMessageId": "imap:imap-folder-sent:9:42",
+                        "remoteThreadId": "imap-thread-sent"
+                    },
+                    "container": {
+                        "muxAccountId": "account-a",
+                        "remoteContainerId": "imap-folder-sent"
+                    }
+                }
+            }],
+            "tombstones": []
+        }))
+        .expect("provider batch");
+        let mut different_correlation = batch.clone();
+        different_correlation.message_upserts[0].client_correlation_id =
+            Some("mux-different-correlation".into());
+        assert_ne!(
+            provider_batch_fingerprint_v2(&batch),
+            provider_batch_fingerprint_v2(&different_correlation),
+            "the adoption correlation is part of replay identity"
+        );
+        let transaction = connection.transaction().expect("projection transaction");
+        apply_provider_batch_with_options_in_transaction(
+            &transaction,
+            batch.clone(),
+            ProviderBatchFailpoint::None,
+            true,
+            true,
+        )
+        .expect("adopt sent projection");
+        transaction.commit().expect("commit adoption");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("message count"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT messages.bcc_recipients
+                     FROM provider_message_refs
+                     JOIN messages ON messages.id = provider_message_refs.message_id
+                     WHERE provider_message_refs.account_id = 'account-a'
+                       AND provider_message_refs.remote_message_id = 'imap:imap-folder-sent:9:42'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("adopted local Bcc supplement"),
+            "blind@example.test"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT message_id, client_correlation_id FROM provider_message_refs
+                     WHERE account_id = 'account-a'
+                       AND remote_message_id = 'imap:imap-folder-sent:9:42'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("adopted provider ref"),
+            (1, "mux-smtp-correlation".into())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM threads WHERE remote_deleted = 0",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("visible thread count"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT messages.thread_id FROM provider_message_refs
+                     JOIN messages ON messages.id = provider_message_refs.message_id
+                     WHERE provider_message_refs.account_id = 'account-a'
+                       AND provider_message_refs.remote_message_id = 'imap:imap-folder-sent:9:42'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("canonical remote thread"),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM snoozes WHERE thread_id = 2 AND wake_at = 5000",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("preserved Mux-owned metadata"),
+            1
+        );
+
+        let mut refresh_json = serde_json::to_value(&batch).expect("serialize refresh batch");
+        refresh_json["batchId"] = serde_json::json!("imap-sent-refresh");
+        refresh_json["expectedPriorCursor"] = serde_json::json!("imap-sent-cursor");
+        refresh_json["cursor"]["value"] = serde_json::json!("imap-sent-cursor-2");
+        refresh_json["messageUpserts"][0]["revision"] =
+            serde_json::json!("imap-revision-sent-refresh");
+        let refresh: ProviderBatch =
+            serde_json::from_value(refresh_json).expect("provider refresh batch");
+        let transaction = connection.transaction().expect("refresh transaction");
+        apply_provider_batch_with_options_in_transaction(
+            &transaction,
+            refresh,
+            ProviderBatchFailpoint::None,
+            true,
+            true,
+        )
+        .expect("refresh adopted Sent projection");
+        transaction.commit().expect("commit refresh");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT messages.bcc_recipients
+                     FROM provider_message_refs
+                     JOIN messages ON messages.id = provider_message_refs.message_id
+                     WHERE provider_message_refs.account_id = 'account-a'
+                       AND provider_message_refs.remote_message_id = 'imap:imap-folder-sent:9:42'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("refreshed local Bcc supplement"),
+            "blind@example.test"
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO threads(
+                   id, account_id, subject, participants, snippet, latest_at,
+                   message_count, remote_in_inbox, remote_unread, remote_starred,
+                   has_attachment, has_invite, has_link, has_from_me
+                 ) VALUES(
+                   3, 'account-a', 'Second subject', 'b@example.test', 'body', 30,
+                   1, 0, 0, 0, 0, 0, 0, 1
+                 );
+                 INSERT INTO messages(
+                   id, thread_id, sender_name, sender_email, recipients, sent_at,
+                   body_text, is_from_me, internet_message_id, provider_subject
+                 ) VALUES(
+                   2, 3, '', 'a@example.test', 'b@example.test', 30,
+                   'body', 1, '<second@mux.invalid>', 'Second subject'
+                 );
+                 INSERT INTO operations(
+                   id, thread_id, field, kind, old_value, new_value, payload_json,
+                   state, created_at, not_before, confirmed_at
+                 ) VALUES(
+                   'smtp-operation-2', NULL, 'send', 'send', 'draft', 'submitted',
+                   '{\"snapshotVersion\":3,\"providerKind\":\"imap\",\"accountId\":\"account-a\",\"submissionMessageId\":\"<second@mux.invalid>\",\"clientCorrelationId\":\"mux-smtp-correlation-2\"}',
+                   'confirmed', 30, 30, 31
+                 );",
+            )
+            .expect("second local SMTP projection");
+        let inbox_batch: ProviderBatch = serde_json::from_value(serde_json::json!({
+            "muxAccountId": "account-a",
+            "batchId": "imap-inbox-no-adoption",
+            "cursor": {
+                "muxAccountId": "account-a",
+                "scope": { "kind": "container", "remoteContainerId": "imap-folder-inbox" },
+                "value": "imap-inbox-cursor"
+            },
+            "observedAt": 40,
+            "threadUpserts": [{
+                "identity": { "muxAccountId": "account-a", "remoteThreadId": "imap-thread-inbox" },
+                "subject": "Second subject",
+                "participants": "b@example.test",
+                "snippet": "body",
+                "latestAt": 30,
+                "messageCount": 1,
+                "inInbox": true,
+                "unread": false,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": true,
+                "category": "",
+                "revision": "imap-derived-v1"
+            }],
+            "messageUpserts": [{
+                "identity": {
+                    "muxAccountId": "account-a",
+                    "remoteMessageId": "imap:imap-folder-inbox:9:43",
+                    "remoteThreadId": "imap-thread-inbox"
+                },
+                "subject": "Second subject",
+                "senderName": "",
+                "senderEmail": "a@example.test",
+                "recipients": "b@example.test",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 30,
+                "bodyText": "body",
+                "bodyState": "complete",
+                "isFromMe": true,
+                "revision": "imap-revision-inbox",
+                "keywords": [],
+                "internetMessageId": "<second@mux.invalid>",
+                "clientCorrelationId": "mux-smtp-correlation-2"
+            }],
+            "containerUpserts": [{
+                "identity": { "muxAccountId": "account-a", "remoteContainerId": "imap-folder-inbox" },
+                "displayName": "Inbox",
+                "kind": "folder",
+                "role": "inbox",
+                "selectable": true
+            }],
+            "membershipChanges": [{
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "account-a",
+                        "remoteMessageId": "imap:imap-folder-inbox:9:43",
+                        "remoteThreadId": "imap-thread-inbox"
+                    },
+                    "container": {
+                        "muxAccountId": "account-a",
+                        "remoteContainerId": "imap-folder-inbox"
+                    }
+                }
+            }],
+            "tombstones": []
+        }))
+        .expect("provider inbox batch");
+        let transaction = connection
+            .transaction()
+            .expect("inbox projection transaction");
+        apply_provider_batch_with_options_in_transaction(
+            &transaction,
+            inbox_batch,
+            ProviderBatchFailpoint::None,
+            true,
+            true,
+        )
+        .expect("project inbox message");
+        transaction.commit().expect("commit inbox projection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT message_id FROM provider_message_refs
+                     WHERE account_id = 'account-a'
+                       AND remote_message_id = 'imap:imap-folder-inbox:9:43'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inbox provider ref"),
+            3,
+            "an exact-looking incoming message must not adopt a local send"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_message_refs WHERE message_id = 2",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("local message reference count"),
+            0
+        );
     }
 }

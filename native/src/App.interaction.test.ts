@@ -3,7 +3,7 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { tick } from 'svelte';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import App from './App.svelte';
 import { MAILBOX_CHANGED_EVENT } from './mailboxEvents';
 import type { MailboxChangedPayload } from './mailboxEvents';
@@ -13,6 +13,7 @@ import type {
   MailboxBootstrap,
   MessagePage,
   MessageSummary,
+  OperationActivitySummary,
   SaveDraftInput,
   SearchPage,
   ThreadPage,
@@ -28,6 +29,16 @@ const account: AccountSummary = {
   unread: 1,
   total: 2,
   refreshSeconds: 60
+};
+
+const secondaryAccount: AccountSummary = {
+  ...account,
+  id: 'acc_personal',
+  name: 'Personal',
+  email: 'jordan@example.com',
+  color: '#8b68ff',
+  unread: 0,
+  total: 0
 };
 
 const threads: ThreadSummary[] = [
@@ -105,13 +116,40 @@ const mailbox: MailboxBootstrap = {
   containers: []
 };
 
+function operation(overrides: Partial<OperationActivitySummary> = {}): OperationActivitySummary {
+  return {
+    id: 'op-queued',
+    threadId: 1,
+    field: 'in_inbox',
+    kind: 'archive',
+    state: 'pending',
+    createdAt: Date.now() - 2_000,
+    notBefore: Date.now() - 1_650,
+    confirmedAt: null,
+    undoOf: null,
+    attempts: 0,
+    ...overrides
+  };
+}
+
 type IpcCall = { command: string; payload: unknown };
 type DraftLoader = (draftId: string) => unknown;
+type MailboxIpcOptions = {
+  accounts?: AccountSummary[];
+  accountRemovalGate?: Promise<void>;
+  operations?: OperationActivitySummary[];
+  setAccountColor?: (accountId: string, color: string) => void | Promise<void>;
+  syncAccountNow?: (accountId: string) => number;
+};
 
-function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
+function installMailboxIpc(draftLoader?: DraftLoader, options: MailboxIpcOptions = {}): IpcCall[] {
   const calls: IpcCall[] = [];
   // Recolouring is the one setting whose effect the next bootstrap has to show.
   const accountColors = new Map<string, string>();
+  let accountRemoved = false;
+  const fixtureMailbox = options.accounts
+    ? { ...mailbox, accounts: options.accounts }
+    : mailbox;
   mockIPC((command, payload) => {
     calls.push({ command, payload });
     if (command === 'gmail_oauth_begin') {
@@ -120,18 +158,37 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
     if (command === 'gmail_oauth_cancel') return { state: 'cancel_requested' };
     if (command === 'imap_account_add') {
       const input = (payload as { input?: { host?: string; email?: string } })?.input ?? {};
-      if (input.host === 'wrong.example.test') throw new Error('The server refused that username and password');
+      if (input.host === 'cancel.example.test') return null;
+      if (input.host === 'wrong.example.test') throw new Error('The incoming server refused those credentials');
       return { accountId: 'imap:fixture', email: input.email, folders: 12 };
     }
-    if (command === 'mailbox_bootstrap') {
-      if (!accountColors.size) return mailbox;
-      return {
-        ...mailbox,
-        accounts: mailbox.accounts.map((entry) => ({ ...entry, color: accountColors.get(entry.id) ?? entry.color }))
+    if (command === 'account_remove') {
+      const accountId = (payload as { input?: { accountId?: string } })?.input?.accountId;
+      if (accountId !== account.id) throw new Error('That account is no longer connected');
+      const completeRemoval = () => {
+        accountRemoved = true;
+        return { accountId: account.id, keychainCleanupPending: false };
       };
+      return options.accountRemovalGate
+        ? options.accountRemovalGate.then(completeRemoval)
+        : completeRemoval();
+    }
+    if (command === 'mailbox_bootstrap') {
+      // Both a recolour and a removal have to show up on the very next
+      // bootstrap: the interface refreshes after each and expects to see it.
+      const accounts = fixtureMailbox.accounts
+        .filter((entry) => !accountRemoved || entry.id !== account.id)
+        .map((entry) => ({ ...entry, color: accountColors.get(entry.id) ?? entry.color }));
+      return accountRemoved
+        ? { ...fixtureMailbox, accounts, containers: [], drafts: [], viewCounts: [] }
+        : { ...fixtureMailbox, accounts };
     }
     if (command === 'list_threads') {
-      return { threads, hasMore: false, nextCursor: null } satisfies ThreadPage;
+      return {
+        threads: accountRemoved ? [] : threads,
+        hasMore: false,
+        nextCursor: null
+      } satisfies ThreadPage;
     }
     if (command === 'get_thread_messages') {
       const threadId = Number((payload as { input: { threadId: number } }).input.threadId);
@@ -195,7 +252,7 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
     if (command === 'rsvp_thread') {
       return { id: 'op-rsvp', threadId: 1, field: 'invitation_response', kind: 'rsvp', state: 'confirmed', notBefore: Date.now() };
     }
-    if (command === 'list_operations') return [];
+    if (command === 'list_operations') return options.operations ?? [];
     if (command === 'save_draft') {
       const input = (payload as { input: Record<string, unknown> }).input;
       return {
@@ -213,22 +270,39 @@ function installMailboxIpc(draftLoader?: DraftLoader): IpcCall[] {
     if (command === 'set_account_refresh') return null;
     if (command === 'set_account_color') {
       const input = (payload as { input: { accountId: string; color: string } }).input;
-      accountColors.set(input.accountId, input.color);
+      const update = () => accountColors.set(input.accountId, input.color);
+      if (options.setAccountColor) {
+        return Promise.resolve(options.setAccountColor(input.accountId, input.color)).then(update);
+      }
+      update();
       return null;
     }
-    if (command === 'sync_account_now') return 1;
+    if (command === 'sync_account_now') {
+      const accountId = String((payload as { input: { accountId: string } }).input.accountId);
+      return options.syncAccountNow ? options.syncAccountNow(accountId) : 1;
+    }
     throw new Error(`Unexpected IPC command: ${command}`);
   }, { shouldMockEvents: true });
   return calls;
 }
 
-async function renderMailbox(draftLoader?: DraftLoader) {
-  const calls = installMailboxIpc(draftLoader);
+async function renderMailbox(draftLoader?: DraftLoader, options: MailboxIpcOptions = {}) {
+  const calls = installMailboxIpc(draftLoader, options);
   const user = userEvent.setup();
   render(App);
   await waitFor(() => expect(screen.getAllByTestId('thread-row')).toHaveLength(2));
   await waitFor(() => expect(screen.getByTestId('reader-subject').textContent).toBe('Architecture sync'));
   return { calls, user };
+}
+
+async function chooseGenericMailbox(
+  settings: HTMLElement,
+  user: ReturnType<typeof userEvent.setup>,
+  email = 'reader@example.test'
+) {
+  await user.type(within(settings).getByTestId('account-email'), email);
+  await user.click(within(settings).getByTestId('account-email-continue'));
+  await user.click(within(settings).getByTestId('choose-imap'));
 }
 
 function blurActiveElement() {
@@ -278,12 +352,37 @@ describe('production mailbox interactions', () => {
     const { calls, user } = await renderMailbox();
     await user.click(screen.getByRole('button', { name: /Settings/u }));
     const dialog = screen.getByTestId('settings-screen');
-    await user.click(within(dialog).getByRole('button', { name: 'Add Gmail account' }));
+    await user.type(within(dialog).getByTestId('account-email'), 'Person@GMAIL.com');
+    const localeLower = vi.spyOn(String.prototype, 'toLocaleLowerCase').mockImplementation(function (this: string) {
+      return String(this).replaceAll('I', 'ı').toLowerCase();
+    });
+    try {
+      await user.click(within(dialog).getByTestId('account-email-continue'));
+    } finally {
+      localeLower.mockRestore();
+    }
 
     await waitFor(() => expect(within(dialog).getByRole('status').textContent).toBe('Connected reader@example.test.'));
     const oauthCall = calls.find((call) => call.command === 'gmail_oauth_begin');
     expect(oauthCall).toBeTruthy();
     expect(JSON.stringify(oauthCall?.payload ?? {})).not.toMatch(/token|secret|credential|clientId/iu);
+  });
+
+  test('asks non-Gmail addresses who hosts the mailbox before choosing a setup path', async () => {
+    const { calls, user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await user.type(within(settings).getByTestId('account-email'), 'person@company.example');
+    await user.click(within(settings).getByTestId('account-email-continue'));
+
+    const mailboxTypeHeading = within(settings).getByRole('heading', { name: 'Where is this mailbox hosted?' });
+    expect(document.activeElement).toBe(mailboxTypeHeading);
+    expect(within(settings).getByTestId('choose-google')).toBeTruthy();
+    expect(within(settings).getByTestId('choose-imap')).toBeTruthy();
+    expect(calls.some((call) => call.command === 'gmail_oauth_begin')).toBe(false);
+
+    await user.click(within(settings).getByTestId('choose-google'));
+    await waitFor(() => expect(calls.some((call) => call.command === 'gmail_oauth_begin')).toBe(true));
   });
 
   test('re-downloads all mail without asking the store to remove anything', async () => {
@@ -335,12 +434,12 @@ describe('production mailbox interactions', () => {
     const settings = screen.getByTestId('settings-screen');
 
     // Accounts owns provider sign-in; other sections must not duplicate it.
-    expect(within(settings).getByRole('button', { name: 'Add Gmail account' })).toBeTruthy();
+    expect(within(settings).getByTestId('account-email')).toBeTruthy();
     expect(within(settings).queryByTestId('resync-all')).toBeNull();
 
     await user.click(within(settings).getByRole('button', { name: 'Appearance' }));
     expect(settings.getAttribute('data-section')).toBe('appearance');
-    expect(within(settings).queryByRole('button', { name: 'Add Gmail account' })).toBeNull();
+    expect(within(settings).queryByTestId('account-email')).toBeNull();
 
     await user.click(within(settings).getByRole('button', { name: 'Shortcuts' }));
     // The reference reads from the shortcut catalog, so it lists the keys that
@@ -575,6 +674,29 @@ describe('production mailbox interactions', () => {
     expect(document.documentElement.style.getPropertyValue('--accent')).toBe('#abcdef');
   });
 
+  test('blocks account removal during a color write, and the picker is already right after failure', async () => {
+    let rejectColor!: (cause: Error) => void;
+    const colorGate = new Promise<void>((_resolve, reject) => { rejectColor = reject; });
+    const { user } = await renderMailbox(undefined, { setAccountColor: () => colorGate });
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const group = within(settings).getAllByTestId('account-color')[0];
+    const swatch = within(group).getByRole('button', { name: 'Rose for Work' }) as HTMLButtonElement;
+    const remove = within(settings).getByTestId('remove-account') as HTMLButtonElement;
+
+    await user.click(swatch);
+    await waitFor(() => expect(swatch.disabled).toBe(true));
+    expect(remove.disabled).toBe(true);
+
+    rejectColor(new Error('The account color could not be saved'));
+    await waitFor(() => expect(swatch.disabled).toBe(false));
+    // Nothing was ever written, so the swatch that was pressed before the
+    // click is still the one the account's own colour picks out — there is
+    // no separate value to roll back the way an input's would be.
+    expect(within(group).getByRole('button', { pressed: true }).getAttribute('aria-label')).toBe('Indigo for Work');
+    expect(within(settings).getByRole('alert').textContent).toBe('The account color could not be saved');
+  });
+
   test('thread action buttons show icon, text, and shortcut independently', async () => {
     const { user } = await renderMailbox();
     const archive = document.querySelector<HTMLButtonElement>('.reader-toolbar [data-action="archive"]')!;
@@ -771,8 +893,8 @@ describe('production mailbox interactions', () => {
       expect(within(settings).getByRole('status').textContent).toMatch(/Checking .* for new mail\./u)
     );
     // Adding a mailbox is a separate idea from syncing an existing one.
-    expect(within(settings).getByRole('button', { name: 'Add Gmail account' })).toBeTruthy();
-    expect(within(settings).queryByRole('button', { name: 'Connect Gmail' })).toBeNull();
+    expect(within(settings).getByTestId('account-email')).toBeTruthy();
+    expect(within(settings).queryByTestId('choose-google')).toBeNull();
   });
 
   test('boots the real light mailbox shell and toggles a persisted dark theme', async () => {
@@ -874,12 +996,14 @@ describe('production mailbox interactions', () => {
   });
 
   test('leaves Tab to the browser and clears search with Escape', async () => {
-    const { user } = await renderMailbox();
+    const { user } = await renderMailbox(undefined, {
+      accounts: [{ ...account, syncState: 'idle', lastSyncAt: Date.now() }]
+    });
     const search = screen.getByTestId('mailbox-search') as HTMLInputElement;
 
     await user.click(search);
     await user.tab();
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open sync status' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: /Refresh 1 visible account/u }));
 
     await user.click(search);
     // Focusing an empty box seeds the mailbox being searched.
@@ -1006,13 +1130,62 @@ describe('production mailbox interactions', () => {
     expect(screen.getByTestId('mux-shell').dataset.theme).toBe('dark');
   });
 
-  test('the toolbar opens sync status, and the rail opens stats', async () => {
-    const { user } = await renderMailbox();
+  test('the toolbar refreshes every visible connected account and badges unresolved work', async () => {
+    window.localStorage.setItem('mux-hidden-accounts', JSON.stringify([secondaryAccount.id]));
+    const { calls, user } = await renderMailbox(undefined, {
+      accounts: [
+        { ...account, syncState: 'idle', lastSyncAt: Date.now() },
+        { ...secondaryAccount, syncState: 'idle', lastSyncAt: Date.now() },
+        {
+          ...secondaryAccount,
+          id: 'acc_team',
+          name: 'Team',
+          email: 'team@example.com',
+          syncState: 'idle',
+          lastSyncAt: Date.now()
+        }
+      ],
+      operations: [
+        operation({ id: 'pending', state: 'pending' }),
+        operation({ id: 'failed', state: 'failed' }),
+        operation({ id: 'done', state: 'confirmed', confirmedAt: Date.now() })
+      ]
+    });
 
+    await waitFor(() => expect(screen.getByTestId('queue-badge').textContent).toBe('2'));
     await user.click(screen.getByTestId('sync-button'));
+    await waitFor(() => {
+      const refreshes = calls.filter((call) => call.command === 'sync_account_now');
+      expect(refreshes.map((call) => (call.payload as { input: { accountId: string } }).input.accountId))
+        .toEqual([account.id, 'acc_team']);
+    });
+    expect(screen.queryByTestId('sync-screen')).toBeNull();
+    expect(screen.getByTestId('mailbox-workspace')).toBeTruthy();
+  });
+
+  test('a new message defaults to the account currently selected in the mailbox', async () => {
+    const { user } = await renderMailbox(undefined, { accounts: [account, secondaryAccount] });
+    const navigation = screen.getByTestId('mailbox-navigation');
+    const secondary = navigation.querySelector<HTMLButtonElement>(
+      `[data-action="select-account"][data-account-id="${secondaryAccount.id}"]`
+    );
+    if (!secondary) throw new Error('Secondary account control is missing');
+
+    await user.click(secondary);
+    await user.click(within(navigation).getByTestId('compose-button'));
+
+    const composer = await screen.findByTestId('composer');
+    expect(within(composer).getByRole<HTMLSelectElement>('combobox', { name: 'From' }).value)
+      .toBe(secondaryAccount.id);
+  });
+
+  test('the rail status opens Sync, and the rail also opens Stats', async () => {
+    const { user } = await renderMailbox();
+    const navigation = screen.getByTestId('mailbox-navigation');
+
+    await user.click(within(navigation).getByRole('button', { name: /Up to date/u }));
     expect(await screen.findByTestId('sync-screen')).toBeTruthy();
     expect(screen.queryByTestId('mailbox-workspace')).toBeNull();
-
     await fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
 
@@ -1022,18 +1195,45 @@ describe('production mailbox interactions', () => {
     await waitFor(() => expect(screen.getByTestId('mailbox-workspace')).toBeTruthy());
   });
 
-  test('adding an imap mailbox verifies it, then clears the password', async () => {
+  test('an account that needs authentication offers Sign in and resumes its wizard', async () => {
+    const blocked = {
+      ...account,
+      syncState: 'authentication_blocked',
+      lastErrorCode: 'imap_reauthorization_required'
+    };
+    const { user } = await renderMailbox(undefined, { accounts: [blocked] });
+    await user.click(within(screen.getByTestId('mailbox-navigation')).getByRole('button', { name: /Up to date/u }));
+    const sync = await screen.findByTestId('sync-screen');
+    const accountRow = within(sync).getByTestId('sync-account');
+
+    expect(within(accountRow).queryByRole('button', { name: 'Sync now' })).toBeNull();
+    await user.click(within(accountRow).getByRole('button', { name: 'Sign in' }));
+
+    const settings = await screen.findByTestId('settings-screen');
+    await waitFor(() => expect(within(settings).getByRole('heading', {
+      name: 'Where is this mailbox hosted?'
+    })).toBeTruthy());
+    expect(within(screen.getByTestId('account-wizard')).getByText(account.email)).toBeTruthy();
+  });
+
+  test('adding an imap and smtp mailbox sends only non-secret configuration through ipc', async () => {
     const { calls, user } = await renderMailbox();
     await user.keyboard('{Meta>},{/Meta}');
     const settings = screen.getByTestId('settings-screen');
-    const submit = within(settings).getByTestId('imap-submit') as HTMLButtonElement;
-    // Nothing to submit until the mailbox is actually described.
-    expect(submit.disabled).toBe(true);
-
+    await chooseGenericMailbox(settings, user);
+    expect(document.activeElement).toBe(within(settings).getByRole('heading', { name: 'Incoming mail' }));
+    const incoming = within(settings).getByTestId('imap-incoming-continue') as HTMLButtonElement;
+    expect(incoming.disabled).toBe(true);
     await user.type(within(settings).getByTestId('imap-host'), 'imap.example.test');
-    await user.type(within(settings).getByTestId('imap-username'), 'reader@example.test');
-    await user.type(within(settings).getByTestId('imap-password'), 'swordfish');
-    await user.type(within(settings).getByTestId('imap-email'), 'reader@example.test');
+    expect((within(settings).getByTestId('imap-username') as HTMLInputElement).value).toBe('reader@example.test');
+    await user.click(incoming);
+    expect(document.activeElement).toBe(within(settings).getByRole('heading', { name: 'Outgoing mail' }));
+    await user.type(within(settings).getByTestId('smtp-host'), 'smtp.example.test');
+    await user.clear(within(settings).getByTestId('smtp-username'));
+    await user.type(within(settings).getByTestId('smtp-username'), 'sender@example.test');
+    await user.click(within(settings).getByTestId('imap-outgoing-continue'));
+    expect(document.activeElement).toBe(within(settings).getByRole('heading', { name: 'Ready to connect' }));
+    const submit = within(settings).getByTestId('imap-submit') as HTMLButtonElement;
     expect(submit.disabled).toBe(false);
     await user.click(submit);
 
@@ -1045,33 +1245,120 @@ describe('production mailbox interactions', () => {
           port: 993,
           username: 'reader@example.test',
           email: 'reader@example.test',
-          password: 'swordfish'
+          smtpHost: 'smtp.example.test',
+          smtpPort: 587,
+          smtpTlsMode: 'starttls',
+          smtpUsername: 'sender@example.test'
         }
       });
+      expect(JSON.stringify(request?.payload).toLowerCase()).not.toContain('password');
     });
-    // What the server showed is reported, and the password does not linger.
     await waitFor(() => expect(within(settings).getByRole('status').textContent)
       .toContain('Connected reader@example.test — 12 folders.'));
-    expect((within(settings).getByTestId('imap-password') as HTMLInputElement).value).toBe('');
     expect(calls.some((call) => call.command === 'mailbox_bootstrap')).toBe(true);
   });
 
-  test('a mailbox the server refuses is reported and nothing is cleared', async () => {
+  test('a mailbox the incoming server refuses is reported and endpoint details stay put', async () => {
     const { user } = await renderMailbox();
     await user.keyboard('{Meta>},{/Meta}');
     const settings = screen.getByTestId('settings-screen');
-
+    await chooseGenericMailbox(settings, user);
     await user.type(within(settings).getByTestId('imap-host'), 'wrong.example.test');
-    await user.type(within(settings).getByTestId('imap-username'), 'reader@example.test');
-    await user.type(within(settings).getByTestId('imap-password'), 'swordfish');
-    await user.type(within(settings).getByTestId('imap-email'), 'reader@example.test');
+    await user.click(within(settings).getByTestId('imap-incoming-continue'));
+    await user.type(within(settings).getByTestId('smtp-host'), 'smtp.example.test');
+    await user.click(within(settings).getByTestId('imap-outgoing-continue'));
     await user.click(within(settings).getByTestId('imap-submit'));
 
     await waitFor(() => expect(within(settings).getByRole('alert').textContent)
-      .toContain('The server refused that username and password'));
+      .toContain('The incoming server refused those credentials'));
     // The details stay put so the mistake can be corrected rather than retyped.
-    expect((within(settings).getByTestId('imap-host') as HTMLInputElement).value).toBe('wrong.example.test');
-    expect((within(settings).getByTestId('imap-password') as HTMLInputElement).value).toBe('swordfish');
+    expect(within(settings).getByText(/wrong\.example\.test:993/u)).toBeTruthy();
+    expect(within(settings).getByText(/smtp\.example\.test:587/u)).toBeTruthy();
+  });
+
+  test('cancelling the native password prompt keeps endpoint details without reporting an error', async () => {
+    const { calls, user } = await renderMailbox();
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    await chooseGenericMailbox(settings, user);
+    await user.type(within(settings).getByTestId('imap-host'), 'cancel.example.test');
+    await user.click(within(settings).getByTestId('imap-incoming-continue'));
+    await user.type(within(settings).getByTestId('smtp-host'), 'smtp.example.test');
+    await user.click(within(settings).getByTestId('imap-outgoing-continue'));
+    await user.click(within(settings).getByTestId('imap-submit'));
+
+    await waitFor(() => expect(calls.some((call) => call.command === 'imap_account_add')).toBe(true));
+    expect(within(settings).getByText(/cancel\.example\.test:993/u)).toBeTruthy();
+    expect(within(settings).getByText(/smtp\.example\.test:587/u)).toBeTruthy();
+    expect(within(settings).queryByRole('alert')).toBeNull();
+  });
+
+  test('removing an account requires confirmation and sends only its opaque id', async () => {
+    window.localStorage.setItem('mux-hidden-accounts', JSON.stringify([account.id]));
+    window.localStorage.setItem('mux-sidebar', JSON.stringify({
+      collapsed: false,
+      openFolderAccounts: [account.id]
+    }));
+    const { calls, user } = await renderMailbox();
+    await user.click(document.querySelector<HTMLButtonElement>('[data-action="select-account"]')!);
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const removeTrigger = within(settings).getByTestId('remove-account');
+    await user.click(removeTrigger);
+
+    const confirmation = within(settings).getByRole('group', { name: `Remove ${account.name}?` });
+    expect(confirmation.textContent).toContain('Mail on the server is not changed.');
+    expect(calls.some((call) => call.command === 'account_remove')).toBe(false);
+    const cancel = within(confirmation).getByRole('button', { name: 'Cancel' });
+    expect(document.activeElement).toBe(cancel);
+    await user.click(cancel);
+    expect(within(settings).queryByRole('group', { name: `Remove ${account.name}?` })).toBeNull();
+    expect(document.activeElement).toBe(removeTrigger);
+
+    await user.click(removeTrigger);
+    await user.click(within(settings).getByTestId('confirm-remove-account'));
+    await waitFor(() => {
+      const request = calls.filter((call) => call.command === 'account_remove').at(-1);
+      expect(request?.payload).toEqual({ input: { accountId: account.id } });
+    });
+    await waitFor(() => expect(within(settings).getByRole('status').textContent)
+      .toContain(`Removed ${account.name} from this Mac.`));
+    expect(within(settings).queryByText(account.email)).toBeNull();
+    expect(window.localStorage.getItem('mux-hidden-accounts')).toBe('[]');
+    expect(window.localStorage.getItem('mux-sidebar')).toBe(JSON.stringify({
+      collapsed: false,
+      openFolderAccounts: [],
+      smartViewsOpen: true,
+      savedSearchesOpen: true
+    }));
+    await user.click(within(settings).getByRole('button', { name: 'Back to mail' }));
+    await waitFor(() => expect(document.querySelector('.workspace > span')?.textContent).toBe('All accounts'));
+  });
+
+  test('an in-flight removal locks every account removal control', async () => {
+    let finishRemoval!: () => void;
+    const accountRemovalGate = new Promise<void>((resolve) => { finishRemoval = resolve; });
+    const { calls, user } = await renderMailbox(undefined, {
+      accounts: [account, secondaryAccount],
+      accountRemovalGate
+    });
+    await user.keyboard('{Meta>},{/Meta}');
+    const settings = screen.getByTestId('settings-screen');
+    const removeButtons = within(settings).getAllByTestId('remove-account') as HTMLButtonElement[];
+    const first = removeButtons.find((button) => button.dataset.accountId === account.id)!;
+    const second = removeButtons.find((button) => button.dataset.accountId === secondaryAccount.id)!;
+
+    await user.click(first);
+    await user.click(within(settings).getByTestId('confirm-remove-account'));
+    await waitFor(() => expect(calls.filter((call) => call.command === 'account_remove')).toHaveLength(1));
+    expect(first.disabled).toBe(true);
+    expect(second.disabled).toBe(true);
+    await user.click(second);
+    expect(within(settings).getByRole('group', { name: `Remove ${account.name}?` })).toBeTruthy();
+
+    finishRemoval();
+    await waitFor(() => expect(within(settings).getByRole('status').textContent)
+      .toContain(`Removed ${account.name} from this Mac.`));
   });
 
   test('the sender shows who else was on the message, and only the caret closes it', async () => {
@@ -1897,18 +2184,29 @@ describe('production mailbox interactions', () => {
     }
   });
 
-  test('focuses, traps, closes, and restores the local activity dialog', async () => {
-    const { user } = await renderMailbox();
-    const activityButton = screen.getByRole('button', { name: /Up to date/u });
-    await user.click(activityButton);
+  test('renders Activity as compact rows and keeps its modal focus contained', async () => {
+    const { user } = await renderMailbox(undefined, {
+      operations: [operation({ kind: 'archive', state: 'confirmed', confirmedAt: Date.now() })]
+    });
+    await user.click(screen.getByRole('button', { name: 'Open command palette' }));
+    const palette = await screen.findByTestId('command-palette');
+    await user.type(within(palette).getByRole('textbox', { name: 'Commands filter' }), 'activity');
+    await user.keyboard('{Enter}');
 
     const activity = await screen.findByTestId('activity-dialog');
+    expect(within(activity).getByTestId('activity-table')).toBeTruthy();
+    expect(within(activity).getByTestId('activity-row').tagName).toBe('TR');
+    expect(within(activity).getByText('Archive conversation')).toBeTruthy();
     const close = within(activity).getByRole('button', { name: 'Close activity' });
     expect(document.activeElement).toBe(close);
     await user.tab();
     expect(document.activeElement).toBe(close);
     await user.keyboard('{Escape}');
     expect(screen.queryByTestId('activity-dialog')).toBeNull();
-    await waitFor(() => expect(document.activeElement).toBe(activityButton));
   });
+
+  // "the rail status opens Sync, and the rail also opens Stats" covers the
+  // trigger that used to open this dialog directly — it opens Sync now.
+  // "renders Activity as compact rows and keeps its modal focus contained"
+  // covers opening it from the command palette and trapping focus inside it.
 });

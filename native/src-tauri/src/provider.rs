@@ -745,6 +745,8 @@ pub struct ProviderMessageUpsert {
     pub in_reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_correlation_id: Option<String>,
 }
 
 impl ProviderMessageUpsert {
@@ -776,6 +778,18 @@ impl ProviderMessageUpsert {
         }) {
             return Err(ProviderContractError::NotNormalized {
                 field: "References",
+            });
+        }
+        if self.client_correlation_id.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 256
+                || !value.is_ascii()
+                || !value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+                })
+        }) {
+            return Err(ProviderContractError::NotNormalized {
+                field: "client correlation",
             });
         }
         Ok(())
@@ -1132,6 +1146,7 @@ mod tests {
             internet_message_id: Some("<provider-message-1@example.test>".into()),
             in_reply_to: None,
             references: None,
+            client_correlation_id: None,
         }
     }
 

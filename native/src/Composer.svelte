@@ -13,6 +13,9 @@
   export let replyAll = false;
   export let forwardThread: ThreadSummary | null = null;
   export let quoteSource: MessageSummary | null = null;
+  /// A brand-new draft follows the mailbox scope the reader chose. Replies,
+  /// forwards, and saved drafts remain pinned to their original account.
+  export let initialAccountId: string | null = null;
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -24,7 +27,13 @@
   let currentDraft = draft;
   let editor: RichEditor;
   let composerDialog: HTMLElement;
-  let accountId = draft?.accountId ?? replyThread?.accountId ?? forwardThread?.accountId ?? accounts[0]?.id ?? '';
+  const contextualAccountId = draft?.accountId
+    ?? replyThread?.accountId
+    ?? forwardThread?.accountId
+    ?? initialAccountId;
+  let accountId = contextualAccountId && accounts.some((account) => account.id === contextualAccountId)
+    ? contextualAccountId
+    : accounts[0]?.id ?? '';
   let recipients = draft?.recipients ?? (replyThread ? replyRecipient : '');
   let ccRecipients = draft?.ccRecipients ?? '';
   let bccRecipients = draft?.bccRecipients ?? '';

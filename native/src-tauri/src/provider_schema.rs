@@ -165,6 +165,10 @@ pub(crate) fn migrate(
              'unavailable', 'metadata', 'normalized', 'failed'
            )),
            body_is_truncated INTEGER NOT NULL DEFAULT 0 CHECK(body_is_truncated IN (0, 1)),
+           client_correlation_id TEXT CHECK(
+             client_correlation_id IS NULL OR
+             length(CAST(client_correlation_id AS BLOB)) BETWEEN 1 AND 256
+           ),
            PRIMARY KEY(account_id, remote_message_id),
            UNIQUE(account_id, message_id),
            FOREIGN KEY(account_id, remote_thread_id)
@@ -565,6 +569,20 @@ pub(crate) fn migrate(
             "ALTER TABLE provider_message_refs
                ADD COLUMN body_is_truncated INTEGER NOT NULL DEFAULT 0
                CHECK(body_is_truncated IN (0, 1));",
+        )?;
+    }
+    if !column_exists(
+        transaction,
+        "provider_message_refs",
+        "client_correlation_id",
+    )? {
+        transaction.execute_batch(
+            "ALTER TABLE provider_message_refs
+               ADD COLUMN client_correlation_id TEXT
+               CHECK(
+                 client_correlation_id IS NULL OR
+                 length(CAST(client_correlation_id AS BLOB)) BETWEEN 1 AND 256
+               );",
         )?;
     }
     for column in [
