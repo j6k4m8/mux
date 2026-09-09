@@ -73,22 +73,32 @@ export function persistSidebarLayout(layout: SidebarLayout): void {
   }
 }
 
-export function toggleFolderAccount(layout: SidebarLayout, accountId: string): SidebarLayout {
-  const open = layout.openFolderAccounts.includes(accountId);
+/// Each of these three toggles negates what the reader can actually see
+/// (`currentlyShown`), not the raw stored preference. A folder section, the
+/// smart views, and the saved searches all stay shown while something inside
+/// them is the thing being read, whatever the stored preference says — and a
+/// toggle that negated the preference instead of the display could flip the
+/// preference to "open" while the section, already forced open, looked
+/// unchanged, so the next real attempt to fold it undid that flip first. A
+/// click always does what the chevron it clicked was showing.
+export function toggleFolderAccount(
+  layout: SidebarLayout,
+  accountId: string,
+  currentlyShown: boolean
+): SidebarLayout {
+  const stored = layout.openFolderAccounts.filter((id) => id !== accountId);
   return {
     ...layout,
-    openFolderAccounts: open
-      ? layout.openFolderAccounts.filter((id) => id !== accountId)
-      : [...layout.openFolderAccounts, accountId].slice(-MAX_REMEMBERED_ACCOUNTS)
+    openFolderAccounts: currentlyShown ? stored : [...stored, accountId].slice(-MAX_REMEMBERED_ACCOUNTS)
   };
 }
 
-export function toggleSmartViews(layout: SidebarLayout): SidebarLayout {
-  return { ...layout, smartViewsOpen: !layout.smartViewsOpen };
+export function toggleSmartViews(layout: SidebarLayout, currentlyShown: boolean): SidebarLayout {
+  return { ...layout, smartViewsOpen: !currentlyShown };
 }
 
-export function toggleSavedSearches(layout: SidebarLayout): SidebarLayout {
-  return { ...layout, savedSearchesOpen: !layout.savedSearchesOpen };
+export function toggleSavedSearches(layout: SidebarLayout, currentlyShown: boolean): SidebarLayout {
+  return { ...layout, savedSearchesOpen: !currentlyShown };
 }
 
 /// The section holding the folder being read is open whether or not it was

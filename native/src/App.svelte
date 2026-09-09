@@ -399,18 +399,18 @@
     persistSidebarLayout(sidebar);
   }
 
-  function toggleFolderSection(accountId: string) {
-    sidebar = toggleFolderAccount(sidebar, accountId);
+  function toggleFolderSection(accountId: string, currentlyShown: boolean) {
+    sidebar = toggleFolderAccount(sidebar, accountId, currentlyShown);
     persistSidebarLayout(sidebar);
   }
 
-  function toggleSmartViewsSection() {
-    sidebar = toggleSmartViews(sidebar);
+  function toggleSmartViewsSection(currentlyShown: boolean) {
+    sidebar = toggleSmartViews(sidebar, currentlyShown);
     persistSidebarLayout(sidebar);
   }
 
-  function toggleSavedSearchesSection() {
-    sidebar = toggleSavedSearches(sidebar);
+  function toggleSavedSearchesSection(currentlyShown: boolean) {
+    sidebar = toggleSavedSearches(sidebar, currentlyShown);
     persistSidebarLayout(sidebar);
   }
 
