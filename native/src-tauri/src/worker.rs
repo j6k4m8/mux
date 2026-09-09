@@ -342,6 +342,13 @@ pub(crate) enum WorkerOutcome {
     AuthenticationExpired {
         code: String,
     },
+    /// One independently configured provider transport lost authorization.
+    /// The account remains usable; this only disables the named capability
+    /// until provisioning proves and re-enables it again.
+    TransportAuthenticationExpired {
+        code: String,
+        capability: String,
+    },
     PermanentFailure {
         code: String,
     },
@@ -962,6 +969,21 @@ impl DurableWorker {
             }
             WorkerOutcome::PermanentFailure { code } => {
                 validate_error_code(&code)?;
+                set_terminal(&transaction, &claim.id, WorkState::Failed, Some(&code), now)?;
+                WorkState::Failed
+            }
+            WorkerOutcome::TransportAuthenticationExpired { code, capability } => {
+                validate_error_code(&code)?;
+                if capability != "outgoing_mail" {
+                    return Err(WorkerError::Validation(
+                        "Unknown transport capability cannot be disabled".into(),
+                    ));
+                }
+                transaction.execute(
+                    "UPDATE provider_capabilities SET enabled = 0
+                     WHERE account_id = ?1 AND capability = ?2",
+                    params![claim.account_id, capability],
+                )?;
                 set_terminal(&transaction, &claim.id, WorkState::Failed, Some(&code), now)?;
                 WorkState::Failed
             }

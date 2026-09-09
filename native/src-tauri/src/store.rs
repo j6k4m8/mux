@@ -23,7 +23,7 @@ use crate::worker::{
 
 pub mod benchmark;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 /// A person cannot hide more accounts than they can configure.
 const MAX_HIDDEN_ACCOUNTS: usize = 64;
 /// Default provider refresh cadence: once a minute.
@@ -1790,6 +1790,13 @@ impl MuxStore {
         let (in_reply_to, references) =
             reply_threading_headers(&transaction, draft.reply_to_thread_id)?;
         let (provider_kind, remote_thread_id) = resolve_send_provider_target(&transaction, &draft)?;
+        if provider_kind == "imap"
+            && !provider_capability_enabled(&transaction, &draft.account_id, "outgoing_mail")?
+        {
+            return Err(StoreError::Conflict(
+                "This IMAP account has no SMTP transport configured".into(),
+            ));
+        }
         let payload = send_payload_for_draft(
             &draft,
             message_id,
@@ -1828,10 +1835,10 @@ impl MuxStore {
                 not_before
             ],
         )?;
-        let send_scope = if provider_kind == "gmail" {
-            crate::gmail::gmail_send_scope(&id)
-        } else {
-            "outgoing:v1".into()
+        let send_scope = match provider_kind.as_str() {
+            "gmail" => crate::gmail::gmail_send_scope(&id),
+            "imap" => crate::smtp::smtp_send_scope(&id),
+            _ => "outgoing:v1".into(),
         };
         enqueue_in_transaction(
             &transaction,
@@ -3715,6 +3722,31 @@ fn apply_send_projection(
     crate::internet_message::validate_references(&payload.references)
         .map_err(|()| StoreError::Validation("Durable References are invalid".into()))?;
     let references_json = serde_json::to_string(&payload.references)?;
+    if let Some((message_id, _)) =
+        observed_imap_sent_message(transaction, &payload, &account_id, internet_message_id)?
+    {
+        // The provider page is already the confirmed projection. SMTP success
+        // confirms the pending send intent, but must not overwrite IMAP's
+        // normalized body, timestamp, headers, or restricted-content sidecars.
+        // Bcc is the one local envelope-only supplement because correct SMTP
+        // MIME does not disclose it to IMAP.
+        transaction.execute(
+            "UPDATE messages SET bcc_recipients = ?2 WHERE id = ?1",
+            params![message_id, bcc_recipients],
+        )?;
+        match draft_revision {
+            Some(revision) => {
+                transaction.execute(
+                    "DELETE FROM drafts WHERE id = ?1 AND revision = ?2",
+                    params![payload.draft_id, revision],
+                )?;
+            }
+            None => {
+                transaction.execute("DELETE FROM drafts WHERE id = ?1", [&payload.draft_id])?;
+            }
+        }
+        return Ok(());
+    }
     let preview = snippet(&body);
     let indexed_thread_id = if let Some(thread_id) = reply_to {
         let thread_exists = transaction.query_row(
@@ -3810,6 +3842,64 @@ fn apply_send_projection(
     Ok(())
 }
 
+/// Finds the exact IMAP Sent observation that won the race with SMTP success.
+/// Both identities are required because Message-ID is forgeable and correlation
+/// alone is not a public mail identity. The provider reference persists the
+/// correlation even when that UID is unchanged on later IMAP scans.
+fn observed_imap_sent_message(
+    transaction: &Transaction<'_>,
+    payload: &SendPayload,
+    account_id: &str,
+    internet_message_id: &str,
+) -> Result<Option<(i64, i64)>, StoreError> {
+    if payload.snapshot_version != Some(3)
+        || payload.provider_kind.as_deref() != Some("imap")
+        || internet_message_id.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(correlation) = payload.client_correlation_id.as_deref() else {
+        return Ok(None);
+    };
+    let mut statement = transaction.prepare(
+        "SELECT message.id, message.thread_id
+         FROM provider_message_refs reference
+         JOIN provider_accounts account ON account.account_id = reference.account_id
+         JOIN messages message ON message.id = reference.message_id
+         JOIN threads thread ON thread.id = message.thread_id
+         WHERE reference.account_id = ?1
+           AND account.provider_kind = 'imap'
+           AND thread.account_id = ?1
+           AND reference.client_correlation_id = ?2
+           AND message.internet_message_id = ?3
+           AND message.is_from_me = 1 AND message.remote_deleted = 0
+           AND EXISTS(
+             SELECT 1
+             FROM provider_container_memberships membership
+             JOIN provider_containers container
+               ON container.account_id = membership.account_id
+              AND container.remote_id = membership.remote_container_id
+             WHERE membership.account_id = reference.account_id
+               AND membership.remote_message_id = reference.remote_message_id
+               AND container.role = 'sent' AND container.is_deleted = 0
+           )
+         ORDER BY message.id LIMIT 2",
+    )?;
+    let candidates = statement
+        .query_map(
+            params![account_id, correlation, internet_message_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(*candidate)),
+        _ => Err(StoreError::Conflict(
+            "SMTP sent-message confirmation is ambiguous".into(),
+        )),
+    }
+}
+
 fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRecord> {
     Ok(OperationRecord {
         row_id: row.get(0)?,
@@ -3858,11 +3948,15 @@ fn provider_mutation_scope(
         .ok_or_else(|| {
             StoreError::Conflict("Remote mutation account is no longer configured".into())
         })?;
-    Ok(if provider == "gmail" {
-        crate::gmail::GMAIL_ACCOUNT_SCOPE.into()
-    } else {
-        format!("sync:{provider}:account:v1")
-    })
+    if provider == "gmail" {
+        return Ok(crate::gmail::GMAIL_ACCOUNT_SCOPE.into());
+    }
+    if !provider_capability_enabled(transaction, account_id, "mutations")? {
+        return Err(StoreError::Conflict(format!(
+            "The {provider} account is read-only"
+        )));
+    }
+    Ok(format!("sync:{provider}:account:v1"))
 }
 
 fn resolve_thread_mutation_target(
@@ -3906,15 +4000,36 @@ fn resolve_thread_mutation_target(
         (_, Some(provider), None) => Err(StoreError::Conflict(format!(
             "The {provider} thread has no stable remote identity"
         ))),
-        (account_id, Some(provider), Some(remote_thread_id)) => Ok(ThreadMutationTarget {
-            account_id,
-            remote_thread_id: Some(remote_thread_id),
-            scope: format!("sync:{provider}:account:v1"),
-        }),
+        (account_id, Some(_), Some(remote_thread_id)) => {
+            let scope = provider_mutation_scope(transaction, &account_id)?;
+            Ok(ThreadMutationTarget {
+                account_id,
+                remote_thread_id: Some(remote_thread_id),
+                scope,
+            })
+        }
         (_, None, Some(_)) => Err(StoreError::Conflict(
             "A remote thread identity has no configured provider account".into(),
         )),
     }
+}
+
+fn provider_capability_enabled(
+    transaction: &Transaction<'_>,
+    account_id: &str,
+    capability: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM provider_capabilities
+               WHERE account_id = ?1 AND capability = ?2 AND enabled = 1
+             )",
+            params![account_id, capability],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(StoreError::from)
 }
 
 fn resolve_send_provider_target(
@@ -4372,6 +4487,14 @@ mod tests {
                     ],
                 )
                 .expect("provider account state");
+            store
+                .connection
+                .execute(
+                    "INSERT INTO provider_capabilities(account_id, capability, enabled)
+                     VALUES(?1, 'mutations', 1)",
+                    [account_id],
+                )
+                .expect("provider mutation authority");
         }
         store
     }
@@ -4702,7 +4825,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version");
-        assert_eq!(version, "22");
+        assert_eq!(version, "23");
         assert_eq!(
             store
                 .connection
@@ -4744,7 +4867,7 @@ mod tests {
         assert_eq!(foreign_key_violations, 0);
 
         let bootstrap = store.bootstrap().expect("bootstrap query");
-        assert_eq!(bootstrap.schema_version, 22);
+        assert_eq!(bootstrap.schema_version, 23);
         assert_eq!(bootstrap.accounts.len(), 3);
         assert_eq!(bootstrap.view_counts.len(), 4);
         assert!(bootstrap.drafts.is_empty());
@@ -4944,7 +5067,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
     }
 
@@ -5103,7 +5226,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
     }
 
@@ -5431,6 +5554,61 @@ mod tests {
     }
 
     #[test]
+    fn schema_v22_adds_provider_message_correlation_without_losing_references() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("provider-correlation-migration.db");
+        let mut store = configured_provider_store(&path, &["migration-account"]);
+        store
+            .apply_provider_batch(sample_provider_batch(
+                "migration-account",
+                "pre-v23-batch",
+                "pre-v23-cursor",
+            ))
+            .expect("provider reference fixture");
+        let before: (String, i64, String) = store
+            .connection
+            .query_row(
+                "SELECT remote_message_id, message_id, body_state
+                 FROM provider_message_refs WHERE account_id = 'migration-account'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("pre-migration reference");
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE provider_message_refs DROP COLUMN client_correlation_id;
+                 UPDATE meta SET value = '22' WHERE key = 'schema_version';",
+            )
+            .expect("simulate schema v22");
+        drop(store);
+
+        let migrated = MuxStore::open(&path, false).expect("v22 migrates to v23");
+        let after: (String, i64, String, Option<String>) = migrated
+            .connection
+            .query_row(
+                "SELECT remote_message_id, message_id, body_state, client_correlation_id
+                 FROM provider_message_refs WHERE account_id = 'migration-account'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("migrated reference");
+        assert_eq!((after.0, after.1, after.2), before);
+        assert_eq!(after.3, None);
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("schema version"),
+            "23"
+        );
+    }
+
+    #[test]
     fn schema_v6_migration_preserves_mail_and_adds_provider_projection_atomically() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("provider-migration.db");
@@ -5489,7 +5667,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         for table in [
             "provider_accounts",
@@ -5579,7 +5757,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
     }
 
@@ -5642,7 +5820,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
     }
 
@@ -5695,7 +5873,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert_eq!(
             migrated
@@ -5814,7 +5992,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let accounts = migrated
             .connection
@@ -5970,7 +6148,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let accounts = migrated
             .connection
@@ -6116,7 +6294,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert_eq!(
             migrated
@@ -6912,7 +7090,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let expected = vec![(
             7001,
@@ -7006,7 +7184,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let receipts_after = migrated
             .connection
@@ -7231,7 +7409,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert_eq!(
             migrated
@@ -8287,6 +8465,49 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("message count");
         assert_eq!(message_count, 42);
+    }
+
+    #[test]
+    fn account_color_is_validated_normalized_and_persistent() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("account-color.db");
+        let mut store = MuxStore::open(&path, true).expect("seeded store opens");
+
+        store
+            .set_account_color("acc_work", "#Aa11Ff")
+            .expect("complete hexadecimal color");
+        let stored: String = store
+            .connection
+            .query_row(
+                "SELECT color FROM accounts WHERE id = 'acc_work'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored account color");
+        assert_eq!(stored, "#aa11ff");
+
+        for invalid in ["", "#123", "123456", "#12345g", "#1234567"] {
+            assert!(matches!(
+                store.set_account_color("acc_work", invalid),
+                Err(StoreError::Validation(_))
+            ));
+        }
+        assert!(matches!(
+            store.set_account_color("missing-account", "#123456"),
+            Err(StoreError::NotFound(ref message)) if message == "Account was not found"
+        ));
+        drop(store);
+
+        let reopened = MuxStore::open(&path, false).expect("store reopens");
+        let persisted: String = reopened
+            .connection
+            .query_row(
+                "SELECT color FROM accounts WHERE id = 'acc_work'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("persisted account color");
+        assert_eq!(persisted, "#aa11ff");
     }
 
     #[test]
@@ -10907,6 +11128,283 @@ mod tests {
     }
 
     #[test]
+    fn smtp_confirmation_reuses_an_imap_sent_observation_that_arrived_first() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("smtp-imap-sent-race.db");
+        let mut store = configured_provider_store(&path, &["imap-account"]);
+        store
+            .connection
+            .execute_batch(
+                "UPDATE accounts SET provider = 'imap' WHERE id = 'imap-account';
+                 UPDATE provider_accounts SET provider_kind = 'imap'
+                 WHERE account_id = 'imap-account';
+                 INSERT INTO provider_capabilities(account_id, capability, enabled)
+                 VALUES('imap-account', 'outgoing_mail', 1);",
+            )
+            .expect("SMTP-capable IMAP account");
+        let draft = store
+            .save_draft(SaveDraftInput {
+                id: None,
+                account_id: "imap-account".into(),
+                recipients: "recipient@example.test".into(),
+                cc_recipients: String::new(),
+                bcc_recipients: "blind@example.test".into(),
+                subject: "Race-safe send".into(),
+                body: "Frozen local body".into(),
+                body_html: "<p>Frozen local body</p>".into(),
+                reply_to_thread_id: None,
+                expected_revision: None,
+            })
+            .expect("draft");
+        let operation = store.queue_send(&draft.id, 10).expect("queued SMTP send");
+        let payload_json: String = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM operations WHERE id = ?1",
+                [&operation.id],
+                |row| row.get(0),
+            )
+            .expect("send snapshot");
+        let payload: SendPayload =
+            serde_json::from_str(&payload_json).expect("typed send snapshot");
+        let message_id = payload
+            .submission_message_id
+            .clone()
+            .expect("submission Message-ID");
+        let correlation = payload
+            .client_correlation_id
+            .clone()
+            .expect("client correlation");
+        let batch: ProviderBatch = serde_json::from_value(serde_json::json!({
+            "muxAccountId": "imap-account",
+            "batchId": "sent-before-smtp-confirmation",
+            "expectedPriorCursor": null,
+            "cursor": {
+                "muxAccountId": "imap-account",
+                "scope": { "kind": "account" },
+                "value": "sent-cursor-1"
+            },
+            "observedAt": 11,
+            "threadUpserts": [{
+                "identity": {
+                    "muxAccountId": "imap-account",
+                    "remoteThreadId": "imap-sent-thread"
+                },
+                "subject": "Race-safe send",
+                "participants": "recipient@example.test",
+                "snippet": "Remote parsed body",
+                "latestAt": 11,
+                "messageCount": 1,
+                "inInbox": false,
+                "unread": false,
+                "starred": false,
+                "hasAttachments": false,
+                "hasInvite": false,
+                "hasLinks": false,
+                "hasFromMe": true,
+                "category": "sent",
+                "revision": "thread-r1"
+            }],
+            "messageUpserts": [{
+                "identity": {
+                    "muxAccountId": "imap-account",
+                    "remoteMessageId": "imap:sent-folder:7:42",
+                    "remoteThreadId": "imap-sent-thread"
+                },
+                "subject": "Race-safe send",
+                "senderName": "Me",
+                "senderEmail": "imap-account@example.com",
+                "recipients": "recipient@example.test",
+                "ccRecipients": "",
+                "bccRecipients": "",
+                "sentAt": 11,
+                "bodyText": "Remote parsed body",
+                "bodyState": "complete",
+                "isFromMe": true,
+                "revision": "message-r1",
+                "keywords": [],
+                "internetMessageId": message_id,
+                "clientCorrelationId": correlation
+            }],
+            "containerUpserts": [{
+                "identity": {
+                    "muxAccountId": "imap-account",
+                    "remoteContainerId": "sent-folder"
+                },
+                "displayName": "Sent",
+                "kind": "folder",
+                "role": "sent",
+                "parentRemoteContainerId": null,
+                "selectable": true
+            }],
+            "membershipChanges": [{
+                "kind": "upsert",
+                "membership": {
+                    "message": {
+                        "muxAccountId": "imap-account",
+                        "remoteMessageId": "imap:sent-folder:7:42",
+                        "remoteThreadId": "imap-sent-thread"
+                    },
+                    "container": {
+                        "muxAccountId": "imap-account",
+                        "remoteContainerId": "sent-folder"
+                    }
+                }
+            }],
+            "tombstones": []
+        }))
+        .expect("IMAP Sent observation");
+        drop(store);
+
+        let worker = DurableWorker::new(&path, WorkerConfig::default()).expect("worker");
+        let result = worker
+            .run_cycle(
+                "smtp-race-worker",
+                &|_: &ClaimedWork, _: &crate::worker::WorkerExecutionContext| {
+                    let mut racing_connection =
+                        Connection::open(&path).expect("open during SMTP execution");
+                    racing_connection
+                        .busy_timeout(std::time::Duration::from_secs(2))
+                        .expect("race connection timeout");
+                    let executing: (String, String) = racing_connection
+                        .query_row(
+                            "SELECT operation.state, work.state
+                             FROM operations operation
+                             JOIN provider_work_items work
+                               ON work.operation_id = operation.id
+                             WHERE operation.id = ?1",
+                            [&operation.id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .expect("executing send fence");
+                    assert_eq!(executing, ("executing".into(), "executing".into()));
+                    let sync_claim = ClaimedWork {
+                        id: "sent-race-sync".into(),
+                        account_id: "imap-account".into(),
+                        operation_id: None,
+                        kind: WorkKind::Sync,
+                        scope: "sync:account".into(),
+                        ordering_key: "sent-before-smtp-confirmation".into(),
+                        payload_json: "{}".into(),
+                        payload_fingerprint_hex: "00".repeat(32),
+                        attempt: 1,
+                        lease_token: "sent-race-lease".into(),
+                        lease_expires_at: operation.not_before + 10_000,
+                    };
+                    let page = crate::worker::ProviderSyncPage {
+                        batch: Box::new(batch.clone()),
+                        restricted_message_content: vec![
+                            crate::worker::RestrictedMessageContent {
+                                identity: batch.message_upserts[0].identity.clone(),
+                                body_html: "<p>Remote parsed body<mux-remote-image data-id=\"1\"></mux-remote-image></p>".into(),
+                                blocked_remote_resources: 1,
+                                remote_images: vec![crate::content::RemoteImageCandidate {
+                                    resource_id: 1,
+                                    url: "https://images.example.test/tracker.png".into(),
+                                    domain: "images.example.test".into(),
+                                    alt_text: "Tracker".into(),
+                                }],
+                            },
+                        ],
+                        continuation: None,
+                        complete: true,
+                        capabilities: None,
+                        replace_memberships_for_upserted_messages: true,
+                        derive_thread_state_from_messages: true,
+                        reconciliation: None,
+                    };
+                    let transaction = racing_connection
+                        .transaction()
+                        .expect("provider page transaction");
+                    crate::provider_conformance::apply_worker_projection(
+                        &transaction,
+                        &sync_claim,
+                        &WorkerProjection::ProviderSyncPage(Box::new(page)),
+                    )
+                    .expect("Sent observation before SMTP acknowledgement");
+                    transaction.commit().expect("commit provider page");
+                    let observed: (i64, String, i64, i64) = racing_connection
+                        .query_row(
+                            "SELECT COUNT(*), reference.client_correlation_id,
+                                    message.blocked_remote_resources,
+                                    (SELECT COUNT(*) FROM message_remote_images
+                                     WHERE message_id = reference.message_id)
+                             FROM provider_message_refs reference
+                             JOIN messages message ON message.id = reference.message_id
+                             WHERE reference.account_id = 'imap-account'",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )
+                        .expect("persisted Sent identity");
+                    assert_eq!(observed, (1, correlation.clone(), 1, 1));
+                    WorkerOutcome::Succeeded {
+                        projection: WorkerProjection::LocalOperation,
+                    }
+                },
+                &apply_worker_projection,
+                &|| operation.not_before + 1,
+            )
+            .expect("SMTP success projection");
+        assert_eq!(result.succeeded, 1);
+        assert!(result.errors.is_empty());
+
+        let verify = MuxStore::open(&path, false).expect("reopen projected mail");
+        let final_state: (i64, i64, String, String, String, i64, i64) = verify
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM messages),
+                   (SELECT COUNT(*) FROM threads WHERE remote_deleted = 0),
+                   operation.state, message.body_text, message.bcc_recipients,
+                   message.blocked_remote_resources,
+                   (SELECT COUNT(*) FROM message_remote_images
+                    WHERE message_id = message.id)
+                 FROM operations operation
+                 JOIN provider_message_refs reference ON reference.account_id = 'imap-account'
+                 JOIN messages message ON message.id = reference.message_id
+                 WHERE operation.id = ?1",
+                [&operation.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("race-safe final state");
+        assert_eq!(
+            final_state,
+            (
+                1,
+                1,
+                "confirmed".into(),
+                "Remote parsed body".into(),
+                "blind@example.test".into(),
+                1,
+                1,
+            )
+        );
+        let provider_html: String = verify
+            .connection
+            .query_row(
+                "SELECT message.body_html
+                 FROM provider_message_refs reference
+                 JOIN messages message ON message.id = reference.message_id
+                 WHERE reference.account_id = 'imap-account'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("provider HTML remains authoritative");
+        assert!(provider_html.contains("<mux-remote-image data-id=\"1\""));
+        assert!(verify.get_draft(&draft.id).expect("draft lookup").is_none());
+    }
+
+    #[test]
     fn pending_thread_action_overlays_immediately_and_undo_restores_projection() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("thread-action.db");
@@ -10925,6 +11423,128 @@ mod tests {
         assert_eq!(effective(&store), 0);
         store.undo_operation(&operation.id).unwrap();
         assert_eq!(effective(&store), 1);
+    }
+
+    #[test]
+    fn read_only_imap_mutation_is_rejected_before_local_intent_is_journaled() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("imap-read-only-mutation.db");
+        let mut store = configured_provider_store(&path, &["imap-account"]);
+        store
+            .apply_provider_batch(sample_provider_batch(
+                "imap-account",
+                "imap-seed",
+                "imap-cursor",
+            ))
+            .expect("IMAP projection fixture");
+        store
+            .connection
+            .execute_batch(
+                "UPDATE provider_accounts SET provider_kind = 'imap'
+                 WHERE account_id = 'imap-account';
+                 DELETE FROM provider_capabilities
+                 WHERE account_id = 'imap-account' AND capability = 'mutations';",
+            )
+            .expect("mark account as IMAP");
+        let thread_id: i64 = store
+            .connection
+            .query_row(
+                "SELECT thread_id FROM provider_thread_refs
+                 WHERE account_id = 'imap-account' AND remote_thread_id = 'remote-thread-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("remote thread mapping");
+        let before: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM operations),
+                   (SELECT COUNT(*) FROM provider_work_items),
+                   (SELECT in_inbox FROM thread_effective WHERE id = ?1)",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preflight state");
+        let error = store
+            .apply_thread_action(thread_id, "archive")
+            .expect_err("receive-only IMAP must reject remote mutation");
+        assert!(matches!(error, StoreError::Conflict(message) if message.contains("read-only")));
+        let after: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM operations),
+                   (SELECT COUNT(*) FROM provider_work_items),
+                   (SELECT in_inbox FROM thread_effective WHERE id = ?1)",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("post-rejection state");
+        assert_eq!(
+            after, before,
+            "rejection must not create pending local intent"
+        );
+
+        let legacy_payload = serde_json::to_string(&ThreadMutationPayload {
+            format_version: Some(1),
+            operation_id: "legacy-imap-star".into(),
+            account_id: Some("imap-account".into()),
+            thread_id,
+            field: "starred".into(),
+            value: "1".into(),
+            remote_thread_id: Some("remote-thread-1".into()),
+            remote_container_id: None,
+            undo_of: None,
+        })
+        .expect("legacy payload");
+        store
+            .connection
+            .execute(
+                "UPDATE threads SET remote_starred = 1 WHERE id = ?1",
+                [thread_id],
+            )
+            .expect("legacy confirmed projection");
+        store
+            .connection
+            .execute(
+                "INSERT INTO operations(
+                   id, thread_id, field, kind, old_value, new_value,
+                   payload_json, state, created_at, not_before, confirmed_at
+                 ) VALUES(
+                   'legacy-imap-star', ?1, 'starred', 'star', '0', '1',
+                   ?2, 'confirmed', 1, 1, 2
+                 )",
+                params![thread_id, legacy_payload],
+            )
+            .expect("legacy confirmed operation");
+        let before_undo: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM operations),
+                   (SELECT COUNT(*) FROM provider_work_items),
+                   (SELECT starred FROM thread_effective WHERE id = ?1)",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("state before legacy undo");
+        let error = store
+            .undo_operation("legacy-imap-star")
+            .expect_err("confirmed legacy IMAP mutation must not create an inverse");
+        assert!(matches!(error, StoreError::Conflict(message) if message.contains("read-only")));
+        let after_undo: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM operations),
+                   (SELECT COUNT(*) FROM provider_work_items),
+                   (SELECT starred FROM thread_effective WHERE id = ?1)",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("state after rejected legacy undo");
+        assert_eq!(after_undo, before_undo);
     }
 
     #[test]

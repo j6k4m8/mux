@@ -2655,6 +2655,7 @@ fn project_message(
         blocked_remote_resources,
         remote_images,
         headers,
+        client_correlation_id,
         flags,
     } = match content {
         Some(content) => project_safe_content(content),
@@ -2669,6 +2670,7 @@ fn project_message(
             blocked_remote_resources: 0,
             remote_images: Vec::new(),
             headers: (None, None, None),
+            client_correlation_id: None,
             flags: (false, false, false),
         },
     };
@@ -2744,6 +2746,7 @@ fn project_message(
         internet_message_id: headers.0,
         in_reply_to: headers.1,
         references: headers.2,
+        client_correlation_id,
     };
     let participants = truncate_utf8(
         &if sender_name.is_empty() {
@@ -2803,6 +2806,7 @@ struct ProjectedSafeContent {
     blocked_remote_resources: i64,
     remote_images: Vec<crate::content::RemoteImageCandidate>,
     headers: ThreadingProjection,
+    client_correlation_id: Option<String>,
     flags: ContentFlags,
 }
 
@@ -2839,6 +2843,7 @@ fn project_safe_content(content: SafeMessageContent) -> ProjectedSafeContent {
             content.in_reply_to,
             (!content.references.is_empty()).then_some(content.references),
         ),
+        client_correlation_id: content.client_correlation_id,
         flags,
     }
 }

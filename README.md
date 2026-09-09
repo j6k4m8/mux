@@ -27,11 +27,13 @@ A fresh database seeds a demo mailbox so that the first launch has something to 
 
 ## Providers
 
-Gmail is the one provider you can connect from the interface. Settings opens the system browser for an installed-desktop authorization, and from then on the account bootstraps, follows the history feed, reconciles labels, and applies archive/read/star/trash mutations through the durable journal.
+Account setup in Settings starts with an email address. `@gmail.com` continues directly to Google in the system browser; another domain first chooses Google Workspace or generic IMAP + SMTP. From then on a Gmail account bootstraps, follows the history feed, reconciles labels, and applies archive/read/star/trash mutations through the durable journal.
 
-Any other IMAP server can be added from Settings: server, port, username, password. Mux opens a real session and lists the mailbox before it writes anything down, so a typo is caught in the form rather than surfacing later as a mailbox that never syncs. The sync is implicit TLS, capability re-read after login, UID-only search and fetch, resumable cursors, and the credentials go to the keychain — but it is read-only. Archiving or starring mail in an IMAP account changes your local copy and never the server, and without an SMTP client such an account can receive and never reply.
+Other mailboxes can be added from Settings with separate IMAP and SMTP endpoints. Non-secret host, port, security-mode, and username fields are submitted through the WebView's typed command; passwords are collected in native macOS secure fields, remain in Rust while Mux verifies both servers, and are then stored in one account-bound Keychain record. IMAP sync uses implicit TLS, capability re-read after login, UID-only search and fetch, and resumable cursors. It is still read-only: archive, read, star, and trash changes are rejected for IMAP accounts rather than pretending to update the server.
 
-Gmail is also the only account that can send. A queued send freezes a durable snapshot, waits out the undo window, and is then submitted to the Gmail API as raw MIME; delayed send, undo-send, and the uncertain-outcome recovery path all sit around that. There is no SMTP transport, so an IMAP account can receive and never reply. There is no JMAP, POP, Exchange, or Outlook adapter.
+Removing an account is a confirmed local action: Mux drops that account's downloaded projection, drafts, queued work, and bound Keychain item. A non-secret durable marker finishes Keychain cleanup after an interruption; it does not delete mail from the provider.
+
+Gmail sends through its API. A generic IMAP account sends through its paired SMTP transport using implicit TLS or STARTTLS plus password authentication (`AUTH PLAIN` or `AUTH LOGIN`). Both paths freeze the same durable MIME snapshot, wait out undo-send, fence the non-idempotent submission, and never automatically retry an ambiguous post-`DATA` result. SMTP acceptance creates the local Sent projection; Mux does not issue IMAP `APPEND`, so a server-side Sent copy appears only when the SMTP service saves one itself. The SMTP path is covered by deterministic wire transcripts and the provider conformance gate, but has not yet been exercised against a live mail host. There is no JMAP, POP, Exchange, or Outlook adapter.
 
 ## Keyboard
 

@@ -297,6 +297,13 @@ export function laneCounts(rows: OperationActivitySummary[]): Record<QueueLane, 
   return counts;
 }
 
+/// The top-bar badge is an interruption counter, not a history counter.
+/// Confirmed and cancelled rows remain useful in the full journal but no
+/// longer represent work or a decision waiting on the reader.
+export function queueBadgeCount(rows: OperationActivitySummary[]): number {
+  return rows.reduce((count, row) => count + Number(queueLane(row.state) !== 'settled'), 0);
+}
+
 function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }

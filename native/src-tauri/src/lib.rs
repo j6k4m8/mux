@@ -1,4 +1,5 @@
 mod account_color;
+mod account_removal;
 pub mod content;
 mod css;
 mod gmail;
@@ -10,6 +11,7 @@ mod imap_access;
 mod internet_message;
 mod ipc_boundary;
 mod keychain;
+mod mail_access_prompt;
 mod mime_ingest;
 mod navigation;
 mod outgoing;
@@ -19,6 +21,7 @@ mod provider_ingest;
 mod provider_schema;
 mod remote_content;
 mod search;
+mod smtp;
 pub mod store;
 mod worker;
 
@@ -41,7 +44,7 @@ use worker::{
     ClaimedWork, DurableWorker, WorkerAdapter, WorkerConfig, WorkerController, WorkerCycleResult,
     WorkerExecutionContext, WorkerOutcome, WorkerProjection,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const MAILBOX_CHANGED_EVENT: &str = "mux://mailbox-changed";
 /// How often the refresh timer asks which accounts are due. Individual accounts
@@ -60,21 +63,43 @@ struct AppState {
     store: Mutex<MuxStore>,
     credentials: keychain::CredentialStore,
     gmail_oauth: Arc<gmail_oauth::GmailOAuthCoordinator>,
+    account_lifecycle_busy: Arc<AtomicBool>,
     worker: Mutex<Option<WorkerController>>,
     /// Set on exit so the refresh timer stops instead of outliving the window.
     refresh_stop: Arc<AtomicBool>,
 }
 
-struct NativeWorkerAdapter<G, I> {
+/// Adding and removing accounts both span SQLite and an external credential
+/// store. Serialize those lifecycle changes so a late authorization cannot
+/// resurrect an account that was just removed (or delete one mid-provision).
+struct AccountLifecycleReservation(Arc<AtomicBool>);
+
+impl AccountLifecycleReservation {
+    fn acquire(flag: Arc<AtomicBool>) -> Result<Self, ()> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self(flag))
+            .map_err(|_| ())
+    }
+}
+
+impl Drop for AccountLifecycleReservation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+struct NativeWorkerAdapter<G, I, S> {
     gmail: G,
     imap: I,
+    smtp: S,
     database_path: PathBuf,
 }
 
-impl<G, I> WorkerAdapter for NativeWorkerAdapter<G, I>
+impl<G, I, S> WorkerAdapter for NativeWorkerAdapter<G, I, S>
 where
     G: WorkerAdapter + Sync,
     I: WorkerAdapter + Sync,
+    S: WorkerAdapter + Sync,
 {
     fn execute(&self, work: &ClaimedWork, context: &WorkerExecutionContext) -> WorkerOutcome {
         if gmail::is_gmail_owned_work(work) {
@@ -82,6 +107,9 @@ where
         }
         if imap::is_imap_sync_work(work) {
             return self.imap.execute(work, context);
+        }
+        if smtp::is_smtp_send_work(work) {
+            return self.smtp.execute(work, context);
         }
         let provider_kind =
             rusqlite::Connection::open(&self.database_path).and_then(|connection| {
@@ -138,6 +166,21 @@ async fn gmail_oauth_begin(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<gmail_oauth::GmailOAuthResult, gmail_oauth::GmailOAuthCommandError> {
+    let _lifecycle = AccountLifecycleReservation::acquire(Arc::clone(
+        &state.account_lifecycle_busy,
+    ))
+    .map_err(|()| gmail_oauth::GmailOAuthCommandError {
+        code: "account_change_busy",
+        message: "Another account change is already in progress.",
+    })?;
+    account_removal::reconcile_pending_credential_deletions(
+        &state.database_path,
+        &state.credentials,
+    )
+    .map_err(|_| gmail_oauth::GmailOAuthCommandError {
+        code: "account_cleanup_incomplete",
+        message: "Mux must finish an earlier account removal before adding another account.",
+    })?;
     let reservation = state.gmail_oauth.reserve()?;
     let cancellation = Arc::clone(&reservation.cancellation);
     let database_path = state.database_path.clone();
@@ -221,8 +264,14 @@ struct AccountColorInput {
 
 /// Recolours one account. The colour comes back out as an inline style on the
 /// other side of the bridge, so the store keeps nothing but a literal `#rrggbb`.
+/// Serialized with removal and the other account-lifecycle changes: a colour
+/// change racing an account's removal could otherwise write a colour for an
+/// account whose row is mid-delete.
 #[tauri::command]
 fn set_account_color(state: State<'_, AppState>, input: AccountColorInput) -> Result<(), String> {
+    let _lifecycle =
+        AccountLifecycleReservation::acquire(Arc::clone(&state.account_lifecycle_busy))
+            .map_err(|()| "Another account change is already in progress".to_string())?;
     let mut store = state
         .store
         .lock()
@@ -238,11 +287,37 @@ struct AccountIdInput {
     account_id: String,
 }
 
-/// What the interface sends to add an IMAP mailbox. Secret bearing, so every
-/// copy of it below is held in `Zeroizing`: the derive only supplies the wipe,
-/// and something has to call it.
-#[derive(Deserialize, Zeroize)]
-#[serde(rename_all = "camelCase")]
+#[tauri::command]
+async fn account_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: AccountIdInput,
+) -> Result<account_removal::RemovedAccount, String> {
+    let _lifecycle =
+        AccountLifecycleReservation::acquire(Arc::clone(&state.account_lifecycle_busy))
+            .map_err(|()| "Another account change is already in progress".to_string())?;
+    let database_path = state.database_path.clone();
+    let credentials = state.credentials.clone();
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        account_removal::remove_account(&database_path, &credentials, &input.account_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Mux could not complete account removal".to_string())??;
+    wake_worker(&state);
+    let _ = app.emit(
+        MAILBOX_CHANGED_EVENT,
+        MailboxChangedPayload {
+            source: "account-removal",
+        },
+    );
+    Ok(removed)
+}
+
+/// Non-secret endpoint configuration for an IMAP/SMTP mailbox. Passwords are
+/// collected by a native secure-field dialog and never enter this IPC shape.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImapAccountInput {
     #[serde(default)]
     display_name: String,
@@ -250,7 +325,10 @@ struct ImapAccountInput {
     host: String,
     port: u16,
     username: String,
-    password: String,
+    smtp_host: String,
+    smtp_port: u16,
+    smtp_tls_mode: String,
+    smtp_username: String,
 }
 
 #[derive(Serialize)]
@@ -267,46 +345,97 @@ struct ImapAccountAdded {
 /// given. Verifying first is the whole point: an unverified account looks added
 /// and then fails inside the worker, where no one is looking.
 #[tauri::command]
-fn imap_account_add(
+async fn imap_account_add(
+    app: AppHandle,
     state: State<'_, AppState>,
     input: ImapAccountInput,
-) -> Result<ImapAccountAdded, String> {
-    let input = Zeroizing::new(input);
-    let request = Zeroizing::new(imap_access::ImapProvisionRequest {
-        display_name: input.display_name.clone(),
-        email: input.email.clone(),
-        host: input.host.clone(),
-        port: input.port,
-        username: input.username.clone(),
-        password: input.password.clone(),
-    });
-    let prepared = imap_access::prepare_imap_account(&request)
-        .map_err(|_| "Those mailbox details are not usable".to_string())?;
-    let folders = imap::verify_authority(&prepared.grant).map_err(|error| match error {
-        imap::ImapError::Authentication => {
-            "The server refused that username and password".to_string()
-        }
-        imap::ImapError::Transient => {
-            "Mux could not reach that server. Check the host and port, then try again".to_string()
-        }
-        _ => "That server did not answer in a way Mux can use".to_string(),
-    })?;
-    imap_access::persist_imap_account(
+) -> Result<Option<ImapAccountAdded>, String> {
+    let _lifecycle =
+        AccountLifecycleReservation::acquire(Arc::clone(&state.account_lifecycle_busy))
+            .map_err(|()| "Another account change is already in progress".to_string())?;
+    account_removal::reconcile_pending_credential_deletions(
         &state.database_path,
         &state.credentials,
-        &prepared,
-        now_ms(),
     )
-    .map_err(|_| "Mux could not save that mailbox".to_string())?;
-    let scheduled = imap::sync_account_now(&state.database_path, &prepared.account_id, now_ms());
-    if scheduled.is_ok() {
+    .map_err(|_| {
+        "Mux must finish an earlier account removal before adding another account".to_string()
+    })?;
+    let smtp_tls_mode = match input.smtp_tls_mode.as_str() {
+        "implicit" => smtp::SmtpTlsMode::Implicit,
+        "starttls" => smtp::SmtpTlsMode::StartTls,
+        _ => return Err("That SMTP security mode is not supported".into()),
+    };
+    let Some(passwords) = mail_access_prompt::prompt_mail_passwords(&app)
+        .map_err(|_| "Mux could not open the secure password dialog".to_string())?
+    else {
+        return Ok(None);
+    };
+    let database_path = state.database_path.clone();
+    let credentials = state.credentials.clone();
+    let (added, scheduled) = tauri::async_runtime::spawn_blocking(move || {
+        let incoming = Zeroizing::new(imap_access::ImapProvisionRequest {
+            display_name: input.display_name,
+            email: input.email,
+            host: input.host,
+            port: input.port,
+            username: input.username,
+            password: passwords.imap.clone(),
+        });
+        let outgoing = Zeroizing::new(imap_access::SmtpProvisionRequest {
+            host: input.smtp_host,
+            port: input.smtp_port,
+            tls_mode: smtp_tls_mode,
+            username: input.smtp_username,
+            password: passwords.smtp.clone(),
+        });
+        let prepared = imap_access::prepare_mail_account(&incoming, &outgoing)
+            .map_err(|_| "Those mail server details are not usable".to_string())?;
+        let folders =
+            imap::verify_authority(&prepared.incoming.grant).map_err(|error| match error {
+                imap::ImapError::Authentication => {
+                    "The incoming server refused those credentials".to_string()
+                }
+                imap::ImapError::Transient => {
+                    "Mux could not reach the incoming server. Check its host and port, then try again"
+                        .to_string()
+                }
+                _ => "The incoming server did not answer in a way Mux can use".to_string(),
+            })?;
+        smtp::verify_authority(&prepared.outgoing).map_err(|error| match error {
+            smtp::SmtpVerificationError::Authentication => {
+                "The outgoing server refused those credentials".to_string()
+            }
+            smtp::SmtpVerificationError::Transient => {
+                "Mux could not reach the outgoing server. Check its host, port, and security mode, then try again"
+                    .to_string()
+            }
+            smtp::SmtpVerificationError::Unsupported => {
+                "The outgoing server did not offer a secure SMTP mode Mux can use".to_string()
+            }
+        })?;
+        imap_access::persist_mail_account(&database_path, &credentials, &prepared, now_ms())
+            .map_err(|_| "Mux could not save that mailbox".to_string())?;
+        let scheduled = imap::sync_account_now(
+            &database_path,
+            &prepared.incoming.account_id,
+            now_ms(),
+        )
+        .is_ok();
+        Ok::<_, String>((
+            ImapAccountAdded {
+                account_id: prepared.incoming.account_id.clone(),
+                email: prepared.incoming.email.clone(),
+                folders,
+            },
+            scheduled,
+        ))
+    })
+    .await
+    .map_err(|_| "Mux could not complete mail server verification".to_string())??;
+    if scheduled {
         wake_worker(&state);
     }
-    Ok(ImapAccountAdded {
-        account_id: prepared.account_id.clone(),
-        email: prepared.email.clone(),
-        folders,
-    })
+    Ok(Some(added))
 }
 
 /// Asks one account for new mail immediately rather than waiting for its cadence.
@@ -685,6 +814,10 @@ pub fn run() {
             let store = MuxStore::open(&path, true)?;
             let worker = DurableWorker::new(&path, WorkerConfig::default())?;
             let credentials = keychain::CredentialStore::for_database(&path)?;
+            // A crash after the local half of account removal can leave only a
+            // non-secret cleanup marker. Finish that idempotent Keychain delete
+            // before any provider is scheduled or allowed to re-provision.
+            let _ = account_removal::reconcile_pending_credential_deletions(&path, &credentials);
             gmail::schedule_initial_syncs(&path, now_ms())?;
             imap::schedule_initial_syncs(&path, now_ms())?;
             imap::schedule_resumable_syncs(&path, now_ms())?;
@@ -707,6 +840,12 @@ pub fn run() {
                 imap::NativeImapSessionFactory::new()?,
                 now_ms as fn() -> i64,
             );
+            let smtp_adapter = smtp::SmtpAdapter::new(
+                imap_access::ImapKeychainAccess::new(&path, credentials.clone()),
+                smtp::NativeSmtpSubmission::new()?,
+                now_ms as fn() -> i64,
+                &path,
+            );
             let app_handle = app.handle().clone();
             let controller = WorkerController::start(
                 worker,
@@ -714,6 +853,7 @@ pub fn run() {
                 NativeWorkerAdapter {
                     gmail: gmail_adapter,
                     imap: imap_adapter,
+                    smtp: smtp_adapter,
                     database_path: path.clone(),
                 },
                 provider_conformance::apply_worker_projection,
@@ -779,6 +919,7 @@ pub fn run() {
                 store: Mutex::new(store),
                 credentials,
                 gmail_oauth: Arc::new(gmail_oauth::GmailOAuthCoordinator::new()),
+                account_lifecycle_busy: Arc::new(AtomicBool::new(false)),
                 worker: Mutex::new(Some(controller)),
                 refresh_stop,
             });
@@ -809,6 +950,7 @@ pub fn run() {
             gmail_oauth_begin,
             gmail_oauth_cancel,
             imap_account_add,
+            account_remove,
             resync_all_mail,
             set_account_refresh,
             set_account_color,
@@ -867,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_routes_gmail_mutations_and_never_fake_confirms_provider_send() {
+    fn native_worker_routes_gmail_and_exact_smtp_scopes_without_fake_provider_send() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("provider-routing.db");
         drop(MuxStore::open(&path, false).unwrap());
@@ -876,6 +1018,7 @@ mod tests {
             .execute_batch(
                 "INSERT INTO accounts(id, name, email, color, provider) VALUES
                    ('gmail-account', 'Gmail', 'g@example.test', '#000', 'gmail'),
+                   ('imap-account', 'IMAP', 'i@example.test', '#000', 'imap'),
                    ('fake-account', 'Demo', 'f@example.test', '#000', 'fake');
                  INSERT INTO provider_accounts(
                    account_id, provider_kind, remote_account_id, auth_state,
@@ -883,6 +1026,9 @@ mod tests {
                  ) VALUES(
                    'gmail-account', 'gmail', 'remote-gmail', 'ready',
                    'vault/gmail', 'idle', 0, 0
+                 ), (
+                   'imap-account', 'imap', 'remote-imap', 'ready',
+                   'imap/account', 'idle', 0, 0
                  );",
             )
             .unwrap();
@@ -891,6 +1037,9 @@ mod tests {
                 calls: AtomicUsize::new(0),
             },
             imap: RecordingGmailAdapter {
+                calls: AtomicUsize::new(0),
+            },
+            smtp: RecordingGmailAdapter {
                 calls: AtomicUsize::new(0),
             },
             database_path: path,
@@ -903,6 +1052,18 @@ mod tests {
             WorkerOutcome::Succeeded { .. }
         ));
         assert_eq!(adapter.gmail.calls.load(Ordering::SeqCst), 1);
+        let mut smtp_claim = routed_claim("imap-account", worker::WorkKind::Send);
+        smtp_claim.scope = smtp::smtp_send_scope(
+            smtp_claim
+                .operation_id
+                .as_deref()
+                .expect("SMTP operation id"),
+        );
+        assert!(matches!(
+            adapter.execute(&smtp_claim, &WorkerExecutionContext::new()),
+            WorkerOutcome::Succeeded { .. }
+        ));
+        assert_eq!(adapter.smtp.calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
             adapter.execute(
                 &routed_claim("gmail-account", worker::WorkKind::Send),
@@ -945,6 +1106,27 @@ mod tests {
     }
 
     #[test]
+    fn account_lifecycle_changes_are_serialized_until_the_active_one_finishes() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = AccountLifecycleReservation::acquire(Arc::clone(&flag)).unwrap();
+        assert!(AccountLifecycleReservation::acquire(Arc::clone(&flag)).is_err());
+        drop(first);
+        assert!(AccountLifecycleReservation::acquire(flag).is_ok());
+    }
+
+    #[test]
+    fn account_color_uses_the_same_lifecycle_reservation_as_account_removal() {
+        let source = include_str!("lib.rs");
+        let command = source
+            .split("fn set_account_color(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}").next())
+            .expect("account color command source");
+        assert!(command.contains("AccountLifecycleReservation::acquire"));
+        assert!(command.contains("state.account_lifecycle_busy"));
+    }
+
+    #[test]
     fn tauri_exposes_no_credential_access_of_any_kind() {
         let source = include_str!("lib.rs");
         let handler = source
@@ -952,13 +1134,9 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("])").next())
             .expect("invoke handler source");
-        // Credentials live in the keychain and are read only inside Rust. The
-        // invariant is about direction: nothing may flow outward. No command
-        // may read, write, or unlock stored credentials, and none may be named
-        // for one. Adding an IMAP mailbox does accept a password inward —
-        // there is no browser flow to borrow, so it has to be typed somewhere —
-        // and it goes straight to the keychain without being stored, logged, or
-        // returned. The response-shape test below holds that line.
+        // Credentials live in the keychain and are read only inside Rust. Mail
+        // passwords are collected by native secure fields; the WebView command
+        // accepts only non-secret endpoint details and returns no authority.
         for forbidden in [
             "vault",
             "credential_value",
@@ -1013,6 +1191,7 @@ mod tests {
                 "gmail_oauth_begin",
                 "gmail_oauth_cancel",
                 "imap_account_add",
+                "account_remove",
                 "resync_all_mail",
                 "set_account_refresh",
                 "set_account_color",
@@ -1021,10 +1200,20 @@ mod tests {
         );
     }
 
-    /// The one command that accepts a credential must not hand any of it back.
     #[test]
-    fn adding_a_mailbox_returns_no_credential_material() {
+    fn adding_a_mailbox_has_a_non_secret_ipc_shape() {
         let source = include_str!("lib.rs");
+        let input = source
+            .split("struct ImapAccountInput {")
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("input struct source");
+        assert!(source.contains(
+            "#[serde(rename_all = \"camelCase\", deny_unknown_fields)]\nstruct ImapAccountInput"
+        ));
+        for forbidden in ["password", "secret", "token", "credential"] {
+            assert!(!input.contains(forbidden), "accepted {forbidden}");
+        }
         let response = source
             .split("struct ImapAccountAdded {")
             .nth(1)
@@ -1045,11 +1234,47 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("\n}").next())
             .expect("command source");
-        // The password reaches the keychain through the provisioning boundary
-        // and nowhere else: no println, no error text carrying it.
+        // The native prompt feeds the combined Keychain record without logging
+        // or accepting password fields from the interface.
         assert!(!command.contains("println"));
         assert!(!command.contains("eprintln"));
-        assert!(command.contains("persist_imap_account"));
+        assert!(command.contains("prompt_mail_passwords"));
+        assert!(command.contains("persist_mail_account"));
+        assert!(command.contains("spawn_blocking"));
+        assert!(!command.contains("input.password"));
+    }
+
+    #[test]
+    fn adding_a_mailbox_rejects_a_secret_smuggled_as_an_unknown_field() {
+        let input = serde_json::json!({
+            "displayName": "Mail",
+            "email": "reader@example.test",
+            "host": "imap.example.test",
+            "port": 993,
+            "username": "reader@example.test",
+            "smtpHost": "smtp.example.test",
+            "smtpPort": 587,
+            "smtpTlsMode": "starttls",
+            "smtpUsername": "reader@example.test",
+            "password": "unexpected-field"
+        });
+        assert!(serde_json::from_value::<ImapAccountInput>(input).is_err());
+    }
+
+    #[test]
+    fn account_removal_accepts_only_an_opaque_account_identifier() {
+        let valid = serde_json::json!({ "accountId": "account-a" });
+        assert_eq!(
+            serde_json::from_value::<AccountIdInput>(valid)
+                .unwrap()
+                .account_id,
+            "account-a"
+        );
+        let smuggled = serde_json::json!({
+            "accountId": "account-a",
+            "credentialRef": "gmail/account/not-allowed"
+        });
+        assert!(serde_json::from_value::<AccountIdInput>(smuggled).is_err());
     }
 
     #[test]

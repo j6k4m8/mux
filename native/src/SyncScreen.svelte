@@ -17,6 +17,9 @@
   /// A sync changes what the mailbox should show, and the mailbox is not this
   /// screen's to reload.
   export let refreshMailbox: () => Promise<void>;
+  /// Authentication stays provider-neutral here. The account wizard decides
+  /// whether the address uses Google or needs generic mailbox details.
+  export let signIn: (account: AccountSummary) => void;
 
   /// The store will not hand over more than a hundred journal rows, and a whole
   /// screen has room for all of them — the dialog this replaces asked for fifty
@@ -34,6 +37,12 @@
   /// the screen is measured from the same moment.
   let now = Date.now();
 
+  $: providerAccounts = accounts.filter(
+    (account) => account.syncState !== null && account.syncState !== undefined
+  );
+  $: syncableAccounts = providerAccounts.filter(
+    (account) => account.syncState !== 'authentication_blocked'
+  );
   $: accountRows = accounts.map((account) => ({
     account,
     health: accountHealth(account, observations[account.id], now)
@@ -101,7 +110,7 @@
   async function syncAll() {
     actionError = '';
     actionNotice = '';
-    await Promise.all(accounts.map(askAccount));
+    await Promise.all(syncableAccounts.map(askAccount));
     await afterSync();
   }
 
@@ -162,8 +171,8 @@
         type="button"
         data-action="sync-all"
         data-testid="sync-all"
-        title="Check every account for new mail right now"
-        disabled={!accounts.length || anyAsking}
+        title="Check every signed-in account for new mail right now"
+        disabled={!syncableAccounts.length || anyAsking}
         on:click={syncAll}
       >{anyAsking ? 'Checking…' : 'Sync all accounts'}</button>
       <button
@@ -188,6 +197,8 @@
       {:else}
         <ul class="sync-account-list">
           {#each accountRows as entry (entry.account.id)}
+            {@const needsSignIn = entry.account.syncState === 'authentication_blocked'}
+            {@const hasProvider = entry.account.syncState !== null && entry.account.syncState !== undefined}
             <li
               data-testid="sync-account"
               data-account-id={entry.account.id}
@@ -203,15 +214,19 @@
               </div>
               <div class="sync-account-side">
                 <em>{entry.account.unread} unread of {entry.account.total}</em>
-                <button
-                  class="sync-secondary"
-                  type="button"
-                  data-action="sync-account"
-                  data-account-id={entry.account.id}
-                  title={`Check ${entry.account.name} for new mail right now`}
-                  disabled={entry.health.asking}
-                  on:click={() => syncOne(entry.account)}
-                >{entry.health.syncing ? 'Checking…' : 'Sync now'}</button>
+                {#if hasProvider}
+                  <button
+                    class="sync-secondary"
+                    type="button"
+                    data-action={needsSignIn ? 'sign-in-account' : 'sync-account'}
+                    data-account-id={entry.account.id}
+                    title={needsSignIn
+                      ? `Sign in to ${entry.account.name} again`
+                      : `Check ${entry.account.name} for new mail right now`}
+                    disabled={!needsSignIn && entry.health.asking}
+                    on:click={() => needsSignIn ? signIn(entry.account) : syncOne(entry.account)}
+                  >{needsSignIn ? 'Sign in' : entry.health.syncing ? 'Checking…' : 'Sync now'}</button>
+                {/if}
               </div>
             </li>
           {/each}

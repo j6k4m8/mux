@@ -125,8 +125,17 @@ impl CredentialStore {
             .find_generic_password(&self.service, identifier)
         {
             Ok((_, item)) => {
+                // This older Security.framework wrapper discards the status
+                // returned by SecKeychainItemDelete, so prove the item is gone
+                // before telling callers their account authority was removed.
                 item.delete();
-                Ok(true)
+                match self
+                    .keychain
+                    .find_generic_password(&self.service, identifier)
+                {
+                    Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(true),
+                    _ => Err(CredentialError::Unavailable),
+                }
             }
             Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(false),
             Err(_) => Err(CredentialError::Unavailable),
